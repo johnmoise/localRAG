@@ -1,1 +1,9 @@
+pub mod chunk;
+pub mod config;
+pub mod db;
 pub mod doctor;
+pub mod embed;
+pub mod index;
+pub mod parse;
+pub mod scan;
+pub mod workspace;

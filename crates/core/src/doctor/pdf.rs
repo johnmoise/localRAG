@@ -13,9 +13,7 @@ pub(super) struct PdfReport {
 
 /// Text, per-character boxes and page labels from the fixture, plus a page render (§5, §6).
 pub(super) fn check(lib: &Path) -> anyhow::Result<PdfReport> {
-    ensure!(lib.exists(), "{} not found; run scripts/fetch-pdfium.sh", lib.display());
-    let bindings = Pdfium::bind_to_library(lib).context("binding libpdfium")?;
-    let pdfium = Pdfium::new(bindings);
+    let pdfium = crate::parse::pdf::pdfium(lib).context("binding libpdfium")?;
     let doc = pdfium.load_pdf_from_byte_slice(SAMPLE_PDF, None)?;
 
     let mut labels = Vec::new();

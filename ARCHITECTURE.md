@@ -833,6 +833,25 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 - PDF/MD/TXT parsing, chunking, embedding; `index`, `status`.
 - *Exit:* a second run reports 0 changed in about a second; touching one file affects only
   that file.
+- **Done (2026-10-31):** commands `init`, `index`, `status [--docs]` and
+  `forget <doc> | --all-removed`. 15 tests (5 unit, 10 integration) cover the exit criteria
+  and the PDF path.
+  - **Real run:** 3 Zotero PDFs plus 300 notes indexed in 49 s (375 chunks, real embeddings).
+    The second run took **13 ms**. Printed page labels come through (e.g. pp. 1996–2005).
+  - **Single-file changes:** an edit, a touch, a removal, and a restore under a new name each
+    touched only that file.
+  - **Deviations from the plan:**
+    - The chunker is custom rather than `text-splitter`, because it has to track
+      page/section/char offsets per sentence.
+    - Markdown uses a line-based heading parser rather than `pulldown-cmark`; it keeps exact
+      line and offset bookkeeping, and fenced code is never read as a heading.
+    - Token counts while chunking are estimated (about 4 chars per token).
+  - **PDF metadata:** no year is taken from PDF metadata, because a PDF's creation date isn't
+    its publication date.
+  - **Environment errors abort the sync** (Ollama down, PDFium missing). Only problems with the
+    file itself are recorded as `failed`, so a file never gets stuck as failed because of the
+    environment.
+  - **Rust 1.85 pins:** `ignore` 0.4.23 (newer versions need Rust 1.88).
 
 **Phase 2: retrieval & grounded answers (CLI)**
 - Hybrid search (`search`); budget check and warnings; prompting; quote verification;

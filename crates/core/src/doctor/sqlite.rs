@@ -1,18 +1,9 @@
 use anyhow::{Context, ensure};
-use rusqlite::{Connection, ffi};
+use rusqlite::Connection;
+
+use crate::db::register_sqlite_vec;
 
 use super::Outcome;
-
-/// Registers sqlite-vec for every connection opened afterwards in this process.
-pub(crate) fn register_sqlite_vec() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| unsafe {
-        #[allow(clippy::missing_transmute_annotations)]
-        ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    });
-}
 
 /// FTS5 and vec0 work, and the chunk triggers leave no orphans after a cascaded delete (§8).
 pub(super) fn check() -> anyhow::Result<Outcome> {

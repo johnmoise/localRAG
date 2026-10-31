@@ -20,7 +20,8 @@ pub struct DoctorConfig {
     pub embed_model: String,
     pub chat_model: String,
     pub num_ctx: u32,
-    pub pdfium_lib: PathBuf,
+    /// Explicit libpdfium path; otherwise the usual discovery (parse::pdf::find_library).
+    pub pdfium_lib: Option<PathBuf>,
     pub tokenizer_file: PathBuf,
     pub crossref_email: Option<String>,
     pub skip_network: bool,
@@ -70,7 +71,7 @@ pub async fn run(cfg: &DoctorConfig) -> Vec<Check> {
 
     // PDFium renders page 1 for the OCR check, so OCR depends on it.
     let t = Instant::now();
-    let pdf = pdf::check(&cfg.pdfium_lib);
+    let pdf = crate::parse::pdf::find_library(cfg.pdfium_lib.as_deref()).and_then(|lib| pdf::check(&lib));
     let rendered = pdf.as_ref().ok().map(|r| r.page1_png.clone());
     checks.push(Check::from_result("PDFium text, boxes, labels, render", t, pdf.map(|r| r.outcome)));
 
