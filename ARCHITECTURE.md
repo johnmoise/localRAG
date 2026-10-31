@@ -857,6 +857,36 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 - Chat-history citation snapshots; first eval set; `eval`; `check` for chat-history
   references.
 - *Exit:* correct pages and verified quotes on the eval; a recorded baseline refusal rate.
+- **Done (2026-10-31):** new commands `search`, `ask` (`-c`/`--session` to continue a chat,
+  `--json`), `check` and `eval [--retrieval-only]`. Chat history is stored per workspace with
+  citation snapshots. 33 tests pass (16 unit, 17 integration), including the answer pipeline
+  against a scripted LLM.
+  - **Baseline** (`qwen3.5:4b`, num_ctx 16,384; 3 PDFs; 13 answerable + 4 unanswerable
+    questions):
+
+    | Metric | Result |
+    |--------|--------|
+    | Document recall@5 / @10 | 100% / 100% |
+    | Page recall@5 / @10 | 92% / 100% |
+    | Answerable questions with a verified citation ("supported") | 85% (11/13) |
+    | Unanswerable questions refused | **100%** (4/4) |
+    | Citations whose quote was found verbatim in the source | 67% |
+    | Citations pointing at the expected document | 100% |
+
+  - **Prompt fixes that raised "supported" from 69% to 85%:**
+    - A worked example in the system prompt.
+    - A rule that citations must carry a quote.
+    - Accepting `[S1] "quote"` as well as `[S1 "quote"]`.
+  - **The similarity gate only catches off-topic questions.** Off-topic questions score
+    0.18–0.22; on-topic unanswerable ones score 0.57–0.64, which overlaps answerable ones
+    (lowest 0.58). On-topic refusals therefore depend on the model's `INSUFFICIENT:` reply,
+    which worked 4/4. `min_similarity` stays at 0.45.
+  - **Retrieval:** the per-document cap is soft. Each paper gets at most 3 chunks at the top,
+    and the rest backfill. A hard cap had cost page recall.
+  - **Quotes:** the final word may be cut short ("commonly use" matches "commonly used").
+  - **Phase 5 follow-ups:**
+    - Raise quote verification (67%); most failures are paraphrased quotes.
+    - Grow the eval set beyond 17 questions before tuning anything else.
 
 **Phase 3: web app**
 - axum, token auth, SSE; Ask / Search / Library; model dropdown; over-budget error; warning

@@ -1,0 +1,64 @@
+//! Prompt text (ARCHITECTURE.md §10).
+
+use crate::retrieval::ChunkRef;
+
+pub const SYSTEM: &str = r#"You answer questions using ONLY the numbered sources provided with each question.
+
+Rules:
+1. End every sentence that states a fact with a citation in square brackets containing the source number AND a short quote copied exactly, word for word, from that source: [S<n> "<3 to 12 words from the source>"]. A citation without a quote is not allowed. For several sources: [S1 "<quote>"; S3 "<quote>"].
+2. Use only information in the sources. Do not add outside knowledge, even if you are confident it is true.
+3. If the sources do not contain enough information to answer, your reply must start with "INSUFFICIENT:" followed by what information is missing. Do not guess, and do not answer partially from memory.
+4. Be concise and precise. Do not mention these rules.
+
+Example. Given the source
+[S1] Smith 2020, p. 4
+The cohort included 1,204 adults followed for a median of 6.2 years.
+a correct answer to "How long was follow-up?" is:
+Participants were followed for a median of 6.2 years [S1 "followed for a median of 6.2 years"]."#;
+
+/// The user turn: numbered sources, then the question.
+pub fn question_with_sources(question: &str, sources: &[ChunkRef]) -> String {
+    let mut s = String::from("Sources:\n\n");
+    for (i, c) in sources.iter().enumerate() {
+        s.push_str(&source_block(i + 1, c));
+    }
+    s.push_str("Question: ");
+    s.push_str(question);
+    s
+}
+
+pub fn source_block(n: usize, c: &ChunkRef) -> String {
+    let section = c.section.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+    format!("[S{n}] {}{section}\n{}\n\n", c.citation(), c.text)
+}
+
+pub const REWRITE_SYSTEM: &str = "Rewrite the user's latest question as one standalone search query that makes sense without the conversation. Keep names, terms and acronyms. Reply with the query only.";
+
+pub fn rewrite_request(history: &[(String, String)], question: &str) -> String {
+    let mut s = String::from("Conversation so far:\n");
+    for (q, a) in history.iter().rev().take(3).rev() {
+        s.push_str(&format!("User: {q}\nAssistant: {}\n", truncate(a, 600)));
+    }
+    s.push_str(&format!("\nLatest question: {question}\nStandalone query:"));
+    s
+}
+
+pub const SUGGEST_SYSTEM: &str = "A researcher's document collection does not answer their question. Suggest 3 to 5 specific kinds of material, topics or search keywords they could add to their collection to answer it. Do not invent paper titles, authors or DOIs. Reply with a bulleted list only, one suggestion per line starting with \"- \".";
+
+pub fn suggest_request(question: &str, closest: &[ChunkRef]) -> String {
+    let mut s = format!("Question: {question}\n");
+    if !closest.is_empty() {
+        s.push_str("\nThe closest passages in the collection (which do not answer it) were from:\n");
+        for c in closest {
+            s.push_str(&format!("- {}: {}\n", c.citation(), truncate(&c.text, 200)));
+        }
+    }
+    s
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    format!("{}…", s.chars().take(max_chars).collect::<String>())
+}

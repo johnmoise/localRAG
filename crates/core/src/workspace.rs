@@ -59,6 +59,10 @@ impl Workspace {
         Ok(InitReport { gitignore_suggestion: gitignore_suggestion(&root), root, already_existed })
     }
 
+    pub fn save_config(&self) -> anyhow::Result<()> {
+        config::save(&self.state_dir().join("config.toml"), &self.config, CONFIG_HEADER)
+    }
+
     pub fn corpus_dir(&self) -> PathBuf {
         self.root.join(CORPUS_DIR)
     }

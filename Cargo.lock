@@ -1273,6 +1273,7 @@ dependencies = [
  "anyhow",
  "clap",
  "localrag-core",
+ "serde_json",
  "tokio",
 ]
 
@@ -1285,6 +1286,7 @@ dependencies = [
  "humantime",
  "ignore",
  "image",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-vision",

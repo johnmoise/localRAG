@@ -514,10 +514,10 @@ pub fn list_documents(conn: &Connection) -> anyhow::Result<Vec<DocSummary>> {
 
 /// Resolves a `forget` argument: a document id or its path relative to corpus/.
 pub fn find_document(conn: &Connection, key: &str) -> anyhow::Result<Option<i64>> {
-    if let Ok(id) = key.parse::<i64>() {
-        if conn.query_row("SELECT 1 FROM documents WHERE id = ?1", [id], |_| Ok(())).optional()?.is_some() {
-            return Ok(Some(id));
-        }
+    if let Ok(id) = key.parse::<i64>()
+        && conn.query_row("SELECT 1 FROM documents WHERE id = ?1", [id], |_| Ok(())).optional()?.is_some()
+    {
+        return Ok(Some(id));
     }
     let path = key.trim_start_matches("corpus/");
     Ok(conn.query_row("SELECT id FROM documents WHERE path = ?1", [path], |r| r.get(0)).optional()?)

@@ -52,6 +52,26 @@ impl Default for ChunkingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct RetrievalConfig {
+    /// Below this best cosine similarity the model isn't called: "not found" (§10). Calibrate with `localrag eval`.
+    pub min_similarity: f32,
+    /// Most sources given to the model per question.
+    pub max_sources: usize,
+    /// Candidates from each of BM25 and vector search.
+    pub candidates: usize,
+    pub per_doc_cap: usize,
+    /// How many top hits get their neighbouring chunks attached.
+    pub expand_top: usize,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        RetrievalConfig { min_similarity: 0.45, max_sources: 10, candidates: 30, per_doc_cap: 3, expand_top: 2 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WorkspaceConfig {
     pub embed_model: String,
     pub chat_model: String,
@@ -59,6 +79,9 @@ pub struct WorkspaceConfig {
     /// Files larger than this are skipped.
     pub max_file_mb: u64,
     pub chunking: ChunkingConfig,
+    pub retrieval: RetrievalConfig,
+    /// Pass `think` to thinking-capable models when answering.
+    pub think: bool,
     /// Context size per chat model (§11); filled in on first use.
     pub num_ctx: BTreeMap<String, u32>,
 }
@@ -71,6 +94,8 @@ impl Default for WorkspaceConfig {
             ocr: OcrMode::Ask,
             max_file_mb: 200,
             chunking: ChunkingConfig::default(),
+            retrieval: RetrievalConfig::default(),
+            think: false,
             num_ctx: BTreeMap::new(),
         }
     }

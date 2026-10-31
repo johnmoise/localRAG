@@ -3,13 +3,6 @@ use serde_json::{Value, json};
 
 use super::{DoctorConfig, Outcome};
 
-/// Query instruction for Qwen3-Embedding (§5). Documents are embedded without one.
-pub(crate) fn embed_query(question: &str) -> String {
-    format!(
-        "Instruct: Given a research question, retrieve passages from the literature that answer it\nQuery: {question}"
-    )
-}
-
 pub(super) async fn post(client: &reqwest::Client, host: &str, path: &str, body: Value) -> anyhow::Result<Value> {
     let resp = client.post(format!("{host}{path}")).json(&body).send().await?;
     let status = resp.status();
@@ -37,7 +30,7 @@ pub(super) async fn check_embed(client: &reqwest::Client, cfg: &DoctorConfig) ->
         "Self-attention takes time quadratic in the sequence length.",
         "The migratory patterns of Arctic terns span both poles.",
     ];
-    let query = embed_query("How does the cost of attention scale with sequence length?");
+    let query = crate::embed::query_text("How does the cost of attention scale with sequence length?");
     let v = post(client, &cfg.ollama_host, "/api/embed", json!({
         "model": cfg.embed_model,
         "input": [docs[0], docs[1], query],

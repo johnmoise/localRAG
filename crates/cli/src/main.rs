@@ -8,7 +8,11 @@ use localrag_core::doctor::{self, DoctorConfig};
 use localrag_core::embed::OllamaEmbedder;
 use localrag_core::index::{self, Change, Parsers};
 use localrag_core::workspace::{self, Workspace};
+use localrag_core::answer::{Answer, Event, RagEngine, SpanSource};
+use localrag_core::budget::{self, OverBudget};
 use localrag_core::db;
+use localrag_core::llm::{Llm, Ollama};
+use localrag_core::{eval, history, refs, retrieval};
 
 #[derive(Parser)]
 #[command(name = "localrag", version, about = "Grounded, cited Q&A over your own literature")]
@@ -30,6 +34,39 @@ enum Command {
     Status {
         #[arg(long)]
         docs: bool,
+    },
+    /// Search the corpus (retrieval only, no model)
+    Search {
+        query: String,
+        /// Number of results
+        #[arg(short, default_value_t = 10)]
+        k: usize,
+    },
+    /// Ask a question; the answer is grounded in and cited from the corpus
+    Ask {
+        question: String,
+        /// Ollama chat model (default: chat_model in the workspace config)
+        #[arg(long)]
+        model: Option<String>,
+        /// Continue the most recent chat session
+        #[arg(long, short = 'c', conflicts_with = "session")]
+        r#continue: bool,
+        /// Continue a specific chat session
+        #[arg(long)]
+        session: Option<i64>,
+        /// Print the full answer as JSON instead of streaming text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check that every citation in chat history still resolves to its source
+    Check,
+    /// Measure retrieval recall and answer grounding against .localrag/eval.jsonl
+    Eval {
+        /// Only measure retrieval (no model calls)
+        #[arg(long)]
+        retrieval_only: bool,
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Permanently delete a removed document's record, chunks, vectors and OCR cache
     Forget {
@@ -73,6 +110,10 @@ fn main() -> ExitCode {
         Command::Index => index_cmd(),
         Command::Status { docs } => status(docs),
         Command::Forget { doc, all_removed, yes } => forget(doc, all_removed, yes),
+        Command::Search { query, k } => search(&query, k),
+        Command::Ask { question, model, r#continue, session, json } => ask(&question, model, r#continue, session, json),
+        Command::Check => check(),
+        Command::Eval { retrieval_only, model } => eval_cmd(retrieval_only, model),
         Command::Doctor { ollama_host, embed_model, chat_model, num_ctx, pdfium, tokenizer, crossref_email, offline } => {
             let cfg = DoctorConfig {
                 ollama_host,
@@ -89,6 +130,10 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<OverBudget>().is_some() => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
+        }
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
@@ -105,11 +150,11 @@ fn init(dir: Option<PathBuf>) -> anyhow::Result<()> {
         println!("Created workspace at {}", report.root.display());
         println!("  Put .pdf, .md and .txt files in {}/corpus/, then run `localrag index`.", report.root.display());
     }
-    if let Some(gitignore) = report.gitignore_suggestion {
-        if confirm(&format!("Add .localrag/ to {}?", gitignore.display()), true)? {
-            workspace::add_to_gitignore(&gitignore)?;
-            println!("  Added .localrag/ to {}", gitignore.display());
-        }
+    if let Some(gitignore) = report.gitignore_suggestion
+        && confirm(&format!("Add .localrag/ to {}?", gitignore.display()), true)?
+    {
+        workspace::add_to_gitignore(&gitignore)?;
+        println!("  Added .localrag/ to {}", gitignore.display());
     }
     Ok(())
 }
@@ -202,6 +247,230 @@ fn forget(doc: Option<String>, all_removed: bool, yes: bool) -> anyhow::Result<(
         println!("Forgot {path}");
     }
     Ok(())
+}
+
+fn search(query: &str, k: usize) -> anyhow::Result<()> {
+    let ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+    let opts = retrieval::SearchOptions {
+        candidates: ws.config.retrieval.candidates,
+        limit: k,
+        per_doc_cap: ws.config.retrieval.per_doc_cap,
+    };
+    let hits = retrieval::search(&conn, &embedder, query, &opts)?;
+    if hits.is_empty() {
+        println!("No matches.");
+    }
+    for (i, h) in hits.iter().enumerate() {
+        let sim = h.similarity.map_or("   –".to_string(), |s| format!("{s:.2}"));
+        let ranks = format!(
+            "bm25 {} · vec {}",
+            h.bm25_rank.map_or("–".into(), |r| r.to_string()),
+            h.vec_rank.map_or("–".into(), |r| r.to_string())
+        );
+        println!("{:>2}. [{}]  sim {sim} · {ranks}", i + 1, h.chunk.citation());
+        println!("    {}", snippet(&h.chunk.text, 240));
+    }
+    Ok(())
+}
+
+fn ask(question: &str, model: Option<String>, cont: bool, session: Option<i64>, json: bool) -> anyhow::Result<()> {
+    let mut ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+    let llm = Ollama::new(&ws.global.ollama_host)?;
+    let model = model.unwrap_or_else(|| ws.config.chat_model.clone());
+    let num_ctx = resolve_num_ctx(&mut ws, &llm, &model)?;
+
+    let session = match (session, cont) {
+        (Some(id), _) => {
+            anyhow::ensure!(history::session_exists(&conn, id)?, "no chat session {id}");
+            Some(id)
+        }
+        (None, true) => history::latest_session(&conn)?,
+        _ => None,
+    };
+    let turns = match session {
+        Some(id) => history::turns(&conn, id)?,
+        None => Vec::new(),
+    };
+
+    let engine = RagEngine { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm };
+    let mut streamed = false;
+    let answer = engine.ask(question, &model, num_ctx, &turns, &mut |e| match e {
+        Event::Query(q) if !json => eprintln!("(searching for: {q})"),
+        Event::Warning(w) => eprintln!("warning: {w}"),
+        Event::Token(t) if !json => {
+            streamed = true;
+            print!("{t}");
+            let _ = std::io::stdout().flush();
+        }
+        _ => {}
+    })?;
+
+    let session = match session {
+        Some(id) => id,
+        None => history::create_session(&conn, question, &model)?,
+    };
+    history::record(&conn, session, question, &answer)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&answer)?);
+        return Ok(());
+    }
+    if streamed {
+        println!("\n");
+    }
+    print_answer(&answer, streamed);
+    eprintln!("(session {session}; continue with `localrag ask -c \"…\"`)");
+    Ok(())
+}
+
+fn print_answer(a: &Answer, streamed: bool) {
+    if a.not_found || a.text.starts_with("INSUFFICIENT") {
+        if !streamed {
+            println!("{}\n", a.text);
+        }
+        if !a.sources.is_empty() {
+            println!("Closest material found (not sufficient to answer):");
+            for c in &a.sources {
+                println!("  - [{}] {}", c.citation(), snippet(&c.text, 160));
+            }
+        }
+        if !a.suggestions.is_empty() {
+            println!("\nMaterial that could help (suggestions from the model's general knowledge, unverified):");
+            for s in &a.suggestions {
+                println!("  - {s}");
+            }
+        }
+        return;
+    }
+    println!("Answer with citations:\n{}\n", a.rendered());
+    if !a.citations.is_empty() {
+        println!("Citations:");
+        for c in &a.citations {
+            let mark = match c.span_source {
+                SpanSource::Quote => "✓ quote found",
+                SpanSource::Similar if c.quote.is_some() => "✗ quote NOT in source; closest sentence shown",
+                SpanSource::Similar => "– no quote; closest sentence shown",
+                SpanSource::None => "✗ no supporting text found",
+            };
+            let span = c.span.map(|(a, b)| c.chunk.text.chars().skip(a).take(b - a).collect::<String>()).unwrap_or_default();
+            println!("  [S{}] {}  {mark}", c.marker, c.chunk.citation());
+            if !span.is_empty() {
+                println!("        \"{}\"", snippet(&span, 200));
+            }
+        }
+    }
+    if !a.invalid_markers.is_empty() {
+        println!("Invalid citations (no such source): {}", a.invalid_markers.join(", "));
+    }
+    if !a.unsupported_sentences.is_empty() {
+        println!("\nSentences without a citation:");
+        for s in &a.unsupported_sentences {
+            println!("  ! {s}");
+        }
+    }
+    if !a.supported {
+        println!("\n⚠ This answer is NOT supported: no citation could be verified against the sources.");
+    }
+}
+
+fn check() -> anyhow::Result<()> {
+    let ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    let r = refs::check_history(&conn)?;
+    println!(
+        "Chat history: {} citations checked · {} resolved · {} relocated · {} source removed · {} broken",
+        r.checked, r.resolved, r.relocated, r.source_removed, r.broken.len()
+    );
+    for (s, m, label, path) in &r.removed {
+        println!("  removed  session {s}, message {m}: [{label}] ({path})");
+    }
+    for (s, m, label, path) in &r.broken {
+        println!("  BROKEN   session {s}, message {m}: [{label}] ({path})");
+    }
+    anyhow::ensure!(r.ok(), "{} broken citation(s)", r.broken.len());
+    Ok(())
+}
+
+fn eval_cmd(retrieval_only: bool, model: Option<String>) -> anyhow::Result<()> {
+    let mut ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    let path = ws.state_dir().join("eval.jsonl");
+    let items = eval::load(&path)?;
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+
+    let retrieval = eval::retrieval(&conn, &embedder, &items)?;
+    println!("Retrieval ({} questions):", retrieval.len());
+    for r in &retrieval {
+        let rank = |r: Option<usize>| r.map_or("miss".to_string(), |n| format!("#{n}"));
+        let (doc, page) = if r.answerable { (rank(r.doc_rank), rank(r.page_rank)) } else { ("–".into(), "–".into()) };
+        println!("  doc {doc:>4}  page {page:>4}  sim {:.2}  {}{}", r.best_similarity.unwrap_or(0.0), if r.answerable { "" } else { "(unanswerable) " }, r.question);
+    }
+
+    let mut answers = Vec::new();
+    let mut model_name = None;
+    if !retrieval_only {
+        let llm = Ollama::new(&ws.global.ollama_host)?;
+        let model = model.unwrap_or_else(|| ws.config.chat_model.clone());
+        let num_ctx = resolve_num_ctx(&mut ws, &llm, &model)?;
+        let engine = RagEngine { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm };
+        println!("\nAnswers ({model}, num_ctx {num_ctx}):");
+        answers = eval::answers(&engine, &items, &model, num_ctx, &mut |i, r| {
+            let verdict = match (r.answerable, r.supported) {
+                (true, true) => "supported",
+                (true, false) => "UNSUPPORTED",
+                (false, false) => "refused ✓",
+                (false, true) => "ANSWERED (should refuse)",
+            };
+            println!(
+                "  {:>2}. {verdict:<24} cites {} (verified {}, on doc {}) uncited {}  {}",
+                i + 1, r.citations, r.verified, r.on_expected_doc, r.uncited_sentences, r.question
+            );
+        })?;
+        model_name = Some(model);
+    }
+
+    let summary = eval::summarize(&items, &retrieval, &answers);
+    let pct = |v: Option<f32>| v.map_or("n/a".to_string(), |v| format!("{:.0}%", v * 100.0));
+    println!("\nSummary");
+    println!("  doc recall@5 {}  @10 {}", pct(Some(summary.doc_recall_at_5)), pct(Some(summary.doc_recall_at_10)));
+    println!("  page recall@5 {}  @10 {}", pct(summary.page_recall_at_5), pct(summary.page_recall_at_10));
+    let sim = |v: Option<f32>| v.map_or("n/a".to_string(), |v| format!("{v:.2}"));
+    println!(
+        "  best similarity: lowest answerable {} · highest unanswerable {} · gate min_similarity {:.2}",
+        sim(summary.lowest_answerable_similarity), sim(summary.highest_unanswerable_similarity), ws.config.retrieval.min_similarity
+    );
+    if !retrieval_only {
+        println!("  answerable supported {}  ·  unanswerable refused {}", pct(summary.supported_rate), pct(summary.refusal_rate));
+        println!("  quote verification {}  ·  citation precision {}", pct(summary.quote_verification_rate), pct(summary.citation_precision));
+    }
+    let out = ws.state_dir().join("logs").join(format!("eval-{}.json", db::now_rfc3339().replace(':', "")));
+    std::fs::write(&out, serde_json::to_string_pretty(&serde_json::json!({
+        "model": model_name, "summary": summary, "retrieval": retrieval, "answers": answers,
+    }))?)?;
+    println!("  details: {}", out.display());
+    Ok(())
+}
+
+/// The workspace's num_ctx for `model`; picks the RAM-based default on first use and saves it.
+fn resolve_num_ctx(ws: &mut Workspace, llm: &Ollama, model: &str) -> anyhow::Result<u32> {
+    if let Some(n) = ws.config.num_ctx.get(model) {
+        return Ok(*n);
+    }
+    let info = llm.model_info(model)?;
+    let n = budget::default_num_ctx(budget::system_ram(), info.context_length);
+    ws.config.num_ctx.insert(model.to_string(), n);
+    ws.save_config()?;
+    eprintln!("(using num_ctx {n} for {model}, based on this Mac's memory; change it in .localrag/config.toml)");
+    Ok(n)
+}
+
+fn snippet(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max { flat } else { format!("{}…", flat.chars().take(max).collect::<String>()) }
 }
 
 fn run_doctor(cfg: &DoctorConfig) -> ExitCode {

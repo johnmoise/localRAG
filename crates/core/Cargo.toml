@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 humantime = "2.4.0"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2.191"
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-vision = "0.3.2"

@@ -22,29 +22,18 @@ pub fn pdfium(lib: &Path) -> anyhow::Result<&'static Pdfium> {
     Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
-/// Finds libpdfium.dylib: the configured path, `$LOCALRAG_PDFIUM`, next to the executable
-/// (the app bundle's Frameworks folder), or a dev checkout's `third_party/pdfium/lib/`.
+/// Finds libpdfium.dylib: the configured path, `$LOCALRAG_PDFIUM`, or a bundled copy
+/// (see `resources::find`).
 pub fn find_library(configured: Option<&Path>) -> anyhow::Result<PathBuf> {
-    const NAME: &str = "libpdfium.dylib";
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    candidates.extend(configured.map(Path::to_path_buf));
-    candidates.extend(std::env::var_os("LOCALRAG_PDFIUM").map(PathBuf::from));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(NAME));
-            candidates.push(dir.join("../Frameworks").join(NAME));
-            for ancestor in dir.ancestors() {
-                candidates.push(ancestor.join("third_party/pdfium/lib").join(NAME));
-            }
+    let explicit = configured.map(Path::to_path_buf).or_else(|| std::env::var_os("LOCALRAG_PDFIUM").map(PathBuf::from));
+    if let Some(p) = explicit {
+        if p.is_file() {
+            return Ok(p);
         }
+        bail!("libpdfium not found at {}", p.display());
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("third_party/pdfium/lib").join(NAME));
-    }
-    match candidates.into_iter().find(|p| p.is_file()) {
-        Some(p) => Ok(p),
-        None => bail!("{NAME} not found; set pdfium_lib in the global config or run scripts/fetch-pdfium.sh"),
-    }
+    crate::resources::find("pdfium/lib/libpdfium.dylib")
+        .context("libpdfium.dylib not found; set pdfium_lib in the global config or run scripts/fetch-pdfium.sh")
 }
 
 pub fn parse(pdfium: &Pdfium, bytes: &[u8]) -> Result<ParsedDoc, FileError> {

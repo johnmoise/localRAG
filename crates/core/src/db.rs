@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -30,12 +30,18 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version == 0 {
-        conn.execute_batch(SCHEMA_V1).context("creating schema")?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    } else if version > SCHEMA_VERSION {
+    if version > SCHEMA_VERSION {
         anyhow::bail!("index.db has schema {version}, newer than this localrag ({SCHEMA_VERSION})");
     }
+    let tx = conn.unchecked_transaction()?;
+    if version < 1 {
+        tx.execute_batch(SCHEMA_V1).context("creating schema v1")?;
+    }
+    if version < 2 {
+        tx.execute_batch(SCHEMA_V2).context("migrating to schema v2")?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -80,6 +86,22 @@ END;
 -- embedding dimension is known.
 ";
 
+/// Chat history (§8). Citations are snapshotted so old answers stay readable after their
+/// sources change or are forgotten.
+const SCHEMA_V2: &str = "
+CREATE TABLE sessions (id INTEGER PRIMARY KEY, title TEXT, model TEXT, created_at TEXT NOT NULL);
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,          -- user|assistant
+  content TEXT NOT NULL,
+  citations_json TEXT,         -- [{marker, label, pages, quote, quote_verified, doc_sha256, chunk_text_sha, chunk_id}]
+  warnings_json TEXT,          -- context-overload warnings (§11)
+  supported INTEGER, model TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX messages_session ON messages(session_id, id);
+";
+
 /// (Re)creates `chunks_vec` for `dim` dimensions together with the trigger that keeps it
 /// and `chunks_fts` in sync on delete. Dropping it discards all vectors.
 pub fn recreate_vec_table(conn: &Connection, dim: usize) -> anyhow::Result<()> {
@@ -109,8 +131,11 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Little-endian f32 bytes, the blob format sqlite-vec accepts for float vectors.
+/// Little-endian f32 bytes of the unit-length vector, the blob format sqlite-vec accepts.
+/// Stored vectors are always normalized so distances convert to cosine similarity.
 pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut v = v.to_vec();
+    crate::embed::normalize(&mut v);
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
