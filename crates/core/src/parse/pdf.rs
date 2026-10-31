@@ -36,13 +36,21 @@ pub fn find_library(configured: Option<&Path>) -> anyhow::Result<PathBuf> {
         .context("libpdfium.dylib not found; set pdfium_lib in the global config or run scripts/fetch-pdfium.sh")
 }
 
-pub fn parse(pdfium: &Pdfium, bytes: &[u8]) -> Result<ParsedDoc, FileError> {
+/// Cheap checks that don't need PDFium: empty file, or no `%PDF-` header in the first KB.
+pub fn sniff(bytes: &[u8]) -> Result<(), FileError> {
     if bytes.is_empty() {
         return Err(FileError("the file is empty".into()));
     }
     if !bytes[..bytes.len().min(1024)].windows(5).any(|w| w == b"%PDF-") {
         return Err(FileError("not a PDF: the file has no PDF header (%PDF-). It may be another format renamed to .pdf".into()));
     }
+    Ok(())
+}
+
+/// In-process parse. Only the sandboxed helper (`localrag-pdf`) calls this; everything else
+/// goes through `crate::pdfhelper`.
+pub fn parse(pdfium: &Pdfium, bytes: &[u8]) -> Result<ParsedDoc, FileError> {
+    sniff(bytes)?;
     let doc = pdfium.load_pdf_from_byte_slice(bytes, None).map_err(|e| FileError(open_error(&e)))?;
     if doc.pages().is_empty() {
         return Err(FileError("the PDF has no pages".into()));
@@ -66,7 +74,7 @@ pub fn parse(pdfium: &Pdfium, bytes: &[u8]) -> Result<ParsedDoc, FileError> {
     Ok(parsed)
 }
 
-fn open_error(e: &PdfiumError) -> String {
+pub fn open_error(e: &PdfiumError) -> String {
     use PdfiumInternalError as I;
     match e {
         PdfiumError::PdfiumLibraryInternalError(I::PasswordError) => {
@@ -108,7 +116,7 @@ fn metadata(doc: &PdfDocument) -> DocMeta {
         ..DocMeta::default()
     };
     if meta.title.is_some() || !meta.authors.is_empty() {
-        meta.source = Some("pdf");
+        meta.source = Some("pdf".into());
     }
     meta
 }

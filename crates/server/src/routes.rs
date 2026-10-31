@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/documents", get(documents))
         .route("/api/documents/{id}", delete(forget))
         .route("/api/documents/forget-removed", post(forget_removed))
+        .route("/api/documents/{id}/rename", post(rename))
         .route("/api/reindex", post(reindex))
         .route("/api/chunks/{id}", get(chunk))
         .route("/api/highlights", get(highlights))
@@ -374,6 +375,27 @@ async fn forget_removed(State(state): State<AppState>) -> ApiResult {
             forgotten.push(index::forget(&ws, &conn, d.id)?);
         }
         Ok(Json(json!({ "forgotten": forgotten })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    name: String,
+}
+
+/// Renames a corpus file without reindexing (§15).
+async fn rename(State(state): State<AppState>, Path(id): Path<i64>, Json(body): Json<RenameBody>) -> ApiResult {
+    if state.sync.lock().expect("sync state").running {
+        return Err(ApiError::new(StatusCode::CONFLICT, "busy", "Indexing is running; try renaming again when it finishes."));
+    }
+    blocking(move || {
+        let ws = state.workspace()?;
+        let mut conn = db::open(&ws.db_path())?;
+        let name = crate::upload::safe_name(&body.name)?;
+        let report = index::rename_document(&ws, &mut conn, id, &name)
+            .map_err(|e| ApiError::new(StatusCode::CONFLICT, "rename_failed", format!("{e:#}")))?;
+        Ok(Json(serde_json::to_value(report).map_err(anyhow::Error::from)?))
     })
     .await
 }

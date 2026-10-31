@@ -1,51 +1,43 @@
-use std::io::Cursor;
-use std::path::Path;
-
-use anyhow::{Context, ensure};
-use pdfium_render::prelude::*;
+use anyhow::{Context, bail, ensure};
 
 use super::{Outcome, SAMPLE_PDF};
+use crate::pdfhelper::PdfHelper;
 
 pub(super) struct PdfReport {
     pub outcome: Outcome,
     pub page1_png: Vec<u8>,
 }
 
-/// Text, per-character boxes and page labels from the fixture, plus a page render (§5, §6).
-pub(super) fn check(lib: &Path) -> anyhow::Result<PdfReport> {
-    let pdfium = crate::parse::pdf::pdfium(lib).context("binding libpdfium")?;
-    let doc = pdfium.load_pdf_from_byte_slice(SAMPLE_PDF, None)?;
+/// Through the sandboxed helper process, as the app uses it: text, per-character boxes and
+/// page labels from the fixture, plus a page render (§5, §6, §14).
+pub(super) fn check(helper: &PdfHelper) -> anyhow::Result<PdfReport> {
+    let path = std::env::temp_dir().join(format!("localrag-doctor-{}.pdf", std::process::id()));
+    std::fs::write(&path, SAMPLE_PDF)?;
+    let result = (|| {
+        let doc = helper.parse(&path)?.map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+        let labels: Vec<String> = doc.pages.iter().map(|p| p.label.clone().unwrap_or_default()).collect();
+        ensure!(doc.pages[0].text.contains("quadratic time"), "unexpected page text: {:?}", doc.pages[0].text);
+        ensure!(labels == ["345", "346"], "page labels {labels:?}, expected [\"345\", \"346\"]");
 
-    let mut labels = Vec::new();
-    let mut boxed_chars = 0usize;
-    let mut page1_text = String::new();
-    for (i, page) in doc.pages().iter().enumerate() {
-        labels.push(page.label().unwrap_or("").to_string());
-        let text = page.text()?;
-        if i == 0 {
-            page1_text = text.all();
+        let pages = helper.chars(&path, 1, 2)?.map_err(|e| anyhow::anyhow!("chars: {e}"))?;
+        let boxed = pages.iter().flat_map(|p| &p.chars).filter(|c| c.1.is_some()).count();
+        ensure!(boxed > 100, "only {boxed} characters had bounding boxes");
+
+        // ~300 DPI for a US-letter page, as planned for OCR.
+        let png = helper.render(&path, 1, 2550)?.map_err(|e| anyhow::anyhow!("render: {e}"))?;
+        if !png.starts_with(b"\x89PNG") {
+            bail!("render didn't return a PNG");
         }
-        boxed_chars += text.chars().iter().filter(|c| c.loose_bounds().is_ok()).count();
-    }
-    ensure!(page1_text.contains("quadratic time"), "unexpected page text: {page1_text:?}");
-    ensure!(labels == ["345", "346"], "page labels {labels:?}, expected [\"345\", \"346\"]");
-    ensure!(boxed_chars > 100, "only {boxed_chars} characters had bounding boxes");
-
-    // ~300 DPI for a US-letter page, as planned for OCR.
-    let page1 = doc.pages().get(0)?;
-    let image = page1
-        .render_with_config(&PdfRenderConfig::new().set_target_width(2550))?
-        .as_image()?;
-    let mut page1_png = Vec::new();
-    image.write_to(&mut Cursor::new(&mut page1_png), image::ImageFormat::Png)?;
-
-    Ok(PdfReport {
-        outcome: Outcome::Pass(format!(
-            "{} pages, {boxed_chars} chars with boxes, labels {labels:?}, page 1 rendered {}×{}",
-            doc.pages().len(),
-            image.width(),
-            image.height()
-        )),
-        page1_png,
-    })
+        Ok(PdfReport {
+            outcome: Outcome::Pass(format!(
+                "{} pages, {boxed} chars with boxes, labels {labels:?}, page 1 rendered ({} KB); helper {}",
+                doc.pages.len(),
+                png.len() / 1024,
+                if helper.is_sandboxed() { "sandboxed (no network, no writes)" } else { "NOT sandboxed" }
+            )),
+            page1_png: png,
+        })
+    })();
+    let _ = std::fs::remove_file(&path);
+    result.context("PDF helper")
 }

@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
+use localrag_core::index::Parsers;
 use localrag_core::parse::{self, DocKind};
 
 use crate::AppState;
@@ -45,26 +46,32 @@ pub async fn upload(State(state): State<AppState>, Query(q): Query<UploadQuery>,
                 format!("“{name}” is {:.1} MB; this workspace accepts files up to {} MB (max_file_mb in .localrag/config.toml).", body.len() as f64 / 1e6, ws.config.max_file_mb),
             ));
         }
-        let pdfium = match kind {
-            DocKind::Pdf => {
-                let lib = parse::pdf::find_library(ws.global.pdfium_lib.as_deref())?;
-                Some(parse::pdf::pdfium(&lib)?)
-            }
-            _ => None,
-        };
-        let check = parse::check_upload(kind, &body, pdfium).map_err(|e| {
-            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "parse_failed", format!("“{name}” couldn't be read: {e}."))
-        })?;
-
-        // Write under a hidden temporary name (the scanner skips hidden files), then rename,
-        // so a sync never sees a half-written file.
+        // Write under a hidden temporary name (the scanner skips hidden files), parse that
+        // file exactly as indexing will (PDFs in the sandboxed helper), and only then rename
+        // it into place, so a sync never sees a half-written or unreadable file.
         let corpus = ws.corpus_dir();
         std::fs::create_dir_all(&corpus).map_err(anyhow::Error::from)?;
-        let target = unique_path(&corpus, &name);
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = corpus.join(format!(".upload-{}-{seq}.tmp", std::process::id()));
         std::fs::write(&tmp, &body).map_err(anyhow::Error::from)?;
+        let parsed = Parsers::new(&ws).parse_path(kind, &tmp);
+        let check = match parsed {
+            Ok(Ok(doc)) => parse::check_upload(kind, &doc),
+            Ok(Err(e)) => Err(e),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        };
+        let check = match check {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "parse_failed", format!("“{name}” couldn't be read: {e}.")));
+            }
+        };
+        let target = unique_path(&corpus, &name);
         std::fs::rename(&tmp, &target).map_err(anyhow::Error::from)?;
         state.start_sync();
 
@@ -75,7 +82,7 @@ pub async fn upload(State(state): State<AppState>, Query(q): Query<UploadQuery>,
 }
 
 /// The file name alone: no folders, no leading dot, no control characters.
-fn safe_name(raw: &str) -> Result<String, ApiError> {
+pub(crate) fn safe_name(raw: &str) -> Result<String, ApiError> {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("").trim();
     let clean: String = base.chars().filter(|c| !c.is_control()).collect();
     if clean.is_empty() || clean.starts_with('.') || clean == ".." {

@@ -269,6 +269,7 @@ fn bad_files_fail_once_and_retry_only_when_changed() {
 /// Needs libpdfium (scripts/fetch-pdfium.sh); skipped when it isn't available.
 #[test]
 fn pdfs_get_page_labels_and_scanned_pages_are_flagged() {
+    use_built_helper();
     let Ok(lib) = localrag_core::parse::pdf::find_library(None) else {
         eprintln!("skipping: libpdfium not found");
         return;
@@ -311,6 +312,23 @@ fn scanned_pdf(pdfium: &pdfium_render::prelude::Pdfium) -> Vec<u8> {
 }
 
 #[test]
+fn damaged_pdfs_fail_cleanly_through_the_helper() {
+    use_built_helper();
+    if localrag_core::parse::pdf::find_library(None).is_err() {
+        return;
+    }
+    let mut f = Fixture::new();
+    f.write("broken.pdf", b"%PDF-1.4\n1 0 obj << garbage that is not a PDF structure");
+    f.write("fake.pdf", b"just text with a .pdf name");
+    let e = FakeEmbedder::new("m", 8);
+    let (r, events) = f.sync(&e);
+    assert_eq!(r.failed, 2, "{events:?}");
+    let msg = |p: &str| events.iter().find(|e| e.path == p).map(|e| format!("{:?}", e.change)).unwrap();
+    assert!(msg("broken.pdf").contains("damaged or not a valid PDF"), "{}", msg("broken.pdf"));
+    assert!(msg("fake.pdf").contains("no PDF header"), "{}", msg("fake.pdf"));
+}
+
+#[test]
 fn concurrent_first_open_migrates_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.db");
@@ -321,4 +339,52 @@ fn concurrent_first_open_migrates_once() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+}
+
+/// PDFs are parsed by the `localrag-pdf` helper binary built alongside these tests.
+fn use_built_helper() {
+    // SAFETY: tests that read it all set the same value.
+    unsafe { std::env::set_var("LOCALRAG_PDF_HELPER", env!("CARGO_BIN_EXE_localrag-pdf")) };
+}
+
+#[test]
+fn rename_updates_references_without_reindexing() {
+    let mut f = Fixture::new();
+    f.write("Parry et al. - 2011 - Survivors.txt", paragraphs(3, "survivors"));
+    f.write("other.txt", paragraphs(2, "other"));
+    let e = FakeEmbedder::new("m", 8);
+    f.sync(&e);
+    let embedded = e.embedded.get();
+    let id = index::find_document(&f.conn, "Parry et al. - 2011 - Survivors.txt").unwrap().unwrap();
+
+    let session = localrag_core::history::create_session(&f.conn, "q", "m").unwrap();
+    let snaps = serde_json::json!([{ "ordinal": 0, "marker": 1, "label": "Parry et al. 2011, ll. 1–3",
+        "doc_path": "Parry et al. - 2011 - Survivors.txt", "doc_sha256": "x", "chunk_text_sha": "y", "chunk_id": 1,
+        "quote": null, "quote_verified": false }]);
+    f.conn.execute(
+        "INSERT INTO messages (session_id, role, content, citations_json, created_at) VALUES (?1, 'assistant', 'A [S1].', ?2, 'now')",
+        rusqlite::params![session, snaps.to_string()],
+    ).unwrap();
+    std::fs::write(f.ws.state_dir().join("eval.jsonl"), "{\"question\": \"q\", \"expected_doc\": \"Parry et al\"}\n{\"question\": \"r\", \"expected_doc\": \"other\"}\n").unwrap();
+
+    let err = index::rename_document(&f.ws, &mut f.conn, id, "parry.pdf").unwrap_err().to_string();
+    assert!(err.contains("keep the .txt extension"), "{err}");
+    let err = index::rename_document(&f.ws, &mut f.conn, id, "other.txt").unwrap_err().to_string();
+    assert!(err.contains("already exists"), "{err}");
+
+    let r = index::rename_document(&f.ws, &mut f.conn, id, "parry-2011.txt").unwrap();
+    assert_eq!((r.path.as_str(), r.label.as_str()), ("parry-2011.txt", "parry-2011"));
+    assert_eq!((r.citations_updated, r.eval_items_updated), (1, 1));
+    assert!(f.corpus().join("parry-2011.txt").is_file() && !f.corpus().join("Parry et al. - 2011 - Survivors.txt").exists());
+
+    let msg: String = f.conn.query_row("SELECT citations_json FROM messages", [], |r| r.get(0)).unwrap();
+    let snap: serde_json::Value = serde_json::from_str::<Vec<serde_json::Value>>(&msg).unwrap().remove(0);
+    assert_eq!((snap["doc_path"].as_str(), snap["label"].as_str()), (Some("parry-2011.txt"), Some("parry-2011, ll. 1–3")));
+    let eval = std::fs::read_to_string(f.ws.state_dir().join("eval.jsonl")).unwrap();
+    assert!(eval.contains("\"expected_doc\":\"parry-2011.txt\"") && eval.contains("\"expected_doc\": \"other\""), "{eval}");
+
+    // The next sync sees nothing to do: same content, same stat, new path already recorded.
+    let (report, events) = f.sync(&e);
+    assert!(!report.changed_any() && events.is_empty(), "{report:?} {events:?}");
+    assert_eq!(e.embedded.get(), embedded);
 }

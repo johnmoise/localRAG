@@ -14,6 +14,7 @@ pub mod index;
 pub mod instance;
 pub mod llm;
 pub mod parse;
+pub mod pdfhelper;
 pub mod prompts;
 pub mod refs;
 pub mod registry;

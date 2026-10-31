@@ -100,14 +100,23 @@ impl Workspace {
     }
 }
 
-/// `.localrag/.gitignore` containing `*` makes git ignore the whole state folder (index,
-/// chat history, OCR text, config) in any repository, including one created after the
-/// workspace. Nothing in `.localrag/` is meant to be committed.
+/// `.localrag/.gitignore` and `corpus/.gitignore`, each containing `*`, make git ignore the
+/// state folder (index, chat history, extracted text, settings) and the documents (often
+/// copyrighted or private) in any repository, including one created after the workspace.
 fn ensure_state_ignored(root: &Path) -> anyhow::Result<()> {
-    let path = root.join(STATE_DIR).join(".gitignore");
-    if std::fs::read_to_string(&path).map(|t| t.lines().any(|l| l.trim() == "*")).unwrap_or(false) {
-        return Ok(());
+    const NOTE: &str = "# Written by localrag so git never commits this folder. Delete this file to version it.\n*\n";
+    for (dir, note) in [
+        (root.join(STATE_DIR), "# Written by localrag: nothing in .localrag/ belongs in version control\n# (index, chat history, extracted document text, settings).\n*\n"),
+        (root.join(CORPUS_DIR), NOTE),
+    ] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let path = dir.join(".gitignore");
+        if path.exists() {
+            continue; // respect an existing (possibly user-edited) file
+        }
+        std::fs::write(&path, note).with_context(|| format!("writing {}", path.display()))?;
     }
-    std::fs::write(&path, "# Written by localrag: nothing in .localrag/ belongs in version control\n# (index, chat history, extracted document text, settings).\n*\n")
-        .with_context(|| format!("writing {}", path.display()))
+    Ok(())
 }

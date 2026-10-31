@@ -71,9 +71,9 @@ pub async fn run(cfg: &DoctorConfig) -> Vec<Check> {
 
     // PDFium renders page 1 for the OCR check, so OCR depends on it.
     let t = Instant::now();
-    let pdf = crate::parse::pdf::find_library(cfg.pdfium_lib.as_deref()).and_then(|lib| pdf::check(&lib));
+    let pdf = crate::pdfhelper::PdfHelper::locate(cfg.pdfium_lib.as_deref()).and_then(|h| pdf::check(&h));
     let rendered = pdf.as_ref().ok().map(|r| r.page1_png.clone());
-    checks.push(Check::from_result("PDFium text, boxes, labels, render", t, pdf.map(|r| r.outcome)));
+    checks.push(Check::from_result("PDF helper (PDFium)", t, pdf.map(|r| r.outcome)));
 
     let t = Instant::now();
     let ocr = match rendered {

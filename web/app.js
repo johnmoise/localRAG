@@ -616,15 +616,52 @@ async function loadLibrary() {
   $("#forget-all").disabled = !counts.removed;
   $("#library-rows").replaceChildren(...documents.map((d) => {
     const detail = d.status === "failed" ? d.error : d.status === "needs_ocr" ? `Scanned pages without text: ${(d.scanned_pages || []).join(", ")} (OCR arrives in a later phase)` : null;
+    const nameCell = el("td", {}, el("div", {}, d.label), el("div", { class: "path" }, d.path), detail ? el("div", { class: "muted" }, detail) : null);
     return el("tr", {},
-      el("td", {}, el("div", {}, d.label), el("div", { class: "path" }, d.path), detail ? el("div", { class: "muted" }, detail) : null),
+      nameCell,
       el("td", {}, el("span", { class: `st ${d.status}` }, d.status.replace("_", " "))),
       el("td", {}, String(d.chunks)),
       el("td", {}, d.pages != null && d.kind === "pdf" ? String(d.pages) : "–"),
-      el("td", {}, d.status === "removed"
+      el("td", { class: "actions" }, d.status === "removed"
         ? el("button", { class: "small danger", title: "Permanently delete this document's record, passages and OCR cache", onclick: () => forget(d) }, "Forget")
-        : null));
+        : el("button", { class: "small", title: "Rename the file (no reindexing)", onclick: () => startRename(d, nameCell) }, "Rename")));
   }));
+}
+
+/// Inline rename: Enter saves, Escape cancels. Only the name changes: the extension is shown
+/// as a fixed suffix (changing the type would mean reindexing), and nothing is reindexed.
+function startRename(d, cell) {
+  const file = d.path.split("/").pop();
+  const dot = file.lastIndexOf(".");
+  const [stem, ext] = dot > 0 ? [file.slice(0, dot), file.slice(dot)] : [file, ""];
+  const input = el("input", { type: "text", value: stem, class: "rename-input", spellcheck: "false" });
+  const err = el("div", { class: "error" });
+  const original = [...cell.childNodes];
+  cell.replaceChildren(el("div", { class: "row" }, input, el("span", { class: "path" }, ext)), el("div", { class: "muted small-text" }, "Enter to save · Esc to cancel"), err);
+  input.focus();
+  input.select();
+  input.addEventListener("keydown", async (e) => {
+    if (e.key === "Escape") { cell.replaceChildren(...original); return; }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    let newStem = input.value.trim();
+    // Typing the extension too is harmless: don't double it.
+    if (ext && newStem.toLowerCase().endsWith(ext.toLowerCase())) newStem = newStem.slice(0, -ext.length).trim();
+    const name = newStem + ext;
+    if (!newStem || name === file) { cell.replaceChildren(...original); return; }
+    input.disabled = true;
+    try {
+      const r = await api(`/api/documents/${d.id}/rename`, { method: "POST", body: JSON.stringify({ name }) });
+      const notes = [];
+      if (r.citations_updated) notes.push(`${r.citations_updated} citation(s) in chat history updated`);
+      if (r.eval_items_updated) notes.push(`${r.eval_items_updated} eval question(s) updated`);
+      $("#upload-results").replaceChildren(el("li", { class: "ok" }, `Renamed ${file} → ${r.path.split("/").pop()}${notes.length ? ` · ${notes.join(", ")}` : ""}. Not reindexed.`));
+      loadLibrary();
+    } catch (ex) {
+      input.disabled = false;
+      err.textContent = ex.message;
+    }
+  });
 }
 
 async function forget(d) {
@@ -679,7 +716,7 @@ async function fillRecent() {
 
 let dialogRequired = false;
 async function showWorkspaceDialog(focus = "open") {
-  const { active, known, home } = await api("/api/workspaces");
+  const { active, known } = await api("/api/workspaces");
   dialogRequired = !active;
   $("#ws-close").hidden = dialogRequired;
   $("#ws-error").textContent = "";
@@ -704,7 +741,7 @@ async function showWorkspaceDialog(focus = "open") {
         onclick: async () => { await api("/api/workspaces/forget", { method: "POST", body: JSON.stringify({ path: w.path }) }); showWorkspaceDialog(focus); },
       }, "×"),
     )));
-  if (!$("#ws-parent").value && home) $("#ws-parent").value = home;
+  updateCreateButton();
   $("#ws-dialog").hidden = false;
   if (focus === "create" || !usable.length) $("#ws-name-input").focus();
 }
@@ -716,10 +753,17 @@ function closeWorkspaceDialog() {
 $("#ws-close").addEventListener("click", closeWorkspaceDialog);
 $("#ws-dialog").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); closeWorkspaceDialog(); } });
 
+// The location comes only from the macOS folder chooser; it can't be typed.
 $("#ws-choose").addEventListener("click", async () => {
   const r = await api("/api/workspaces/choose-folder", { method: "POST" });
   if (r.path) $("#ws-parent").value = r.path;
+  updateCreateButton();
 });
+$("#ws-parent").addEventListener("click", () => $("#ws-choose").click());
+$("#ws-name-input").addEventListener("input", updateCreateButton);
+function updateCreateButton() {
+  $("#ws-create").disabled = !$("#ws-parent").value || !$("#ws-name-input").value.trim();
+}
 
 $("#ws-open-other").addEventListener("click", async () => {
   const r = await api("/api/workspaces/choose-folder", { method: "POST" });
@@ -731,6 +775,7 @@ $("#ws-create").addEventListener("click", async () => {
   try {
     const r = await api("/api/workspaces/create", { method: "POST", body: JSON.stringify({ parent: $("#ws-parent").value.trim(), name: $("#ws-name-input").value.trim() }) });
     $("#ws-name-input").value = "";
+    $("#ws-parent").value = "";
     onWorkspaceActivated(r.active);
   } catch (e) {
     $("#ws-error").textContent = e.message;

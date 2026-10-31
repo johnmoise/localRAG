@@ -43,7 +43,7 @@ impl DocKind {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParsedDoc {
     pub pages: Vec<Page>,
     /// 1-based PDF pages with no text layer (§6).
@@ -51,17 +51,17 @@ pub struct ParsedDoc {
     pub meta: DocMeta,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DocMeta {
     pub title: Option<String>,
     pub authors: Vec<String>,
     pub year: Option<i32>,
     pub doi: Option<String>,
     /// Where these fields came from: "pdf" or "frontmatter".
-    pub source: Option<&'static str>,
+    pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Page {
     /// 1-based page index for PDFs; `None` for Markdown and text, which are one "page".
     pub pdf_page: Option<u32>,
@@ -72,7 +72,7 @@ pub struct Page {
 }
 
 /// A paragraph-like run of text within one page.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     /// Char offsets into `Page::text`.
     pub chars: Range<usize>,
@@ -124,14 +124,9 @@ pub struct UploadCheck {
     pub title: Option<String>,
 }
 
-/// Parses an upload exactly as indexing will, so problems are reported before the file is
-/// added to corpus/. `pdfium` is only needed for PDFs.
-pub fn check_upload(kind: DocKind, bytes: &[u8], pdfium: Option<&pdfium_render::prelude::Pdfium>) -> Result<UploadCheck, FileError> {
-    let doc = match kind {
-        DocKind::Pdf => pdf::parse(pdfium.ok_or_else(|| FileError("PDF support (libpdfium) isn't available".into()))?, bytes)?,
-        DocKind::Markdown => markdown::parse(bytes)?,
-        DocKind::Text => text::parse(bytes)?,
-    };
+/// Checks an upload parsed exactly as indexing will parse it (PDFs via the helper process,
+/// `crate::pdfhelper`), so problems are reported before the file joins corpus/.
+pub fn check_upload(kind: DocKind, doc: &ParsedDoc) -> Result<UploadCheck, FileError> {
     let text_chars: usize = doc.pages.iter().map(|p| p.text.chars().filter(|c| !c.is_whitespace()).count()).sum();
     if text_chars == 0 && doc.scanned_pages.is_empty() {
         return Err(FileError(match kind {
@@ -139,7 +134,7 @@ pub fn check_upload(kind: DocKind, bytes: &[u8], pdfium: Option<&pdfium_render::
             _ => "the file contains no text".into(),
         }));
     }
-    Ok(UploadCheck { kind: kind.as_str(), pages: doc.pages.len(), text_chars, scanned_pages: doc.scanned_pages, title: doc.meta.title })
+    Ok(UploadCheck { kind: kind.as_str(), pages: doc.pages.len(), text_chars, scanned_pages: doc.scanned_pages.clone(), title: doc.meta.title.clone() })
 }
 
 /// Builds a page whose blocks are runs of non-blank lines, for plain text and Markdown bodies.

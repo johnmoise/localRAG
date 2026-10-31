@@ -63,7 +63,7 @@ fn front_matter(text: &str) -> (DocMeta, usize) {
         }
     }
     if meta.title.is_some() || !meta.authors.is_empty() || meta.year.is_some() || meta.doi.is_some() {
-        meta.source = Some("frontmatter");
+        meta.source = Some("frontmatter".into());
     }
     (meta, body_start)
 }

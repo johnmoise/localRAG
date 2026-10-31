@@ -24,9 +24,33 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
     // The busy timeout first, so the other pragmas and the migration wait out concurrent openers.
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    migrate(&conn)?;
+    // Switching a new database to WAL, and the migration's BEGIN IMMEDIATE, can report
+    // SQLITE_BUSY without consulting the busy handler when several connections open it at
+    // once; retry those briefly.
+    retry_busy(|| conn.pragma_update(None, "journal_mode", "WAL").map_err(anyhow::Error::from))?;
+    retry_busy(|| migrate(&conn))?;
     Ok(conn)
+}
+
+fn retry_busy<T>(mut f: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let started = std::time::Instant::now();
+    loop {
+        match f() {
+            Err(e) if is_busy(&e) && started.elapsed() < std::time::Duration::from_secs(10) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(f, _)) if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    })
 }
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {

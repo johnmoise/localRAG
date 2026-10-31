@@ -42,6 +42,7 @@ fn char_span(text: &str, needle: &str) -> (usize, usize) {
 
 #[test]
 fn pdf_quote_and_whole_chunk_map_to_page_rectangles() {
+    use_built_helper();
     if localrag_core::parse::pdf::find_library(None).is_err() {
         eprintln!("skipping: libpdfium not found");
         return;
@@ -82,4 +83,10 @@ fn changed_or_removed_files_are_reported_unavailable() {
     let (id, _) = chunk_with(&conn, "attention");
     std::fs::write(ws.corpus_dir().join("a.txt"), "Edited since indexing.\n").unwrap();
     assert!(matches!(highlight::for_chunk(&ws, &conn, id, None).unwrap(), Highlight::Unavailable { .. }));
+}
+
+/// PDFs are parsed by the `localrag-pdf` helper binary built alongside these tests.
+fn use_built_helper() {
+    // SAFETY: tests that read it all set the same value.
+    unsafe { std::env::set_var("LOCALRAG_PDF_HELPER", env!("CARGO_BIN_EXE_localrag-pdf")) };
 }

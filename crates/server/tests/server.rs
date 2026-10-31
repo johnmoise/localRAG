@@ -173,7 +173,7 @@ async fn workspaces_can_be_created_opened_and_switched() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let a = parent.path().canonicalize().unwrap().join("topic-a");
     assert_eq!(s.root().as_deref(), Some(a.as_path()));
-    assert!(a.join("corpus").is_dir() && a.join(".localrag/.gitignore").is_file());
+    assert!(a.join("corpus").is_dir() && a.join(".localrag/.gitignore").is_file() && a.join("corpus/.gitignore").is_file());
 
     let (status, body) = send_json(&s, post("/api/workspaces/create", json!({ "parent": parent.path(), "name": "topic-a" }))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "a non-empty folder isn't overwritten");
@@ -225,7 +225,7 @@ async fn uploads_are_validated_before_joining_the_corpus() {
 
     let mut files: Vec<String> = std::fs::read_dir(&corpus).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
     files.sort();
-    assert_eq!(files, ["escape.txt", "notes (2).md", "notes.md"], "rejected files never reach corpus/, no temp files left");
+    assert_eq!(files, [".gitignore", "escape.txt", "notes (2).md", "notes.md"], "rejected files never reach corpus/, no temp files left");
 }
 
 fn urlencode(s: &str) -> String {

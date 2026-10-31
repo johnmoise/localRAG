@@ -93,26 +93,37 @@ impl SyncReport {
     }
 }
 
-/// Loads PDFium only if a PDF actually needs parsing.
+/// Parses corpus files: Markdown and text in process, PDFs in the sandboxed helper process
+/// (`crate::pdfhelper`), which is located only once a PDF needs parsing.
 pub struct Parsers {
     pdfium_lib: Option<std::path::PathBuf>,
+    helper: std::sync::OnceLock<crate::pdfhelper::PdfHelper>,
 }
 
 impl Parsers {
     pub fn new(ws: &Workspace) -> Self {
-        Parsers { pdfium_lib: ws.global.pdfium_lib.clone() }
+        Parsers { pdfium_lib: ws.global.pdfium_lib.clone(), helper: std::sync::OnceLock::new() }
+    }
+
+    pub fn pdf_helper(&self) -> anyhow::Result<&crate::pdfhelper::PdfHelper> {
+        if let Some(h) = self.helper.get() {
+            return Ok(h);
+        }
+        let h = crate::pdfhelper::PdfHelper::locate(self.pdfium_lib.as_deref())?;
+        Ok(self.helper.get_or_init(|| h))
+    }
+
+    /// Parses a file on disk the way indexing does.
+    pub fn parse_path(&self, kind: DocKind, path: &std::path::Path) -> anyhow::Result<Result<ParsedDoc, FileError>> {
+        Ok(match kind {
+            DocKind::Pdf => return self.pdf_helper()?.parse(path),
+            DocKind::Markdown => parse::markdown::parse(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+            DocKind::Text => parse::text::parse(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+        })
     }
 
     fn parse(&self, file: &CorpusFile) -> anyhow::Result<Result<ParsedDoc, FileError>> {
-        let bytes = std::fs::read(&file.abs_path).with_context(|| format!("reading {}", file.abs_path.display()))?;
-        Ok(match file.kind {
-            DocKind::Pdf => {
-                let lib = parse::pdf::find_library(self.pdfium_lib.as_deref())?;
-                parse::pdf::parse(parse::pdf::pdfium(&lib)?, &bytes)
-            }
-            DocKind::Markdown => parse::markdown::parse(&bytes),
-            DocKind::Text => parse::text::parse(&bytes),
-        })
+        self.parse_path(file.kind, &file.abs_path)
     }
 }
 
@@ -340,7 +351,7 @@ fn write_document(
     let scanned = doc.map(|d| json!(d.scanned_pages).to_string());
     let page_count = doc.map(|d| d.pages.len() as i64);
     let (csl, doi, meta_source) = match doc {
-        Some(d) if d.meta.source.is_some() => (Some(csl_json(d).to_string()), d.meta.doi.clone(), d.meta.source),
+        Some(d) if d.meta.source.is_some() => (Some(csl_json(d).to_string()), d.meta.doi.clone(), d.meta.source.as_deref()),
         _ => (None, doc.and_then(|d| d.meta.doi.clone()), None),
     };
     let doc_id = match existing_id {
@@ -510,6 +521,126 @@ pub fn list_documents(conn: &Connection) -> anyhow::Result<Vec<DocSummary>> {
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenameReport {
+    pub path: String,
+    pub label: String,
+    /// Chat-history citations whose path/label were updated.
+    pub citations_updated: usize,
+    /// eval.jsonl questions whose expected_doc was updated.
+    pub eval_items_updated: usize,
+}
+
+/// Renames a document's file within its corpus folder without reindexing: the content, hash,
+/// chunks and vectors are unchanged, so only references to the name are updated. Those are
+/// the document's path, chat-history citation snapshots (path, and the label when it came
+/// from the file name), and `eval.jsonl` entries naming the old file.
+pub fn rename_document(ws: &Workspace, conn: &mut Connection, doc_id: i64, new_name: &str) -> anyhow::Result<RenameReport> {
+    let (old_path, status, kind, cite_label, csl): (String, String, String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT path, status, kind, cite_label, csl_json FROM documents WHERE id = ?1",
+            [doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+        .with_context(|| format!("no document with id {doc_id}"))?;
+    if Status::parse(&status) == Status::Removed {
+        bail!("{old_path} is no longer in corpus/, so there's no file to rename");
+    }
+    let new_kind = DocKind::from_path(std::path::Path::new(new_name));
+    if new_kind.map(DocKind::as_str) != Some(kind.as_str()) {
+        let ext = old_path.rsplit_once('.').map_or("", |(_, e)| e);
+        bail!("keep the .{ext} extension: changing a file's type would mean reindexing it");
+    }
+    let new_path = match old_path.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{new_name}"),
+        None => new_name.to_string(),
+    };
+    if new_path == old_path {
+        bail!("that's already its name");
+    }
+    let (from, to) = (ws.corpus_dir().join(&old_path), ws.corpus_dir().join(&new_path));
+    if to.exists() || conn.query_row("SELECT 1 FROM documents WHERE path = ?1", [&new_path], |_| Ok(())).optional()?.is_some() {
+        bail!("{new_path} already exists in corpus/");
+    }
+
+    let old_label = crate::cite::doc_label(cite_label.as_deref(), csl.as_deref(), &old_path);
+    let new_label = crate::cite::doc_label(cite_label.as_deref(), csl.as_deref(), &new_path);
+    std::fs::rename(&from, &to).with_context(|| format!("renaming {}", from.display()))?;
+
+    let result = (|| -> anyhow::Result<usize> {
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE documents SET path = ?2 WHERE id = ?1", params![doc_id, new_path])?;
+        let rows: Vec<(i64, String)> = tx
+            .prepare("SELECT id, citations_json FROM messages WHERE citations_json IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut updated = 0;
+        for (id, json) in rows {
+            let mut snaps: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+            let mut changed = false;
+            for snap in &mut snaps {
+                // By path, not hash: an identical copy elsewhere in corpus/ keeps its own name.
+                if snap["doc_path"] != old_path.as_str() {
+                    continue;
+                }
+                snap["doc_path"] = json!(new_path);
+                if let Some(label) = snap["label"].as_str()
+                    && let Some(rest) = label.strip_prefix(&old_label)
+                {
+                    snap["label"] = json!(format!("{new_label}{rest}"));
+                }
+                changed = true;
+                updated += 1;
+            }
+            if changed {
+                tx.execute("UPDATE messages SET citations_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&snaps)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    })();
+    let citations_updated = match result {
+        Ok(n) => n,
+        Err(e) => {
+            // Put the file back so the index and disk stay consistent.
+            let _ = std::fs::rename(&to, &from);
+            return Err(e);
+        }
+    };
+    let eval_items_updated = rename_in_eval(ws, &old_path, &new_path)?;
+    Ok(RenameReport { path: new_path, label: new_label, citations_updated, eval_items_updated })
+}
+
+/// eval.jsonl names documents by a substring of their path; retarget entries that matched
+/// the old file name and no longer match the new one.
+fn rename_in_eval(ws: &Workspace, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
+    let file = ws.state_dir().join("eval.jsonl");
+    let Ok(text) = std::fs::read_to_string(&file) else { return Ok(0) };
+    let (old_l, new_l) = (old_path.to_lowercase(), new_path.to_lowercase());
+    let new_name = new_path.rsplit('/').next().unwrap_or(new_path);
+    let mut updated = 0;
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut replaced = None;
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(want) = v["expected_doc"].as_str().map(str::to_lowercase)
+            && old_l.contains(&want)
+            && !new_l.contains(&want)
+        {
+            v["expected_doc"] = json!(new_name);
+            replaced = Some(v.to_string());
+            updated += 1;
+        }
+        out.push_str(replaced.as_deref().unwrap_or(line));
+        out.push('\n');
+    }
+    if updated > 0 {
+        crate::config::write_private(&file, out.as_bytes())?;
+    }
+    Ok(updated)
 }
 
 /// Resolves a `forget` argument: a document id or its path relative to corpus/.
