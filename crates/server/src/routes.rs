@@ -32,6 +32,15 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index_html))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
+        .route("/api/workspaces", get(crate::workspaces::list))
+        .route("/api/workspaces/open", post(crate::workspaces::open))
+        .route("/api/workspaces/create", post(crate::workspaces::create))
+        .route("/api/workspaces/forget", post(crate::workspaces::forget))
+        .route("/api/workspaces/choose-folder", post(crate::workspaces::choose_folder))
+        .route(
+            "/api/documents/upload",
+            post(crate::upload::upload).layer(axum::extract::DefaultBodyLimit::max(crate::upload::MAX_UPLOAD_BYTES)),
+        )
         .route("/api/models", get(models))
         .route("/api/search", post(search))
         .route("/api/ask", post(ask))
@@ -55,13 +64,16 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, kind: &str, message: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, kind: &str, message: impl Into<String>) -> Self {
         ApiError { status, body: json!({ "error": kind, "message": message.into() }) }
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::NoWorkspace>().is_some() {
+            return ApiError::new(StatusCode::CONFLICT, "no_workspace", e.to_string());
+        }
         if let Some(over) = e.downcast_ref::<OverBudget>() {
             let mut body = serde_json::to_value(over).unwrap_or_default();
             body["error"] = json!("over_budget");
@@ -78,10 +90,10 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult = Result<Json<Value>, ApiError>;
+pub type ApiResult = Result<Json<Value>, ApiError>;
 
 /// Runs blocking core work off the async runtime.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
+pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?
@@ -118,7 +130,9 @@ fn asset_response(path: &str) -> Response {
 
 async fn status(State(state): State<AppState>) -> ApiResult {
     let sync = state.sync.lock().expect("sync state").clone();
-    let root = state.root.clone();
+    let Some(root) = state.root() else {
+        return Ok(Json(json!({ "workspace": null })));
+    };
     blocking(move || {
         let ws = localrag_core::workspace::Workspace::open(&root)?;
         let conn = db::open(&ws.db_path())?;
@@ -192,9 +206,10 @@ async fn ask(State(state): State<AppState>, Json(body): Json<AskBody>) -> Result
     if question.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty", "Type a question first."));
     }
-    let root = state.root.clone();
+    let root = state.root().ok_or(crate::NoWorkspace).map_err(anyhow::Error::from)?;
     let (model, num_ctx) = {
         let question = question.clone();
+        let root = root.clone();
         let model = body.model.clone();
         blocking(move || {
             let mut ws = localrag_core::workspace::Workspace::open(&root)?;
@@ -210,7 +225,6 @@ async fn ask(State(state): State<AppState>, Json(body): Json<AskBody>) -> Result
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(256);
-    let root = state.root.clone();
     tokio::task::spawn_blocking(move || {
         let send = |name: &str, data: Value| {
             let _ = tx.blocking_send(SseEvent::default().event(name).data(data.to_string()));
@@ -433,7 +447,7 @@ async fn file(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Resp
             .map_err(|_| not_found("no such document in corpus/"))?;
         let bytes = std::fs::read(ws.corpus_dir().join(&path)).map_err(|_| not_found("file is missing from corpus/"))?;
         let mime = if kind == "pdf" { "application/pdf" } else { "text/plain; charset=utf-8" };
-        Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
+        Ok(([(header::CONTENT_TYPE, mime), (header::CONTENT_DISPOSITION, "inline")], bytes).into_response())
     })
     .await
 }

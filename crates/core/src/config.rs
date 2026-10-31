@@ -124,5 +124,31 @@ pub(crate) fn load_or_default<T: Default + for<'de> Deserialize<'de>>(path: &Pat
 
 pub(crate) fn save<T: Serialize>(path: &Path, value: &T, header: &str) -> anyhow::Result<()> {
     let body = toml::to_string_pretty(value)?;
-    std::fs::write(path, format!("{header}{body}")).with_context(|| format!("writing {}", path.display()))
+    write_private(path, format!("{header}{body}").as_bytes())
+}
+
+pub fn save_global(cfg: &GlobalConfig) -> anyhow::Result<()> {
+    let dir = global_config_dir();
+    ensure_private_dir(&dir)?;
+    save(&dir.join("config.toml"), cfg, "# localrag machine-wide settings. Private to this user (mode 0600); never inside a workspace.\n\n")
+}
+
+/// Creates `dir` (and parents) and makes it accessible to this user only (0700).
+pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Writes a file readable and writable by this user only (0600), replacing it atomically.
+pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }

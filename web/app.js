@@ -20,7 +20,10 @@ async function api(path, opts = {}) {
     headers: opts.body ? { "Content-Type": "application/json", ...(opts.headers || {}) } : opts.headers,
   });
   const body = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
-  if (!res.ok) throw Object.assign(new Error(body?.message || body || res.statusText), { status: res.status, body });
+  if (!res.ok) {
+    if (body?.error === "no_workspace") showWorkspaceDialog();
+    throw Object.assign(new Error(body?.message || body || res.statusText), { status: res.status, body });
+  }
   return body;
 }
 
@@ -54,7 +57,12 @@ async function refreshStatus() {
   clearTimeout(statusTimer);
   try {
     const s = await api("/api/status");
-    $("#ws-name").textContent = s.name ? `· ${s.name}` : "";
+    if (!s.workspace) {
+      $("#ws-name").textContent = "";
+      $("#status").innerHTML = `<span class="dot bad"></span>No workspace open`;
+      return;
+    }
+    $("#ws-name").textContent = s.name || "";
     document.title = s.name ? `localrag · ${s.name}` : "localrag";
     const docs = Object.values(s.documents || {}).reduce((a, b) => a + b, 0);
     let dot = "", text;
@@ -76,7 +84,7 @@ async function refreshStatus() {
     syncWasRunning = s.sync.running;
     statusTimer = setTimeout(refreshStatus, s.sync.running ? 1500 : 8000);
   } catch (e) {
-    $("#status").innerHTML = `<span class="dot bad"></span>Server unreachable`;
+    $("#status").innerHTML = `<span class="dot bad"></span>${esc(e.status ? e.message : "Server unreachable")}`;
     statusTimer = setTimeout(refreshStatus, 5000);
   }
 }
@@ -529,7 +537,9 @@ async function openViewer(chunk, span, mode) {
     pdfjs.GlobalWorkerOptions.workerSrc = "/assets/vendor/pdf.worker.min.mjs";
   }
   if (viewer.docId !== chunk.doc_id) {
-    viewer.doc = await pdfjs.getDocument({ url: `/files/${chunk.doc_id}`, withCredentials: true }).promise;
+    // isEvalSupported: false keeps PDF.js from compiling font code from the PDF (defense in
+    // depth against malicious documents, cf. CVE-2024-4367).
+    viewer.doc = await pdfjs.getDocument({ url: `/files/${chunk.doc_id}`, withCredentials: true, isEvalSupported: false }).promise;
     viewer.docId = chunk.doc_id;
   }
   viewer.rects = new Map(hl.pages.map((p) => [p.pdf_page, p.rects]));
@@ -633,20 +643,187 @@ $("#reindex").addEventListener("click", async () => {
   const before = (await api("/api/status")).sync.runs;
   await api("/api/reindex", { method: "POST" });
   refreshStatus();
-  // Small corpora sync in milliseconds, faster than the status poll notices; wait for this
-  // sync's result before redrawing the table.
-  for (let i = 0; i < 600; i++) {
-    const { sync } = await api("/api/status");
-    if (!sync.running && sync.runs > before) break;
-    await new Promise((r) => setTimeout(r, 500));
-  }
+  await waitForSync(before);
   btn.disabled = false;
   loadLibrary();
   refreshStatus();
 });
 
+// ---------------------------------------------------------------- workspaces
+
+const fileBtn = $("#file-btn");
+const fileMenu = $("#file-menu");
+fileBtn.addEventListener("click", async (e) => {
+  e.stopPropagation();
+  const open = fileMenu.hidden;
+  if (open) await fillRecent();
+  fileMenu.hidden = !open;
+  fileBtn.setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", (e) => {
+  if (!fileMenu.hidden && !fileMenu.contains(e.target)) { fileMenu.hidden = true; fileBtn.setAttribute("aria-expanded", "false"); }
+});
+$("#menu-new").addEventListener("click", () => { fileMenu.hidden = true; showWorkspaceDialog("create"); });
+$("#menu-open").addEventListener("click", () => { fileMenu.hidden = true; showWorkspaceDialog("open"); });
+
+async function fillRecent() {
+  const { active, known } = await api("/api/workspaces");
+  const recent = known.filter((w) => w.available).slice(0, 6);
+  $("#menu-recent").replaceChildren(...(recent.length ? recent.map((w) =>
+    el("button", {
+      role: "menuitem", class: active?.path === w.path ? "current" : "",
+      onclick: () => { fileMenu.hidden = true; if (active?.path !== w.path) switchWorkspace(w.path); },
+    }, el("span", { class: "name" }, w.name), el("span", { class: "path" }, w.path)),
+  ) : [el("div", { class: "menu-label" }, "None yet")]));
+}
+
+let dialogRequired = false;
+async function showWorkspaceDialog(focus = "open") {
+  const { active, known, home } = await api("/api/workspaces");
+  dialogRequired = !active;
+  $("#ws-close").hidden = dialogRequired;
+  $("#ws-error").textContent = "";
+  const usable = known.filter((w) => w.available);
+  if (!known.length) {
+    $("#ws-title").textContent = "Create your first workspace";
+    $("#ws-intro").textContent = "A workspace is a folder holding the documents for one research topic. Choose where to create it.";
+  } else {
+    $("#ws-title").textContent = active ? "Workspaces" : "Choose a workspace";
+    $("#ws-intro").textContent = active ? `Open: ${active.name}` : "Pick the workspace to work in, or create a new one.";
+  }
+  $("#ws-known-section").hidden = !known.length;
+  $("#ws-known").replaceChildren(...known.map((w) =>
+    el("li", { class: w.available ? "" : "missing" },
+      el("div", { class: "info" },
+        el("div", { class: "name" }, w.name, w.available ? null : el("span", { class: "missing-note" }, " · folder not found")),
+        el("div", { class: "path", title: w.path }, w.path)),
+      active?.path === w.path ? el("span", { class: "muted" }, "open")
+        : el("button", { class: "small primary", disabled: !w.available, onclick: () => switchWorkspace(w.path) }, "Open"),
+      active?.path === w.path ? null : el("button", {
+        class: "del", title: "Remove from this list (the folder isn't touched)",
+        onclick: async () => { await api("/api/workspaces/forget", { method: "POST", body: JSON.stringify({ path: w.path }) }); showWorkspaceDialog(focus); },
+      }, "×"),
+    )));
+  if (!$("#ws-parent").value && home) $("#ws-parent").value = home;
+  $("#ws-dialog").hidden = false;
+  if (focus === "create" || !usable.length) $("#ws-name-input").focus();
+}
+
+function closeWorkspaceDialog() {
+  if (dialogRequired) return;
+  $("#ws-dialog").hidden = true;
+}
+$("#ws-close").addEventListener("click", closeWorkspaceDialog);
+$("#ws-dialog").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); closeWorkspaceDialog(); } });
+
+$("#ws-choose").addEventListener("click", async () => {
+  const r = await api("/api/workspaces/choose-folder", { method: "POST" });
+  if (r.path) $("#ws-parent").value = r.path;
+});
+
+$("#ws-open-other").addEventListener("click", async () => {
+  const r = await api("/api/workspaces/choose-folder", { method: "POST" });
+  if (r.path) switchWorkspace(r.path);
+});
+
+$("#ws-create").addEventListener("click", async () => {
+  $("#ws-error").textContent = "";
+  try {
+    const r = await api("/api/workspaces/create", { method: "POST", body: JSON.stringify({ parent: $("#ws-parent").value.trim(), name: $("#ws-name-input").value.trim() }) });
+    $("#ws-name-input").value = "";
+    onWorkspaceActivated(r.active);
+  } catch (e) {
+    $("#ws-error").textContent = e.message;
+  }
+});
+$("#ws-name-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#ws-create").click(); });
+
+async function switchWorkspace(path, init = false) {
+  $("#ws-error").textContent = "";
+  try {
+    const r = await api("/api/workspaces/open", { method: "POST", body: JSON.stringify({ path, init }) });
+    onWorkspaceActivated(r.active);
+  } catch (e) {
+    if (e.body?.error === "not_workspace") {
+      if (confirm(e.message)) return switchWorkspace(path, true);
+      return;
+    }
+    if ($("#ws-dialog").hidden) alert(e.message); else $("#ws-error").textContent = e.message;
+  }
+}
+
+/// Everything shown belongs to one workspace: reset it all for the new one.
+function onWorkspaceActivated(active) {
+  dialogRequired = false;
+  $("#ws-dialog").hidden = true;
+  $("#ws-name").textContent = active?.name || "";
+  closeViewer();
+  viewer.doc = null; viewer.docId = null;
+  $("#search-results").replaceChildren();
+  $("#upload-results").replaceChildren();
+  newChat();
+  loadModels();
+  refreshStatus();
+  if ($("#tab-library").classList.contains("active")) loadLibrary();
+}
+
+// ---------------------------------------------------------------- uploads
+
+$("#add-docs").addEventListener("click", () => $("#add-docs-input").click());
+$("#add-docs-input").addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  const list = $("#upload-results");
+  list.replaceChildren();
+  const before = (await api("/api/status")).sync?.runs ?? 0;
+  const accepted = /\.(pdf|md|markdown|txt)$/i;
+  for (const f of files) {
+    const row = el("li", { class: "busy" }, `Checking ${f.name}…`);
+    list.append(row);
+    if (!accepted.test(f.name)) {
+      row.className = "err";
+      row.textContent = `“${f.name}” isn't a supported file type. localrag indexes PDF (.pdf), Markdown (.md, .markdown) and plain text (.txt).`;
+      continue;
+    }
+    try {
+      const r = await api(`/api/documents/upload?name=${encodeURIComponent(f.name)}`, {
+        method: "POST", body: f, headers: { "Content-Type": "application/octet-stream" },
+      });
+      const c = r.check;
+      const parts = [`Added ${r.saved_as}${r.renamed ? ` (a file named “${f.name}” already existed)` : ""}`];
+      parts.push(c.kind === "pdf" ? `${c.pages} page${c.pages === 1 ? "" : "s"}` : `${c.text_chars.toLocaleString()} characters`);
+      if (c.scanned_pages.length) parts.push(`${c.scanned_pages.length} scanned page(s) will need OCR (pages ${c.scanned_pages.join(", ")})`);
+      row.className = "ok";
+      row.textContent = `${parts.join(" · ")}. Indexing…`;
+    } catch (err) {
+      row.className = "err";
+      row.textContent = err.message;
+    }
+  }
+  if (list.querySelector("li.ok")) await waitForSync(before);
+  for (const row of list.querySelectorAll("li.ok")) row.textContent = row.textContent.replace(/ Indexing…$/, " Indexed.");
+  loadLibrary();
+});
+
+/// Small corpora sync in milliseconds, faster than the status poll notices: wait until a
+/// sync that started after `before` (a completed-sync count) has finished.
+async function waitForSync(before) {
+  for (let i = 0; i < 1200; i++) {
+    const { sync } = await api("/api/status");
+    if (!sync || (!sync.running && sync.runs > before)) return;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 // ---------------------------------------------------------------- start
 
-refreshStatus();
-loadModels();
-loadSessions();
+(async function start() {
+  const { active } = await api("/api/workspaces");
+  if (!active) {
+    $("#status").innerHTML = `<span class="dot bad"></span>No workspace open`;
+    showWorkspaceDialog();
+    return;
+  }
+  onWorkspaceActivated(active);
+  loadSessions();
+})();

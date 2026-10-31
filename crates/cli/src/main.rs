@@ -7,12 +7,12 @@ use clap::{Parser, Subcommand};
 use localrag_core::doctor::{self, DoctorConfig};
 use localrag_core::embed::OllamaEmbedder;
 use localrag_core::index::{self, Change, Parsers};
-use localrag_core::workspace::{self, Workspace};
+use localrag_core::workspace::Workspace;
 use localrag_core::answer::{Answer, Event, RagEngine, SpanSource};
 use localrag_core::budget::{self, OverBudget};
 use localrag_core::db;
 use localrag_core::llm::Ollama;
-use localrag_core::{eval, history, refs, retrieval};
+use localrag_core::{eval, history, instance, refs, retrieval};
 
 #[derive(Parser)]
 #[command(name = "localrag", version, about = "Grounded, cited Q&A over your own literature")]
@@ -58,7 +58,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Index changes, then serve the web UI on 127.0.0.1 and open it in the browser
+    /// Run the web app on 127.0.0.1 and open it (starts on the workspace picker unless -C is
+    /// given). If localrag is already running, opens that instead
     Serve {
         /// Preferred port; a free one is used if it's taken
         #[arg(long, default_value_t = 8765)]
@@ -119,14 +120,16 @@ enum Command {
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Init { dir } => init(dir),
-        Command::Index => index_cmd(),
+        Command::Index => exclusive().and_then(|_g| index_cmd()),
         Command::Status { docs } => status(docs),
-        Command::Forget { doc, all_removed, yes } => forget(doc, all_removed, yes),
+        Command::Forget { doc, all_removed, yes } => exclusive().and_then(|_g| forget(doc, all_removed, yes)),
         Command::Search { query, k } => search(&query, k),
-        Command::Ask { question, model, r#continue, session, json } => ask(&question, model, r#continue, session, json),
+        Command::Ask { question, model, r#continue, session, json } => {
+            exclusive().and_then(|_g| ask(&question, model, r#continue, session, json))
+        }
         Command::Serve { port, no_open, dir } => serve(port, no_open, dir),
         Command::Check => check(),
-        Command::Eval { retrieval_only, model } => eval_cmd(retrieval_only, model),
+        Command::Eval { retrieval_only, model } => exclusive().and_then(|_g| eval_cmd(retrieval_only, model)),
         Command::Doctor { ollama_host, embed_model, chat_model, num_ctx, pdfium, tokenizer, crossref_email, offline } => {
             let cfg = DoctorConfig {
                 ollama_host,
@@ -163,12 +166,8 @@ fn init(dir: Option<PathBuf>) -> anyhow::Result<()> {
         println!("Created workspace at {}", report.root.display());
         println!("  Put .pdf, .md and .txt files in {}/corpus/, then run `localrag index`.", report.root.display());
     }
-    if let Some(gitignore) = report.gitignore_suggestion
-        && confirm(&format!("Add .localrag/ to {}?", gitignore.display()), true)?
-    {
-        workspace::add_to_gitignore(&gitignore)?;
-        println!("  Added .localrag/ to {}", gitignore.display());
-    }
+    println!("  .localrag/ (index, chat history, settings) is git-ignored automatically.");
+    localrag_core::registry::remember(&report.root)?;
     Ok(())
 }
 
@@ -391,16 +390,54 @@ fn print_answer(a: &Answer, streamed: bool) {
 }
 
 fn serve(port: u16, no_open: bool, dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let ws = Workspace::discover(&dir.unwrap_or(std::env::current_dir()?))?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(localrag_server::serve(&ws.root, port, |url| {
-        println!("localrag is serving {}", ws.root.display());
-        println!("  {url}");
-        println!("  (indexing runs in the background; press Ctrl-C to stop)");
+    let open_browser = |url: &str| {
         if !no_open {
             let _ = std::process::Command::new("open").arg(url).status();
         }
+    };
+    let guard = match instance::acquire()? {
+        Ok(g) => g,
+        Err(running) => {
+            // Only one localrag at a time: hand over to the one that's running.
+            match &running.url {
+                Some(url) => {
+                    println!("localrag is already running (pid {}). Opening it: {url}", running.pid);
+                    open_browser(url);
+                }
+                None => println!("localrag is already starting (pid {}).", running.pid),
+            }
+            println!("Switch workspaces from its File menu.");
+            return Ok(());
+        }
+    };
+    let root = match dir {
+        Some(d) => Some(Workspace::discover(&d)?.root),
+        None => None,
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(localrag_server::serve(root.as_deref(), port, |url| {
+        match &root {
+            Some(r) => println!("localrag is serving {}", r.display()),
+            None => println!("localrag is running; choose a workspace in the browser."),
+        }
+        println!("  {url}");
+        println!("  (press Ctrl-C to stop)");
+        let _ = guard.publish_url(url);
+        open_browser(url);
     }))
+}
+
+/// Commands that write to a workspace refuse while the app is running, so there's only ever
+/// one copy of localrag changing things.
+fn exclusive() -> anyhow::Result<instance::InstanceGuard> {
+    match instance::acquire()? {
+        Ok(g) => Ok(g),
+        Err(running) => anyhow::bail!(
+            "localrag is already running (pid {}){}. Use it there, or stop it (Ctrl-C) before running this command",
+            running.pid,
+            running.url.map(|u| format!(" at {u}")).unwrap_or_default()
+        ),
+    }
 }
 
 fn check() -> anyhow::Result<()> {

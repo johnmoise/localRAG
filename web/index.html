@@ -11,7 +11,18 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">localrag <span id="ws-name" class="ws-name"></span></div>
+    <div class="brand">localrag</div>
+    <div class="menu">
+      <button id="file-btn" class="menu-btn" aria-haspopup="true" aria-expanded="false">File</button>
+      <div id="file-menu" class="menu-list" role="menu" hidden>
+        <button role="menuitem" id="menu-new">New workspace…</button>
+        <button role="menuitem" id="menu-open">Open workspace…</button>
+        <div class="menu-sep"></div>
+        <div class="menu-label">Recent</div>
+        <div id="menu-recent"></div>
+      </div>
+    </div>
+    <span id="ws-name" class="ws-name"></span>
     <nav class="tabs" role="tablist">
       <button role="tab" data-tab="ask" class="active">Ask</button>
       <button role="tab" data-tab="search">Search</button>
@@ -54,10 +65,13 @@
 
     <section id="tab-library" class="tab">
       <div class="toolbar">
-        <button id="reindex" class="primary small">Reindex</button>
+        <button id="add-docs" class="primary small">Add documents…</button>
+        <input id="add-docs-input" type="file" multiple accept=".pdf,.md,.markdown,.txt,application/pdf,text/markdown,text/plain" hidden>
+        <button id="reindex" class="small">Reindex</button>
         <button id="forget-all" class="small danger">Forget all removed</button>
         <span id="library-summary" class="muted"></span>
       </div>
+      <ul id="upload-results" class="upload-results"></ul>
       <table class="library">
         <thead><tr><th>Document</th><th>Status</th><th>Chunks</th><th>Pages</th><th></th></tr></thead>
         <tbody id="library-rows"></tbody>
@@ -81,6 +95,29 @@
       <button id="insp-paraphrase" class="small" hidden></button>
     </div>
   </aside>
+
+  <div id="ws-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ws-title">
+      <div class="modal-head">
+        <h2 id="ws-title">Choose a workspace</h2>
+        <button id="ws-close" class="icon" aria-label="Close">×</button>
+      </div>
+      <p id="ws-intro" class="muted"></p>
+      <section id="ws-known-section">
+        <ul id="ws-known" class="ws-known"></ul>
+        <button id="ws-open-other" class="small">Open another folder…</button>
+      </section>
+      <section class="ws-create">
+        <h3 id="ws-create-title">New workspace</h3>
+        <p class="muted small-text">A folder is created at this location with <code>corpus/</code> for your documents and <code>.localrag/</code> for the index.</p>
+        <label>Location
+          <span class="row"><input id="ws-parent" type="text" placeholder="/Users/you/Research" spellcheck="false"><button id="ws-choose" class="small" type="button">Choose…</button></span>
+        </label>
+        <label>Folder name <input id="ws-name-input" type="text" placeholder="e.g. second-cancers" spellcheck="false"></label>
+        <div class="row end"><span id="ws-error" class="error" role="alert"></span><button id="ws-create" class="primary">Create workspace</button></div>
+      </section>
+    </div>
+  </div>
 
   <div id="viewer" class="viewer" hidden>
     <div class="viewer-bar">

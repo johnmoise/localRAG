@@ -21,27 +21,43 @@ pub fn register_sqlite_vec() {
 pub fn open(path: &Path) -> anyhow::Result<Connection> {
     register_sqlite_vec();
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // The busy timeout first, so the other pragmas and the migration wait out concurrent openers.
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     migrate(&conn)?;
     Ok(conn)
 }
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
-    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version > SCHEMA_VERSION {
-        anyhow::bail!("index.db has schema {version}, newer than this localrag ({SCHEMA_VERSION})");
+    if conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? == SCHEMA_VERSION {
+        return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
-    if version < 1 {
-        tx.execute_batch(SCHEMA_V1).context("creating schema v1")?;
+    // Several connections can open a new database at once (the background sync and UI
+    // requests). BEGIN IMMEDIATE takes the write lock before the version is re-read, so
+    // exactly one of them migrates and the others see the result.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> anyhow::Result<()> {
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!("index.db has schema {version}, newer than this localrag ({SCHEMA_VERSION})");
+        }
+        if version < 1 {
+            conn.execute_batch(SCHEMA_V1).context("creating schema v1")?;
+        }
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2).context("migrating to schema v2")?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
-    if version < 2 {
-        tx.execute_batch(SCHEMA_V2).context("migrating to schema v2")?;
-    }
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    tx.commit()?;
     Ok(())
 }
 

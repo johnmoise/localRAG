@@ -7,10 +7,12 @@
 
 mod auth;
 mod routes;
+mod upload;
+mod workspaces;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Context;
 use axum::Router;
@@ -23,17 +25,35 @@ use localrag_core::workspace::Workspace;
 
 pub use auth::TOKEN_COOKIE;
 
+/// Server state. Exactly one workspace is active at a time (or none, until the user picks
+/// one); switching replaces it for every route.
 #[derive(Clone)]
 pub struct AppState {
-    pub root: PathBuf,
     pub token: String,
     pub port: u16,
+    active: Arc<RwLock<Option<PathBuf>>>,
     pub sync: Arc<Mutex<SyncState>>,
 }
 
+/// No workspace is open yet: the UI shows the workspace picker.
+#[derive(Debug)]
+pub struct NoWorkspace;
+
+impl std::fmt::Display for NoWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no workspace is open; choose or create one")
+    }
+}
+
+impl std::error::Error for NoWorkspace {}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct SyncState {
+    /// The workspace this state describes.
+    pub root: Option<PathBuf>,
     pub running: bool,
+    /// Another sync was asked for while one ran (e.g. an upload); it starts right after.
+    pub rerun: bool,
     /// Completed syncs since the server started; lets the UI tell when "its" sync is done.
     pub runs: u64,
     pub processed: usize,
@@ -72,46 +92,82 @@ impl From<&SyncReport> for SyncSummary {
 }
 
 impl AppState {
-    pub fn new(root: &Path, port: u16, token: String) -> Self {
-        AppState { root: root.to_path_buf(), token, port, sync: Arc::default() }
+    pub fn new(root: Option<&Path>, port: u16, token: String) -> Self {
+        AppState { token, port, active: Arc::new(RwLock::new(root.map(Path::to_path_buf))), sync: Arc::default() }
     }
 
-    /// The workspace, re-read so config edits take effect without a restart.
+    pub fn root(&self) -> Option<PathBuf> {
+        self.active.read().expect("active workspace").clone()
+    }
+
+    /// The active workspace, re-read so config edits take effect without a restart.
     pub fn workspace(&self) -> anyhow::Result<Workspace> {
-        Workspace::open(&self.root)
+        let root = self.root().ok_or(NoWorkspace)?;
+        Workspace::open(&root)
     }
 
-    /// Starts an index sync in the background unless one is already running.
-    pub fn start_sync(&self) -> bool {
+    /// Makes `root` the one active workspace, remembers it, and syncs it.
+    pub fn activate(&self, root: &Path) -> anyhow::Result<Workspace> {
+        let ws = Workspace::open(root)?;
+        localrag_core::registry::remember(&ws.root)?;
+        *self.active.write().expect("active workspace") = Some(ws.root.clone());
         {
             let mut s = self.sync.lock().expect("sync state");
-            if s.running {
+            // A sync still running for the previous workspace finishes on its own; its
+            // result is dropped because it no longer matches `root`.
+            *s = SyncState { root: Some(ws.root.clone()), ..SyncState::default() };
+        }
+        self.start_sync();
+        Ok(ws)
+    }
+
+    /// Starts an index sync of the active workspace in the background. If one is already
+    /// running, another is queued to start when it ends (so a just-uploaded file is picked up).
+    pub fn start_sync(&self) -> bool {
+        let Some(root) = self.root() else { return false };
+        {
+            let mut s = self.sync.lock().expect("sync state");
+            if s.running && s.root.as_ref() == Some(&root) {
+                s.rerun = true;
                 return false;
             }
-            *s = SyncState { running: true, runs: s.runs, last: s.last.clone(), ..SyncState::default() };
+            *s = SyncState { root: Some(root.clone()), running: true, runs: s.runs, last: s.last.clone(), ..SyncState::default() };
         }
         let state = self.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(move || loop {
             let result = (|| -> anyhow::Result<SyncReport> {
-                let ws = state.workspace()?;
+                let ws = Workspace::open(&root)?;
                 let mut conn = db::open(&ws.db_path())?;
                 let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
                 index::sync(&ws, &mut conn, &embedder, &Parsers::new(&ws), &mut |e| {
                     let mut s = state.sync.lock().expect("sync state");
-                    if !matches!(e.change, Change::Touched) {
-                        s.processed += 1;
+                    if s.root.as_ref() == Some(&root) {
+                        if !matches!(e.change, Change::Touched) {
+                            s.processed += 1;
+                        }
+                        s.current = Some(e.path.clone());
                     }
-                    s.current = Some(e.path.clone());
                 })
             })();
             let mut s = state.sync.lock().expect("sync state");
-            s.running = false;
+            if s.root.as_ref() != Some(&root) {
+                return; // the user switched workspaces meanwhile
+            }
             s.current = None;
             s.runs += 1;
             match result {
-                Ok(r) => s.last = Some(SyncSummary::from(&r)),
+                Ok(r) => {
+                    s.last = Some(SyncSummary::from(&r));
+                    s.error = None;
+                }
                 Err(e) => s.error = Some(format!("{e:#}")),
             }
+            if std::mem::take(&mut s.rerun) {
+                s.processed = 0;
+                continue;
+            }
+            s.running = false;
+            return;
         });
         true
     }
@@ -139,13 +195,15 @@ pub async fn bind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     }
 }
 
-/// Serves the workspace at `root` until the process exits. Calls `on_ready` with the
-/// launch URL (which carries the access token) once listening.
-pub async fn serve(root: &Path, port: u16, on_ready: impl FnOnce(&str)) -> anyhow::Result<()> {
+/// Serves until the process exits, with `root` active (or none, so the UI starts on the
+/// workspace picker). Calls `on_ready` with the launch URL, which carries the access token.
+pub async fn serve(root: Option<&Path>, port: u16, on_ready: impl FnOnce(&str)) -> anyhow::Result<()> {
     let listener = bind(port).await?;
     let port = listener.local_addr()?.port();
-    let state = AppState::new(root, port, new_token()?);
-    state.start_sync();
+    let state = AppState::new(None, port, new_token()?);
+    if let Some(root) = root {
+        state.activate(root)?;
+    }
     on_ready(&format!("http://127.0.0.1:{port}/?token={}", state.token));
     axum::serve(listener, router(state)).await?;
     Ok(())

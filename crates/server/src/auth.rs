@@ -4,7 +4,7 @@
 //! routes) present the per-launch token.
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 
@@ -55,7 +55,17 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     if protected && !has_token(req.headers(), state.port, &state.token) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid token").into_response();
     }
-    next.run(req).await
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    // Served files are never sniffed into HTML (an uploaded .txt full of <script> stays text),
+    // never framed, and never leak the URL to other sites.
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if protected {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    resp
 }
 
 fn has_token(headers: &HeaderMap, port: u16, token: &str) -> bool {

@@ -5,7 +5,7 @@ pub const PARSER_VERSION: i64 = 1;
 /// ATX headings (`#`…`######`) define sections; fenced code is never read as a heading.
 /// YAML front matter supplies title, author(s), year and doi.
 pub fn parse(bytes: &[u8]) -> Result<ParsedDoc, FileError> {
-    let text = String::from_utf8(bytes.to_vec()).map_err(|_| FileError("not valid UTF-8 text".into()))?;
+    let text = super::utf8(bytes)?;
     let (meta, body_start) = front_matter(&text);
     let mut blocks = line_blocks(&text, heading);
     // Drop blocks that are the front matter itself.

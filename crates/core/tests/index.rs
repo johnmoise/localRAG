@@ -309,3 +309,16 @@ fn scanned_pdf(pdfium: &pdfium_render::prelude::Pdfium) -> Vec<u8> {
         .unwrap();
     doc.save_to_bytes().unwrap()
 }
+
+#[test]
+fn concurrent_first_open_migrates_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let handles: Vec<_> = (0..8).map(|_| {
+        let p = path.clone();
+        std::thread::spawn(move || db::open(&p).map(|_| ()))
+    }).collect();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

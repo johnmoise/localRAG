@@ -37,9 +37,16 @@ pub fn find_library(configured: Option<&Path>) -> anyhow::Result<PathBuf> {
 }
 
 pub fn parse(pdfium: &Pdfium, bytes: &[u8]) -> Result<ParsedDoc, FileError> {
-    let doc = pdfium
-        .load_pdf_from_byte_slice(bytes, None)
-        .map_err(|e| FileError(format!("cannot open PDF: {e}")))?;
+    if bytes.is_empty() {
+        return Err(FileError("the file is empty".into()));
+    }
+    if !bytes[..bytes.len().min(1024)].windows(5).any(|w| w == b"%PDF-") {
+        return Err(FileError("not a PDF: the file has no PDF header (%PDF-). It may be another format renamed to .pdf".into()));
+    }
+    let doc = pdfium.load_pdf_from_byte_slice(bytes, None).map_err(|e| FileError(open_error(&e)))?;
+    if doc.pages().is_empty() {
+        return Err(FileError("the PDF has no pages".into()));
+    }
 
     let mut parsed = ParsedDoc { meta: metadata(&doc), ..ParsedDoc::default() };
     for (i, page) in doc.pages().iter().enumerate() {
@@ -57,6 +64,20 @@ pub fn parse(pdfium: &Pdfium, bytes: &[u8]) -> Result<ParsedDoc, FileError> {
         parsed.pages.push(Page { pdf_page: Some(pdf_page), label: page.label().map(str::to_string), text, blocks });
     }
     Ok(parsed)
+}
+
+fn open_error(e: &PdfiumError) -> String {
+    use PdfiumInternalError as I;
+    match e {
+        PdfiumError::PdfiumLibraryInternalError(I::PasswordError) => {
+            "the PDF is password-protected; remove the password (e.g. Preview → Export as PDF) and try again".into()
+        }
+        PdfiumError::PdfiumLibraryInternalError(I::SecurityError) => "the PDF's security settings don't allow reading it".into(),
+        PdfiumError::PdfiumLibraryInternalError(I::FormatError) => {
+            "the PDF is damaged or not a valid PDF (PDFium couldn't parse its structure); try re-saving or re-downloading it".into()
+        }
+        other => format!("PDFium couldn't open the PDF: {other}"),
+    }
 }
 
 fn has_image(page: &PdfPage) -> bool {

@@ -96,6 +96,52 @@ impl std::fmt::Display for FileError {
 
 impl std::error::Error for FileError {}
 
+/// UTF-8 text, or an error saying where the first invalid byte is.
+pub(crate) fn utf8(bytes: &[u8]) -> Result<String, FileError> {
+    if bytes.is_empty() {
+        return Err(FileError("the file is empty".into()));
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|e| {
+        let at = e.utf8_error().valid_up_to();
+        let line = bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1;
+        FileError(format!(
+            "not valid UTF-8 text: byte 0x{:02x} at offset {at} (line {line}) isn't UTF-8. \
+             The file may be in another encoding (e.g. Latin-1 or UTF-16) or not text at all; re-save it as UTF-8",
+            bytes[at]
+        ))
+    })
+}
+
+/// What an uploaded file contains, after it parsed successfully.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UploadCheck {
+    pub kind: &'static str,
+    /// PDF pages (1 for Markdown/text).
+    pub pages: usize,
+    /// Non-whitespace characters of extractable text.
+    pub text_chars: usize,
+    pub scanned_pages: Vec<u32>,
+    pub title: Option<String>,
+}
+
+/// Parses an upload exactly as indexing will, so problems are reported before the file is
+/// added to corpus/. `pdfium` is only needed for PDFs.
+pub fn check_upload(kind: DocKind, bytes: &[u8], pdfium: Option<&pdfium_render::prelude::Pdfium>) -> Result<UploadCheck, FileError> {
+    let doc = match kind {
+        DocKind::Pdf => pdf::parse(pdfium.ok_or_else(|| FileError("PDF support (libpdfium) isn't available".into()))?, bytes)?,
+        DocKind::Markdown => markdown::parse(bytes)?,
+        DocKind::Text => text::parse(bytes)?,
+    };
+    let text_chars: usize = doc.pages.iter().map(|p| p.text.chars().filter(|c| !c.is_whitespace()).count()).sum();
+    if text_chars == 0 && doc.scanned_pages.is_empty() {
+        return Err(FileError(match kind {
+            DocKind::Pdf => "the PDF has no extractable text and no scanned pages to OCR (blank, or text drawn as vector shapes)".into(),
+            _ => "the file contains no text".into(),
+        }));
+    }
+    Ok(UploadCheck { kind: kind.as_str(), pages: doc.pages.len(), text_chars, scanned_pages: doc.scanned_pages, title: doc.meta.title })
+}
+
 /// Builds a page whose blocks are runs of non-blank lines, for plain text and Markdown bodies.
 /// `heading` classifies a line as a heading: Some((level, title)).
 pub(crate) fn line_blocks(text: &str, heading: impl Fn(&str) -> Option<(usize, String)>) -> Vec<Block> {

