@@ -1,0 +1,652 @@
+// localrag web UI (ARCHITECTURE.md §15). Plain ES module, no build step.
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, attrs = {}, ...children) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined) e.append(c);
+  return e;
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    credentials: "same-origin",
+    headers: opts.body ? { "Content-Type": "application/json", ...(opts.headers || {}) } : opts.headers,
+  });
+  const body = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
+  if (!res.ok) throw Object.assign(new Error(body?.message || body || res.statusText), { status: res.status, body });
+  return body;
+}
+
+const STATUS_TEXT = {
+  verified: "✓ Verified quote",
+  verified_paraphrase: "≈ Verified paraphrase",
+  unverified: "⚠ Unverified",
+};
+const STATUS_ICON = { verified: "✓", verified_paraphrase: "≈", unverified: "⚠" };
+
+const state = {
+  sessionId: null,
+  // Message id → { citations, supported, el } for citations shown in the thread.
+  messages: new Map(),
+  inspected: null,
+};
+
+// ---------------------------------------------------------------- tabs & status
+
+document.querySelectorAll(".tabs button").forEach((b) =>
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.id === `tab-${b.dataset.tab}`));
+    if (b.dataset.tab === "library") loadLibrary();
+  }),
+);
+
+let syncWasRunning = false;
+let statusTimer = null;
+async function refreshStatus() {
+  clearTimeout(statusTimer);
+  try {
+    const s = await api("/api/status");
+    $("#ws-name").textContent = s.name ? `· ${s.name}` : "";
+    document.title = s.name ? `localrag · ${s.name}` : "localrag";
+    const docs = Object.values(s.documents || {}).reduce((a, b) => a + b, 0);
+    let dot = "", text;
+    if (!s.ollama.reachable) {
+      dot = "bad";
+      text = `Ollama not reachable at ${s.ollama.host}`;
+    } else if (s.sync.running) {
+      dot = "busy";
+      text = `Indexing… ${s.sync.processed} file(s)${s.sync.current ? ` · ${s.sync.current}` : ""}`;
+    } else if (s.sync.error) {
+      dot = "bad";
+      text = `Indexing failed: ${s.sync.error}`;
+    } else {
+      text = `${docs} documents · ${s.chunks} passages`;
+    }
+    $("#status").innerHTML = `<span class="dot ${dot}"></span>${esc(text)}`;
+    $("#status").title = s.workspace;
+    if (syncWasRunning && !s.sync.running && $("#tab-library").classList.contains("active")) loadLibrary();
+    syncWasRunning = s.sync.running;
+    statusTimer = setTimeout(refreshStatus, s.sync.running ? 1500 : 8000);
+  } catch (e) {
+    $("#status").innerHTML = `<span class="dot bad"></span>Server unreachable`;
+    statusTimer = setTimeout(refreshStatus, 5000);
+  }
+}
+
+// ---------------------------------------------------------------- models
+
+async function loadModels() {
+  const sel = $("#model");
+  try {
+    const m = await api("/api/models");
+    const saved = localStorageGet("model");
+    sel.replaceChildren(...m.models.map((x) => el("option", { value: x.name }, x.name)));
+    const pick = [saved, m.default].find((n) => m.models.some((x) => x.name === n));
+    if (pick) sel.value = pick;
+  } catch (e) {
+    sel.replaceChildren(el("option", { value: "" }, "(Ollama unavailable)"));
+  }
+}
+$("#model").addEventListener("change", (e) => localStorageSet("model", e.target.value));
+
+function localStorageGet(k) {
+  try { return localStorage.getItem(`localrag.${k}`); } catch { return null; }
+}
+function localStorageSet(k, v) {
+  try { localStorage.setItem(`localrag.${k}`, v); } catch { /* private mode */ }
+}
+
+// ---------------------------------------------------------------- sessions
+
+async function loadSessions() {
+  const { sessions } = await api("/api/sessions");
+  $("#session-list").replaceChildren(
+    ...sessions.map((s) =>
+      el("li", { class: s.id === state.sessionId ? "active" : "", onclick: () => openSession(s.id) },
+        el("span", { class: "title", title: s.title }, s.title || `Chat ${s.id}`),
+        el("button", {
+          class: "del", title: "Delete chat",
+          onclick: async (ev) => {
+            ev.stopPropagation();
+            if (!confirm("Delete this chat? Its questions and answers are removed from history.")) return;
+            await api(`/api/sessions/${s.id}`, { method: "DELETE" });
+            if (state.sessionId === s.id) newChat();
+            loadSessions();
+          },
+        }, "×"),
+      ),
+    ),
+  );
+}
+
+function newChat() {
+  state.sessionId = null;
+  state.messages.clear();
+  $("#thread").replaceChildren($("#thread-empty") || emptyState());
+  $("#thread-empty").hidden = false;
+  closeInspector();
+  loadSessions();
+  $("#question").focus();
+}
+function emptyState() {
+  return el("div", { class: "empty", id: "thread-empty" },
+    el("h2", {}, "Ask your literature"),
+    el("p", {}, "Answers come only from the documents in corpus/, with citations you can check against the source."));
+}
+$("#new-chat").addEventListener("click", newChat);
+
+async function openSession(id) {
+  const { messages } = await api(`/api/sessions/${id}`);
+  state.sessionId = id;
+  state.messages.clear();
+  closeInspector();
+  const thread = $("#thread");
+  thread.replaceChildren();
+  for (const m of messages) {
+    if (m.role === "user") thread.append(userMsg(m.content));
+    else thread.append(assistantFromHistory(m));
+  }
+  thread.scrollTop = thread.scrollHeight;
+  loadSessions();
+}
+
+// ---------------------------------------------------------------- rendering answers
+
+function userMsg(text) {
+  return el("div", { class: "msg user" }, text);
+}
+
+/// Normalizes live-answer citations and history snapshots into one shape.
+function liveCitation(c) {
+  return {
+    ordinal: c.ordinal, status: c.status, label: c.chunk.locator ? `${c.chunk.doc_label}, ${c.chunk.locator}` : c.chunk.doc_label,
+    quote: c.quote, span: c.quote_verified ? c.span : null,
+    chunk_id: c.chunk.id, doc_sha256: c.chunk.doc_sha256, chunk_text_sha: c.chunk.text_sha,
+  };
+}
+function snapshotCitation(c) {
+  return {
+    ordinal: c.ordinal, status: c.status || (c.quote_verified ? "verified" : "unverified"), label: c.label,
+    quote: c.quote, span: c.span, chunk_id: c.chunk_id, doc_sha256: c.doc_sha256, chunk_text_sha: c.chunk_text_sha,
+  };
+}
+
+function renderMarkdownWithChips(placeholderMd, citations, messageId) {
+  const byOrd = new Map(citations.map((c) => [c.ordinal, c]));
+  const html = DOMPurify.sanitize(marked.parse(placeholderMd || ""));
+  return html.replace(/⟦(\d+)⟧/g, (_, n) => {
+    const c = byOrd.get(Number(n));
+    if (!c) return `<span class="chip invalid" title="This citation names a source that wasn't provided">invalid</span>`;
+    return `<button class="chip ${esc(c.status)}" data-msg="${esc(messageId ?? "")}" data-ord="${c.ordinal}" title="${esc(STATUS_TEXT[c.status])}">${esc(c.label)} ${STATUS_ICON[c.status] || ""}</button>`;
+  });
+}
+
+function bindChips(container, messageId) {
+  container.querySelectorAll("button.chip").forEach((b) =>
+    b.addEventListener("click", () => {
+      const entry = state.messages.get(messageId);
+      const c = entry?.citations.find((x) => x.ordinal === Number(b.dataset.ord));
+      if (c) inspectCitation(c, messageId, b);
+    }),
+  );
+}
+
+function answerBlock({ placeholderMd, text, citations, supported, notFound, sources, suggestions, warnings, unsupported, invalid, thinking, model, messageId }) {
+  const wrap = el("div", { class: "msg assistant" });
+  for (const w of warnings || []) wrap.append(el("div", { class: "warning" }, "⚠ ", w.message || describeWarning(w)));
+  if (thinking) wrap.append(el("details", {}, el("summary", {}, "Model reasoning"), el("div", { class: "thinking" }, thinking)));
+
+  const insufficient = notFound || (text || "").startsWith("INSUFFICIENT");
+  const body = el("div", { class: "body" });
+  if (insufficient) {
+    body.append(el("p", {}, notFound ? text : text.replace(/^INSUFFICIENT:\s*/, "The sources don't contain enough to answer: ")));
+  } else {
+    body.innerHTML = renderMarkdownWithChips(placeholderMd, citations, messageId);
+  }
+  wrap.append(body);
+
+  if (insufficient && sources?.length) {
+    wrap.append(el("div", { class: "closest" }, el("div", { class: "muted" }, "Closest material found (not sufficient to answer):"),
+      el("ul", {}, sources.map((c) => el("li", {}, el("button", { class: "chip unverified", onclick: () => inspectChunk(c) }, `${c.doc_label}${c.locator ? `, ${c.locator}` : ""}`))))));
+  }
+  if (suggestions?.length) {
+    wrap.append(el("div", { class: "suggestions" },
+      el("div", { class: "label" }, "Material that could help (suggested from the model's general knowledge, unverified):"),
+      el("ul", {}, suggestions.map((s) => el("li", {}, s)))));
+  }
+  const flags = [];
+  if (!insufficient && supported === false) flags.push(el("span", { class: "badge unsupported" }, "Not supported by a verified citation"));
+  if (unsupported?.length) flags.push(el("details", {}, el("summary", {}, `${unsupported.length} sentence(s) without a citation`), el("ul", {}, unsupported.map((s) => el("li", {}, s)))));
+  if (invalid?.length) flags.push(el("div", {}, `Citations to sources that weren't provided: ${invalid.join(", ")}`));
+  if (flags.length) wrap.append(el("div", { class: "flags" }, flags));
+  if (model) wrap.append(el("div", { class: "meta" }, model));
+  if (messageId !== undefined) {
+    state.messages.set(messageId, { citations, supported, el: wrap });
+    bindChips(body, messageId);
+  }
+  return wrap;
+}
+
+function describeWarning(w) {
+  return w.kind ? w.kind.replace(/_/g, " ") : "Context warning";
+}
+
+function assistantFromHistory(m) {
+  return answerBlock({
+    placeholderMd: m.placeholder_markdown,
+    text: m.content,
+    citations: (m.citations || []).map(snapshotCitation),
+    supported: m.supported,
+    notFound: m.content.startsWith("The indexed literature doesn't contain"),
+    warnings: Array.isArray(m.warnings) ? m.warnings.map((w) => ({ ...w, message: warningText(w) })) : [],
+    model: m.model,
+    messageId: m.id,
+  });
+}
+
+function warningText(w) {
+  switch (w.kind) {
+    case "history_dropped": return `Context full: ${w.turns} earliest turn(s) of this chat (${w.tokens} tokens) were left out.`;
+    case "sources_dropped": return `${w.dropped} of ${w.relevant} relevant passages didn't fit; the answer used the top ${w.relevant - w.dropped}.`;
+    case "neighbors_dropped": return `Surrounding context for ${w.passages} passages was left out.`;
+    case "truncated": return `The model received less than was sent (${w.evaluated} of ~${w.sent} tokens); the answer may be missing information.`;
+    default: return describeWarning(w);
+  }
+}
+
+// ---------------------------------------------------------------- asking
+
+$("#question").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $("#composer").requestSubmit();
+});
+$("#question").addEventListener("input", () => ($("#ask-error").textContent = ""));
+
+$("#composer").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = $("#question").value.trim();
+  if (!question) return;
+  const btn = $("#ask-btn");
+  btn.disabled = true;
+  $("#ask-error").textContent = "";
+  $("#thread-empty")?.setAttribute("hidden", "");
+
+  let res;
+  try {
+    res = await fetch("/api/ask", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, model: $("#model").value || null, session_id: state.sessionId }),
+    });
+  } catch (err) {
+    $("#ask-error").textContent = `Couldn't reach the server: ${err.message}`;
+    btn.disabled = false;
+    return;
+  }
+  if (!res.ok) {
+    // Over budget: keep the text, explain by how much (§11).
+    const body = await res.json().catch(() => ({}));
+    $("#ask-error").textContent = body.message || `Request failed (${res.status})`;
+    btn.disabled = false;
+    return;
+  }
+
+  $("#question").value = "";
+  const thread = $("#thread");
+  thread.append(userMsg(question));
+  const live = el("div", { class: "msg assistant" });
+  const warnBox = el("div");
+  const thinkBox = el("div", { class: "thinking", hidden: true });
+  const stream = el("div", { class: "streaming" }, "Searching the literature…");
+  live.append(warnBox, thinkBox, stream);
+  thread.append(live);
+  thread.scrollTop = thread.scrollHeight;
+
+  let started = false;
+  try {
+    for await (const { event, data } of sse(res)) {
+      if (event === "query") stream.textContent = `Searching for: ${data.query}`;
+      else if (event === "sources") { if (!started) stream.textContent = `Reading ${data.sources.length} passages…`; }
+      else if (event === "warning") warnBox.append(el("div", { class: "warning" }, "⚠ ", data.message));
+      else if (event === "thinking") { thinkBox.hidden = false; thinkBox.textContent += data.text; }
+      else if (event === "token") {
+        if (!started) { stream.textContent = ""; started = true; }
+        stream.textContent += data.text;
+        thread.scrollTop = thread.scrollHeight;
+      } else if (event === "answer") {
+        const a = data.answer;
+        state.sessionId = data.session_id;
+        live.replaceWith(answerBlock({
+          placeholderMd: data.placeholder_markdown, text: a.text, citations: a.citations.map(liveCitation),
+          supported: a.supported, notFound: a.not_found, sources: a.sources, suggestions: a.suggestions,
+          warnings: a.warnings.map((w) => ({ ...w, message: warningText(w) })), unsupported: a.unsupported_sentences,
+          invalid: a.invalid_markers, thinking: a.thinking, model: a.model, messageId: data.message_id,
+        }));
+        loadSessions();
+      } else if (event === "error") {
+        stream.textContent = "";
+        live.append(el("div", { class: "error" }, data.message));
+      }
+    }
+  } catch (err) {
+    live.append(el("div", { class: "error" }, `Connection lost: ${err.message}`));
+  } finally {
+    btn.disabled = false;
+    thread.scrollTop = thread.scrollHeight;
+  }
+});
+
+/// Server-sent events from a fetch() response (EventSource can't POST).
+async function* sse(res) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const raw = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      let event = "message", data = "";
+      for (const line of raw.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (data) yield { event, data: JSON.parse(data) };
+    }
+  }
+}
+
+// ---------------------------------------------------------------- inspector
+
+function closeInspector() {
+  $("#inspector").hidden = true;
+  document.querySelectorAll(".chip.selected").forEach((c) => c.classList.remove("selected"));
+  state.inspected = null;
+}
+$("#insp-close").addEventListener("click", closeInspector);
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!$("#viewer").hidden) closeViewer();
+  else closeInspector();
+});
+
+/// Chunk text with a highlight: the verified quote span, or (§10) the whole chunk when the
+/// citation is unverified or a verified paraphrase.
+function renderChunkText(text, span, mode) {
+  const box = $("#insp-text");
+  box.className = `insp-text${mode === "whole" || mode === "para" ? " whole" : ""}${mode === "para" ? " para" : ""}`;
+  const chars = Array.from(text);
+  if (mode === "none") { box.textContent = text; return; }
+  const [a, b] = mode === "quote" && span ? span : [0, chars.length];
+  box.replaceChildren(chars.slice(0, a).join(""), el("mark", {}, chars.slice(a, b).join("")), chars.slice(b).join(""));
+}
+
+async function inspectCitation(citation, messageId, chipEl) {
+  let c = citation;
+  document.querySelectorAll(".chip.selected").forEach((x) => x.classList.remove("selected"));
+  chipEl?.classList.add("selected");
+  const insp = $("#inspector");
+  insp.hidden = false;
+  $("#insp-label").textContent = c.label;
+  $("#insp-status").innerHTML = `<span class="chip ${esc(c.status)}">${esc(STATUS_TEXT[c.status])}</span>`;
+  const q = $("#insp-quote");
+  q.hidden = !c.quote;
+  if (c.quote) {
+    q.replaceChildren(el("span", { class: "muted" }, c.status === "verified" ? "Quoted: " : "Model's quote (not found verbatim): "), el("span", { class: "q" }, `“${c.quote}”`));
+  }
+  $("#insp-text").textContent = "Loading passage…";
+  const note = $("#insp-note");
+  note.hidden = true;
+
+  let chunk;
+  try {
+    const qs = new URLSearchParams({ text_sha: c.chunk_text_sha, doc_sha: c.doc_sha256 || "" });
+    if (c.status === "verified" && c.quote) qs.set("quote", c.quote);
+    const r = await api(`/api/chunks/${c.chunk_id}?${qs}`);
+    chunk = r.chunk;
+    // The span stored with the citation can be missing (older history) or stale (the
+    // passage was relocated); the server's fresh match wins.
+    if (r.span) c = { ...c, span: r.span };
+    if (r.resolution === "relocated") showNote("The document changed since this answer; showing the same passage in the current version.");
+    if (r.resolution === "source_removed") showNote("This document was removed from corpus/. The passage is kept for this citation.");
+  } catch (e) {
+    $("#insp-text").textContent = "";
+    showNote(e.status === 404 ? "This passage is no longer in the index (the document was forgotten or changed)." : e.message);
+    $("#insp-open").hidden = true;
+    $("#insp-paraphrase").hidden = true;
+    return;
+  }
+  const mode = c.status === "verified" ? "quote" : c.status === "verified_paraphrase" ? "para" : "whole";
+  renderChunkText(chunk.text, c.span, mode);
+  if (mode !== "quote") {
+    showNote(c.status === "unverified"
+      ? "The quote wasn't found word for word, so the whole cited passage is highlighted. Compare it with the claim; if it supports it, mark it as a verified paraphrase."
+      : "You reviewed this citation and accepted it as a paraphrase of the highlighted passage.");
+  }
+  state.inspected = { chunk, span: mode === "quote" ? c.span : null, mode };
+  setupOpenButton(chunk, mode === "quote" ? c.span : null, mode);
+
+  const pb = $("#insp-paraphrase");
+  pb.hidden = !(messageId && (c.status === "unverified" || c.status === "verified_paraphrase"));
+  pb.textContent = c.status === "unverified" ? "Mark as verified paraphrase" : "Undo verified paraphrase";
+  pb.onclick = async () => {
+    pb.disabled = true;
+    try {
+      const { message } = await api(`/api/messages/${messageId}/citations/${c.ordinal}/paraphrase`, {
+        method: "POST", body: JSON.stringify({ on: c.status === "unverified" }),
+      });
+      applyMessageUpdate(messageId, message);
+      const updated = state.messages.get(messageId).citations.find((x) => x.ordinal === c.ordinal);
+      const chip = state.messages.get(messageId).el.querySelector(`.chip[data-ord="${c.ordinal}"]`);
+      inspectCitation(updated, messageId, chip);
+    } catch (e) {
+      showNote(e.message);
+    } finally {
+      pb.disabled = false;
+    }
+  };
+}
+
+function applyMessageUpdate(messageId, m) {
+  const entry = state.messages.get(messageId);
+  if (!entry) return;
+  const fresh = assistantFromHistory(m);
+  entry.el.replaceWith(fresh);
+}
+
+async function inspectChunk(chunk) {
+  closeInspector();
+  $("#inspector").hidden = false;
+  $("#insp-label").textContent = chunk.locator ? `${chunk.doc_label}, ${chunk.locator}` : chunk.doc_label;
+  $("#insp-status").textContent = chunk.doc_path;
+  $("#insp-status").className = "muted";
+  $("#insp-quote").hidden = true;
+  $("#insp-note").hidden = true;
+  $("#insp-paraphrase").hidden = true;
+  renderChunkText(chunk.text, null, "none");
+  setupOpenButton(chunk, null, "whole");
+}
+
+function showNote(text) {
+  const n = $("#insp-note");
+  n.textContent = text;
+  n.hidden = false;
+}
+
+function setupOpenButton(chunk, span, mode) {
+  const b = $("#insp-open");
+  b.hidden = false;
+  b.textContent = chunk.locator?.startsWith("p") ? `Open at ${chunk.locator}` : "Open in source";
+  b.onclick = () => openViewer(chunk, span, mode);
+}
+
+// ---------------------------------------------------------------- source viewer
+
+let pdfjs = null;
+const viewer = { doc: null, page: 1, rects: new Map(), cls: "quote", docId: null };
+
+async function openViewer(chunk, span, mode) {
+  const qs = new URLSearchParams({ chunk: chunk.id });
+  if (span) { qs.set("start", span[0]); qs.set("end", span[1]); }
+  const hl = await api(`/api/highlights?${qs}`);
+  $("#viewer-title").textContent = chunk.locator ? `${chunk.doc_label}, ${chunk.locator}` : chunk.doc_label;
+  $("#viewer").hidden = false;
+  const body = $("#viewer-body");
+  body.replaceChildren(el("div", { class: "muted" }, "Loading…"));
+  viewer.cls = mode === "quote" ? "quote" : mode === "para" ? "para" : "whole";
+
+  if (hl.kind === "unavailable") {
+    body.replaceChildren(el("div", { class: "text-view" }, `The source can't be shown: ${hl.reason}.`));
+    toggleNav(false);
+    return;
+  }
+  if (hl.kind === "text") {
+    toggleNav(false);
+    const text = await (await fetch(`/files/${chunk.doc_id}`, { credentials: "same-origin" })).text();
+    const chars = Array.from(text);
+    const mark = el("mark", {}, chars.slice(hl.start, hl.end).join(""));
+    const view = el("div", { class: `text-view${viewer.cls === "quote" ? "" : " whole"}${viewer.cls === "para" ? " para" : ""}` },
+      chars.slice(0, hl.start).join(""), mark, chars.slice(hl.end).join(""));
+    body.replaceChildren(view);
+    mark.scrollIntoView({ block: "center" });
+    return;
+  }
+
+  // PDF
+  if (!pdfjs) {
+    pdfjs = await import("/assets/vendor/pdf.min.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc = "/assets/vendor/pdf.worker.min.mjs";
+  }
+  if (viewer.docId !== chunk.doc_id) {
+    viewer.doc = await pdfjs.getDocument({ url: `/files/${chunk.doc_id}`, withCredentials: true }).promise;
+    viewer.docId = chunk.doc_id;
+  }
+  viewer.rects = new Map(hl.pages.map((p) => [p.pdf_page, p.rects]));
+  viewer.page = hl.pages[0]?.pdf_page || chunk.pdf_page_start || 1;
+  toggleNav(true);
+  renderPage();
+}
+
+async function renderPage() {
+  const body = $("#viewer-body");
+  const page = await viewer.doc.getPage(viewer.page);
+  const base = page.getViewport({ scale: 1 });
+  const width = Math.min(body.clientWidth - 40, 980);
+  const scale = width / base.width;
+  const vp = page.getViewport({ scale: scale * window.devicePixelRatio });
+  const canvas = el("canvas");
+  canvas.width = vp.width;
+  canvas.height = vp.height;
+  canvas.style.width = `${vp.width / window.devicePixelRatio}px`;
+  canvas.style.height = `${vp.height / window.devicePixelRatio}px`;
+  const wrap = el("div", { class: "page-wrap" }, canvas);
+  body.replaceChildren(wrap);
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+  const cssW = vp.width / window.devicePixelRatio, cssH = vp.height / window.devicePixelRatio;
+  // Scroll to the topmost rectangle: PDF text order isn't reading order (footers come first).
+  let top = null, topY = Infinity;
+  for (const [x, y, w, h] of viewer.rects.get(viewer.page) || []) {
+    const r = el("div", { class: `hl ${viewer.cls}` });
+    Object.assign(r.style, { left: `${x * cssW}px`, top: `${y * cssH}px`, width: `${w * cssW}px`, height: `${h * cssH}px` });
+    wrap.append(r);
+    if (y < topY) { topY = y; top = r; }
+  }
+  top?.scrollIntoView({ block: "start" });
+  $("#viewer-page").textContent = `Page ${viewer.page} of ${viewer.doc.numPages}`;
+  $("#viewer-prev").disabled = viewer.page <= 1;
+  $("#viewer-next").disabled = viewer.page >= viewer.doc.numPages;
+}
+
+function toggleNav(on) {
+  for (const id of ["#viewer-prev", "#viewer-next", "#viewer-page"]) $(id).hidden = !on;
+}
+$("#viewer-prev").addEventListener("click", () => { viewer.page--; renderPage(); });
+$("#viewer-next").addEventListener("click", () => { viewer.page++; renderPage(); });
+function closeViewer() { $("#viewer").hidden = true; }
+$("#viewer-close").addEventListener("click", closeViewer);
+
+// ---------------------------------------------------------------- search
+
+$("#search-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const list = $("#search-results");
+  list.replaceChildren(el("li", { class: "muted" }, "Searching…"));
+  try {
+    const { hits } = await api("/api/search", { method: "POST", body: JSON.stringify({ query: $("#search-q").value, k: 15 }) });
+    if (!hits.length) { list.replaceChildren(el("li", { class: "muted" }, "No matches.")); return; }
+    list.replaceChildren(...hits.map((h) => {
+      const c = h.chunk;
+      const scores = [h.similarity != null ? `similarity ${h.similarity.toFixed(2)}` : null, h.bm25_rank ? `keyword #${h.bm25_rank}` : null].filter(Boolean).join(" · ");
+      return el("li", { onclick: () => inspectChunk(c) },
+        el("div", { class: "head" }, c.locator ? `${c.doc_label}, ${c.locator}` : c.doc_label, el("span", { class: "scores" }, scores)),
+        el("div", { class: "snippet" }, c.text.length > 320 ? `${c.text.slice(0, 320)}…` : c.text));
+    }));
+  } catch (err) {
+    list.replaceChildren(el("li", { class: "error" }, err.message));
+  }
+});
+
+// ---------------------------------------------------------------- library
+
+async function loadLibrary() {
+  const { documents } = await api("/api/documents");
+  const counts = documents.reduce((m, d) => ((m[d.status] = (m[d.status] || 0) + 1), m), {});
+  $("#library-summary").textContent = Object.entries(counts).map(([k, n]) => `${n} ${k.replace("_", " ")}`).join(" · ") || "No documents yet: add files to corpus/ and press Reindex.";
+  $("#forget-all").disabled = !counts.removed;
+  $("#library-rows").replaceChildren(...documents.map((d) => {
+    const detail = d.status === "failed" ? d.error : d.status === "needs_ocr" ? `Scanned pages without text: ${(d.scanned_pages || []).join(", ")} (OCR arrives in a later phase)` : null;
+    return el("tr", {},
+      el("td", {}, el("div", {}, d.label), el("div", { class: "path" }, d.path), detail ? el("div", { class: "muted" }, detail) : null),
+      el("td", {}, el("span", { class: `st ${d.status}` }, d.status.replace("_", " "))),
+      el("td", {}, String(d.chunks)),
+      el("td", {}, d.pages != null && d.kind === "pdf" ? String(d.pages) : "–"),
+      el("td", {}, d.status === "removed"
+        ? el("button", { class: "small danger", title: "Permanently delete this document's record, passages and OCR cache", onclick: () => forget(d) }, "Forget")
+        : null));
+  }));
+}
+
+async function forget(d) {
+  if (!confirm(`Permanently forget “${d.label}”?\n\nIts record, passages and OCR cache are deleted. Old answers stay readable, but their citations to it will show as forgotten. This can't be undone.`)) return;
+  try { await api(`/api/documents/${d.id}`, { method: "DELETE" }); } catch (e) { alert(e.message); }
+  loadLibrary();
+}
+$("#forget-all").addEventListener("click", async () => {
+  if (!confirm("Permanently forget every removed document? This can't be undone.")) return;
+  await api("/api/documents/forget-removed", { method: "POST" });
+  loadLibrary();
+});
+$("#reindex").addEventListener("click", async () => {
+  const btn = $("#reindex");
+  btn.disabled = true;
+  const before = (await api("/api/status")).sync.runs;
+  await api("/api/reindex", { method: "POST" });
+  refreshStatus();
+  // Small corpora sync in milliseconds, faster than the status poll notices; wait for this
+  // sync's result before redrawing the table.
+  for (let i = 0; i < 600; i++) {
+    const { sync } = await api("/api/status");
+    if (!sync.running && sync.runs > before) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  btn.disabled = false;
+  loadLibrary();
+  refreshStatus();
+});
+
+// ---------------------------------------------------------------- start
+
+refreshStatus();
+loadModels();
+loadSessions();

@@ -8,6 +8,7 @@ pub mod db;
 pub mod doctor;
 pub mod embed;
 pub mod eval;
+pub mod highlight;
 pub mod history;
 pub mod index;
 pub mod llm;

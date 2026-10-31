@@ -140,26 +140,45 @@ fn units(doc: &ParsedDoc, target: usize) -> Vec<Unit> {
 /// Joins wrapped lines: drops end-of-line hyphenation before a lowercase letter and
 /// collapses all whitespace to single spaces.
 fn normalize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.trim().chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '-' && chars.peek() == Some(&'\n') {
-            let mut look = chars.clone();
-            look.next();
-            if look.peek().is_some_and(|n| n.is_lowercase()) {
-                chars.next();
+    let chars: Vec<char> = s.chars().collect();
+    normalize_mapped(&chars).0
+}
+
+/// `normalize`, also returning for each output char the index of the input char it came
+/// from. Highlighting uses this to map chunk text back to page characters.
+pub(crate) fn normalize_mapped(input: &[char]) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(input.len());
+    let mut map = Vec::with_capacity(input.len());
+    let mut i = input.iter().position(|c| !c.is_whitespace()).unwrap_or(input.len());
+    while i < input.len() {
+        let c = input[i];
+        if c == '-' {
+            // "-\n" or "-\r\n" followed by a lowercase letter: a wrapped word.
+            let mut j = i + 1;
+            if input.get(j) == Some(&'\r') {
+                j += 1;
+            }
+            if input.get(j) == Some(&'\n') && input.get(j + 1).is_some_and(|n| n.is_lowercase()) {
+                i = j + 1;
                 continue;
             }
         }
         if c.is_whitespace() {
             if !out.ends_with(' ') {
                 out.push(' ');
+                map.push(i);
             }
         } else {
             out.push(c);
+            map.push(i);
         }
+        i += 1;
     }
-    out
+    if out.ends_with(' ') {
+        out.pop();
+        map.pop();
+    }
+    (out, map)
 }
 
 fn split_long(text: &str, target: usize) -> Vec<String> {

@@ -2,12 +2,12 @@
 //! (ARCHITECTURE.md §10, §11).
 
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::budget::{self, ContextWarning, FixedCosts, PER_MESSAGE_OVERHEAD, TokenCounter};
 use crate::citations::{self, Marker};
 use crate::embed::Embedder;
-use crate::llm::{ChatRequest, Delta, Llm, Message};
+use crate::llm::{ChatRequest, Delta, Llm, Message, ModelInfo};
 use crate::prompts;
 use crate::retrieval::{self, ChunkRef, Hit, SearchOptions};
 use crate::workspace::Workspace;
@@ -28,8 +28,31 @@ pub enum SpanSource {
     None,
 }
 
+/// How far a citation is backed by its source (§10).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CitationStatus {
+    /// The quote was found in the cited chunk.
+    Verified,
+    /// No quote, or the quote isn't in the chunk.
+    #[default]
+    Unverified,
+    /// Unverified, then reviewed and accepted by the user.
+    VerifiedParaphrase,
+}
+
+impl CitationStatus {
+    pub fn counts_as_support(self) -> bool {
+        matches!(self, CitationStatus::Verified | CitationStatus::VerifiedParaphrase)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Citation {
+    /// Position of this citation among all marker items in the answer, in order; the UI's
+    /// placeholders (`citations::placeholders`) refer to it.
+    pub ordinal: usize,
+    pub status: CitationStatus,
     /// The `n` in `[Sn]`.
     pub marker: usize,
     pub chunk: ChunkRef,
@@ -101,19 +124,32 @@ const NOT_FOUND_TEXT: &str = "The indexed literature doesn't contain enough info
 
 impl RagEngine<'_> {
     /// Fails with a downcastable [`budget::OverBudget`] when the question can't fit.
+    /// The submit check alone (§11): fails with a downcastable [`budget::OverBudget`].
+    pub fn check_budget(&self, question: &str, model: &str, num_ctx: u32) -> anyhow::Result<()> {
+        let info = self.llm.model_info(model)?;
+        let counter = TokenCounter::for_model(self.conn, &info);
+        self.fixed_costs(&info, &counter, question, num_ctx).check()?;
+        Ok(())
+    }
+
+    fn fixed_costs(&self, info: &ModelInfo, counter: &TokenCounter, question: &str, num_ctx: u32) -> FixedCosts {
+        let think = self.ws.config.think && info.can("thinking");
+        FixedCosts {
+            num_ctx,
+            system: counter.count(prompts::SYSTEM),
+            output_reserve: if think { budget::OUTPUT_RESERVE_THINKING } else { budget::OUTPUT_RESERVE },
+            min_grounding: 3 * self.ws.config.chunking.target_tokens,
+            question: counter.count(&prompts::question_with_sources(question, &[])),
+        }
+    }
+
     pub fn ask(&self, question: &str, model: &str, num_ctx: u32, history: &[Turn], on: &mut dyn FnMut(Event)) -> anyhow::Result<Answer> {
         let cfg = &self.ws.config;
         let info = self.llm.model_info(model)?;
         let counter = TokenCounter::for_model(self.conn, &info);
         let think = cfg.think && info.can("thinking");
-        let min_grounding = 3 * cfg.chunking.target_tokens;
-        let fixed = FixedCosts {
-            num_ctx,
-            system: counter.count(prompts::SYSTEM),
-            output_reserve: if think { budget::OUTPUT_RESERVE_THINKING } else { budget::OUTPUT_RESERVE },
-            min_grounding,
-            question: counter.count(&prompts::question_with_sources(question, &[])),
-        };
+        let fixed = self.fixed_costs(&info, &counter, question, num_ctx);
+        let min_grounding = fixed.min_grounding;
         fixed.check()?;
 
         let mut answer = Answer {
@@ -248,14 +284,16 @@ impl RagEngine<'_> {
         let markers = citations::parse_markers(&answer.text);
         self.resolve_citations(&mut answer, &markers);
         answer.unsupported_sentences = citations::uncited_sentences(&answer.text, &markers);
-        answer.supported = answer.citations.iter().any(|c| c.quote_verified);
+        answer.supported = answer.citations.iter().any(|c| c.status.counts_as_support());
         Ok(answer)
     }
 
     fn resolve_citations(&self, answer: &mut Answer, markers: &[Marker]) {
+        let mut ordinal = 0;
         for m in markers {
             let claim = claim_before(&answer.text, m.range.start);
             for item in &m.items {
+                ordinal += 1;
                 let Some(chunk) = answer.sources.get(item.source - 1).cloned() else {
                     answer.invalid_markers.push(format!("S{}", item.source));
                     continue;
@@ -269,6 +307,8 @@ impl RagEngine<'_> {
                     },
                 };
                 answer.citations.push(Citation {
+                    ordinal: ordinal - 1,
+                    status: if span_source == SpanSource::Quote { CitationStatus::Verified } else { CitationStatus::Unverified },
                     marker: item.source,
                     quote: item.quote.clone(),
                     quote_verified: span_source == SpanSource::Quote,

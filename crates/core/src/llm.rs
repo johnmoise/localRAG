@@ -80,6 +80,17 @@ impl Ollama {
         Ok(Ollama { host: host.trim_end_matches('/').to_string(), client })
     }
 
+    /// Ollama's version, with a short timeout: used to show whether Ollama is reachable.
+    pub fn version(&self) -> anyhow::Result<String> {
+        let v: Value = self
+            .client
+            .get(format!("{}/api/version", self.host))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()?
+            .json()?;
+        Ok(v["version"].as_str().unwrap_or("?").to_string())
+    }
+
     /// Installed models that can chat (capability `completion`), excluding embedding-only ones.
     pub fn chat_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let tags: Value = self.client.get(format!("{}/api/tags", self.host)).send()?.json()?;

@@ -11,7 +11,7 @@ use localrag_core::workspace::{self, Workspace};
 use localrag_core::answer::{Answer, Event, RagEngine, SpanSource};
 use localrag_core::budget::{self, OverBudget};
 use localrag_core::db;
-use localrag_core::llm::{Llm, Ollama};
+use localrag_core::llm::Ollama;
 use localrag_core::{eval, history, refs, retrieval};
 
 #[derive(Parser)]
@@ -57,6 +57,18 @@ enum Command {
         /// Print the full answer as JSON instead of streaming text
         #[arg(long)]
         json: bool,
+    },
+    /// Index changes, then serve the web UI on 127.0.0.1 and open it in the browser
+    Serve {
+        /// Preferred port; a free one is used if it's taken
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+        /// Don't open the browser
+        #[arg(long)]
+        no_open: bool,
+        /// Workspace directory (default: found from the current directory)
+        #[arg(long, short = 'C')]
+        dir: Option<PathBuf>,
     },
     /// Check that every citation in chat history still resolves to its source
     Check,
@@ -112,6 +124,7 @@ fn main() -> ExitCode {
         Command::Forget { doc, all_removed, yes } => forget(doc, all_removed, yes),
         Command::Search { query, k } => search(&query, k),
         Command::Ask { question, model, r#continue, session, json } => ask(&question, model, r#continue, session, json),
+        Command::Serve { port, no_open, dir } => serve(port, no_open, dir),
         Command::Check => check(),
         Command::Eval { retrieval_only, model } => eval_cmd(retrieval_only, model),
         Command::Doctor { ollama_host, embed_model, chat_model, num_ctx, pdfium, tokenizer, crossref_email, offline } => {
@@ -377,6 +390,19 @@ fn print_answer(a: &Answer, streamed: bool) {
     }
 }
 
+fn serve(port: u16, no_open: bool, dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let ws = Workspace::discover(&dir.unwrap_or(std::env::current_dir()?))?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(localrag_server::serve(&ws.root, port, |url| {
+        println!("localrag is serving {}", ws.root.display());
+        println!("  {url}");
+        println!("  (indexing runs in the background; press Ctrl-C to stop)");
+        if !no_open {
+            let _ = std::process::Command::new("open").arg(url).status();
+        }
+    }))
+}
+
 fn check() -> anyhow::Result<()> {
     let ws = Workspace::discover(&std::env::current_dir()?)?;
     let conn = db::open(&ws.db_path())?;
@@ -455,16 +481,11 @@ fn eval_cmd(retrieval_only: bool, model: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The workspace's num_ctx for `model`; picks the RAM-based default on first use and saves it.
 fn resolve_num_ctx(ws: &mut Workspace, llm: &Ollama, model: &str) -> anyhow::Result<u32> {
-    if let Some(n) = ws.config.num_ctx.get(model) {
-        return Ok(*n);
+    let (n, new) = budget::resolve_num_ctx(ws, llm, model)?;
+    if new {
+        eprintln!("(using num_ctx {n} for {model}, based on this Mac's memory; change it in .localrag/config.toml)");
     }
-    let info = llm.model_info(model)?;
-    let n = budget::default_num_ctx(budget::system_ram(), info.context_length);
-    ws.config.num_ctx.insert(model.to_string(), n);
-    ws.save_config()?;
-    eprintln!("(using num_ctx {n} for {model}, based on this Mac's memory; change it in .localrag/config.toml)");
     Ok(n)
 }
 

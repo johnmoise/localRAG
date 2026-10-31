@@ -107,6 +107,25 @@ fn closing_quote(open: char) -> Option<char> {
     }
 }
 
+/// The answer with each marker item replaced by `⟦k⟧`, k being the item's ordinal in
+/// reading order (`Citation::ordinal`). The UI renders the Markdown, then swaps the
+/// placeholders for citation chips.
+pub fn placeholders(text: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    let mut ordinal = 0;
+    for m in parse_markers(text) {
+        out.push_str(&text[i..m.range.start]);
+        for _ in &m.items {
+            out.push_str(&format!("⟦{ordinal}⟧"));
+            ordinal += 1;
+        }
+        i = m.range.end;
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
 /// Where a quote sits in a chunk: a char range in the chunk text.
 pub fn verify_quote(quote: &str, chunk: &str, ocr: bool) -> Option<Range<usize>> {
     let parts: Vec<&str> = quote.split(['…']).flat_map(|p| p.split("...")).map(str::trim).filter(|p| !p.is_empty()).collect();
@@ -277,6 +296,11 @@ mod tests {
         let m = parse_markers(after);
         assert_eq!(m[0].items, [MarkerItem { source: 2, quote: Some("quoted after the bracket".into()) }]);
         assert_eq!(&after[m[0].range.clone()], r#"[S2] "quoted after the bracket""#);
+    }
+
+    #[test]
+    fn placeholders_number_items_in_order() {
+        assert_eq!(placeholders(r#"A [S1 "q"]. B [S2; S3] and [S1] "after"."#), "A ⟦0⟧. B ⟦1⟧⟦2⟧ and ⟦3⟧.");
     }
 
     #[test]

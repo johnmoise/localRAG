@@ -37,6 +37,7 @@ Guiding principles:
 | Document statuses | `pending`, `indexed`, `needs_ocr`, `failed`, `removed`. Removed documents can be *forgotten* | 5 |
 | Citation metadata | Crossref only (no Zotero). Rate-limited for polite/public pools; email asked for on first load | 7 |
 | Citations | `[Author Year, p. N]` with the exact quoted span highlighted in the source | 10 |
+| Unverified quotes | Flagged as unverified, and the whole cited chunk is highlighted so you can judge the paraphrase. You can promote one to **Verified Paraphrase** | 10, 15 |
 | Chat history | Kept per workspace | 8 |
 | Context size | `num_ctx` chosen from RAM (16k on 16 GB), fixed per model, sent on every request | 11 |
 | Over budget | Submit is blocked with "Over token count by X tokens". No live counter | 11 |
@@ -292,7 +293,7 @@ CREATE TABLE messages (
   id INTEGER PRIMARY KEY,
   session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   role TEXT, content TEXT,
-  citations_json TEXT,     -- snapshot: label, page, quote, doc sha256, chunk text_sha
+  citations_json TEXT,     -- snapshot: label, page, quote, status (verified|unverified|verified_paraphrase), doc sha256, chunk text_sha
   warnings_json TEXT,      -- context-overload warnings (§11)
   supported INTEGER, model TEXT, created_at TEXT
 );
@@ -370,8 +371,21 @@ block and excluded from validation.
   - Found → it becomes the highlighted span.
   - Not found → the citation is flagged. A quote missing from its source is a strong sign of
     hallucination, and checking for it is deterministic and nearly free.
-- **No usable quote:** the chunk sentence most similar to the claim is highlighted instead,
-  in a distinct color.
+- **Citation statuses:**
+
+  | Status | Meaning | What the UI highlights |
+  |--------|---------|------------------------|
+  | **Verified** | The quote was found in the cited chunk | Just the quoted span |
+  | **Unverified** | No quote, or the quote isn't in the chunk (usually a paraphrase) | The **entire cited chunk**, so you can compare the claim with the original text |
+  | **Verified Paraphrase** | An unverified citation you reviewed and accepted | The entire chunk, marked as a reviewed paraphrase |
+
+  - **Promoting:** any unverified citation in the Ask tab can be promoted to Verified
+    Paraphrase, and demoted again. The choice is stored on that message in chat history,
+    with a timestamp.
+  - **"Supported":** an answer counts as supported once it has at least one verified or
+    verified-paraphrase citation.
+  - The CLI still prints the closest sentence for unverified citations, because it can't
+    show a highlighted chunk.
 - **Highlighting:** span offsets → PDFium character boxes (Vision boxes for OCR pages) →
   rectangles in a vendored PDF.js viewer, opened at the page.
 
@@ -718,8 +732,10 @@ One page with four tabs, a Settings panel, and a first-load dialog.
   - Chat with a model dropdown and session list.
   - An over-budget Submit shows "Over token count by X tokens".
   - Answers show context-overload banners, flagged sentences, and citation chips
-    `[Smith 2021, p. 12]`. A chip opens a side panel with the chunk, the highlighted quote and
-    **Open at p. 12** (PDF.js with the highlight).
+    `[Smith 2021, p. 12]` marked ✓ verified, ≈ verified paraphrase or ⚠ unverified.
+  - A chip opens a side panel with the chunk, the highlight (§10: the quote when verified,
+    the whole chunk otherwise) and **Open at p. 12** (PDF.js with the same highlight).
+    Unverified chips have **Mark as verified paraphrase**; promoted ones have **Undo**.
 - **Search:** ranked passages, filterable by document or year.
 - **Library:**
   - Documents with status and metadata source.
@@ -892,6 +908,32 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 - axum, token auth, SSE; Ask / Search / Library; model dropdown; over-budget error; warning
   banners; chat history; PDF.js with highlights; `serve`.
 - *Exit:* the full loop in the browser across two workspaces, with no state leaking.
+- **Done (2026-10-31):** `localrag serve [--port 8765] [--no-open] [-C dir]` syncs in the
+  background, serves the UI, and opens the browser on the launch URL that carries the token.
+  - **What was tested** (in the browser, two workspaces at once on ports 8765/8766):
+    - Ask, with streaming, citation chips, the inspector and promoting a paraphrase.
+    - The PDF.js viewer, with rectangles exactly over the cited text, across pages.
+    - The Markdown viewer, Search, and Library remove/reindex.
+    - The over-budget error.
+  - **Security:**
+    - Host check, Origin check, and a per-launch token traded for an HttpOnly, SameSite=Strict
+      cookie.
+    - A CSP that allows scripts only from the app itself.
+  - 50 tests pass. New ones cover the auth guard, paraphrase promotion, and highlight mapping
+    (PDF rectangles, text offsets, changed files).
+  - **Bugs the two-workspace test caught:**
+    - Cookies are per host, not per port, so the token cookie is now `localrag_token_<port>`.
+      Before that, opening a second workspace logged out the first.
+    - Chat history from before citation ordinals existed now gets them backfilled when read.
+  - **Highlighting:** spans map to PDFium character boxes through the same normalization the
+    chunker uses (whitespace, hyphenation, `\r\n`), so rectangles match the cited text
+    exactly. They are merged per line. The viewer scrolls to the topmost one, because PDF
+    text order puts footers first.
+  - **Not yet:**
+    - The Settings panel and Crossref email dialog (Phase 4).
+    - Search filters by document or year (need Phase 4 metadata).
+    - Suggestions and uncited-sentence lists aren't stored in chat history, so reopened chats
+      don't show them.
 
 **Phase 4: metadata & OCR**
 - DOI extraction; Crossref client (limiter, cache, background queue); page labels;

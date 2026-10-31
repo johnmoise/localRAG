@@ -82,6 +82,19 @@ pub fn default_num_ctx(ram_bytes: u64, model_max: Option<u32>) -> u32 {
     model_max.map_or(by_ram, |m| by_ram.min(m))
 }
 
+/// The workspace's `num_ctx` for `model`. On first use, picks the RAM-based default, saves
+/// it to the workspace config, and returns `true` as the second value.
+pub fn resolve_num_ctx(ws: &mut crate::workspace::Workspace, llm: &dyn crate::llm::Llm, model: &str) -> anyhow::Result<(u32, bool)> {
+    if let Some(n) = ws.config.num_ctx.get(model) {
+        return Ok((*n, false));
+    }
+    let info = llm.model_info(model)?;
+    let n = default_num_ctx(system_ram(), info.context_length);
+    ws.config.num_ctx.insert(model.to_string(), n);
+    ws.save_config()?;
+    Ok((n, true))
+}
+
 /// Physical memory in bytes (macOS `hw.memsize`).
 pub fn system_ram() -> u64 {
     let mut value: u64 = 0;

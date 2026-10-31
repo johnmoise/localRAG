@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>localrag</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/vendor/marked.min.js"></script>
+  <script src="/assets/vendor/purify.min.js"></script>
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">localrag <span id="ws-name" class="ws-name"></span></div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="ask" class="active">Ask</button>
+      <button role="tab" data-tab="search">Search</button>
+      <button role="tab" data-tab="library">Library</button>
+    </nav>
+    <div id="status" class="status" title=""></div>
+  </header>
+
+  <main>
+    <section id="tab-ask" class="tab active">
+      <aside class="sessions">
+        <button id="new-chat" class="primary small">New chat</button>
+        <ul id="session-list"></ul>
+      </aside>
+      <div class="chat">
+        <div id="thread" class="thread">
+          <div class="empty" id="thread-empty">
+            <h2>Ask your literature</h2>
+            <p>Answers come only from the documents in <code>corpus/</code>, with citations you can check against the source.</p>
+          </div>
+        </div>
+        <form id="composer" class="composer">
+          <textarea id="question" rows="3" placeholder="Ask a question about your documents…" required></textarea>
+          <div class="composer-row">
+            <label class="model">Model <select id="model"></select></label>
+            <span id="ask-error" class="error" role="alert"></span>
+            <button id="ask-btn" class="primary" type="submit">Ask</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="tab-search" class="tab">
+      <form id="search-form" class="searchbar">
+        <input id="search-q" type="search" placeholder="Search passages (no model involved)…" required>
+        <button class="primary" type="submit">Search</button>
+      </form>
+      <ol id="search-results" class="results"></ol>
+    </section>
+
+    <section id="tab-library" class="tab">
+      <div class="toolbar">
+        <button id="reindex" class="primary small">Reindex</button>
+        <button id="forget-all" class="small danger">Forget all removed</button>
+        <span id="library-summary" class="muted"></span>
+      </div>
+      <table class="library">
+        <thead><tr><th>Document</th><th>Status</th><th>Chunks</th><th>Pages</th><th></th></tr></thead>
+        <tbody id="library-rows"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <aside id="inspector" class="inspector" hidden>
+    <div class="inspector-head">
+      <div>
+        <div id="insp-label" class="insp-label"></div>
+        <div id="insp-status"></div>
+      </div>
+      <button id="insp-close" class="icon" aria-label="Close">×</button>
+    </div>
+    <div id="insp-note" class="note" hidden></div>
+    <div id="insp-quote" class="insp-quote" hidden></div>
+    <div id="insp-text" class="insp-text"></div>
+    <div class="insp-actions">
+      <button id="insp-open" class="primary small">Open in source</button>
+      <button id="insp-paraphrase" class="small" hidden></button>
+    </div>
+  </aside>
+
+  <div id="viewer" class="viewer" hidden>
+    <div class="viewer-bar">
+      <span id="viewer-title"></span>
+      <span class="spacer"></span>
+      <button id="viewer-prev" class="small">‹ Prev</button>
+      <span id="viewer-page" class="muted"></span>
+      <button id="viewer-next" class="small">Next ›</button>
+      <button id="viewer-close" class="icon" aria-label="Close">×</button>
+    </div>
+    <div id="viewer-body" class="viewer-body"></div>
+  </div>
+</body>
+</html>
