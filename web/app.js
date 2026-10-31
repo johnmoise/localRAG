@@ -71,7 +71,10 @@ async function refreshStatus() {
       text = `Ollama not reachable at ${s.ollama.host}`;
     } else if (s.sync.running) {
       dot = "busy";
-      text = `Indexing… ${s.sync.processed} file(s)${s.sync.current ? ` · ${s.sync.current}` : ""}`;
+      const o = s.sync.ocr;
+      text = s.sync.phase === "ocr" && o ? `OCR: ${o.path} · page ${Math.min(o.done + 1, o.pages)} of ${o.pages}`
+        : s.sync.phase === "metadata" ? `Looking up citations on Crossref…${s.sync.current ? ` · ${s.sync.current}` : ""}`
+        : `Indexing… ${s.sync.processed} file(s)${s.sync.current ? ` · ${s.sync.current}` : ""}`;
     } else if (s.sync.error) {
       dot = "bad";
       text = `Indexing failed: ${s.sync.error}`;
@@ -80,6 +83,7 @@ async function refreshStatus() {
     }
     $("#status").innerHTML = `<span class="dot ${dot}"></span>${esc(text)}`;
     $("#status").title = s.workspace;
+    $("#ocr-cancel").hidden = !(s.sync.running && s.sync.phase === "ocr");
     if (syncWasRunning && !s.sync.running && $("#tab-library").classList.contains("active")) loadLibrary();
     syncWasRunning = s.sync.running;
     statusTimer = setTimeout(refreshStatus, s.sync.running ? 1500 : 8000);
@@ -175,7 +179,7 @@ function userMsg(text) {
 /// Normalizes live-answer citations and history snapshots into one shape.
 function liveCitation(c) {
   return {
-    ordinal: c.ordinal, status: c.status, label: c.chunk.locator ? `${c.chunk.doc_label}, ${c.chunk.locator}` : c.chunk.doc_label,
+    ordinal: c.ordinal, status: c.status, ocr: c.chunk.ocr, label: c.chunk.locator ? `${c.chunk.doc_label}, ${c.chunk.locator}` : c.chunk.doc_label,
     quote: c.quote, span: c.quote_verified ? c.span : null,
     chunk_id: c.chunk.id, doc_sha256: c.chunk.doc_sha256, chunk_text_sha: c.chunk.text_sha,
   };
@@ -193,7 +197,8 @@ function renderMarkdownWithChips(placeholderMd, citations, messageId) {
   return html.replace(/⟦(\d+)⟧/g, (_, n) => {
     const c = byOrd.get(Number(n));
     if (!c) return `<span class="chip invalid" title="This citation names a source that wasn't provided">invalid</span>`;
-    return `<button class="chip ${esc(c.status)}" data-msg="${esc(messageId ?? "")}" data-ord="${c.ordinal}" title="${esc(STATUS_TEXT[c.status])}">${esc(c.label)} ${STATUS_ICON[c.status] || ""}</button>`;
+    const ocr = c.ocr ? `<span class="ocr-badge" title="From OCR of a scanned page">OCR</span>` : "";
+    return `<button class="chip ${esc(c.status)}" data-msg="${esc(messageId ?? "")}" data-ord="${c.ordinal}" title="${esc(STATUS_TEXT[c.status])}">${esc(c.label)} ${STATUS_ICON[c.status] || ""}${ocr}</button>`;
   });
 }
 
@@ -386,6 +391,8 @@ $("#insp-close").addEventListener("click", closeInspector);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("#viewer").hidden) closeViewer();
+  else if (!$("#meta-dialog").hidden) $("#meta-dialog").hidden = true;
+  else if (!$("#settings-dialog").hidden) $("#settings-dialog").hidden = true;
   else closeInspector();
 });
 
@@ -437,6 +444,7 @@ async function inspectCitation(citation, messageId, chipEl) {
   }
   const mode = c.status === "verified" ? "quote" : c.status === "verified_paraphrase" ? "para" : "whole";
   renderChunkText(chunk.text, c.span, mode);
+  if (chunk.ocr) $("#insp-label").append(el("span", { class: "ocr-badge", title: "Text recognized from a scanned page; small recognition errors are possible" }, "OCR"));
   if (mode !== "quote") {
     showNote(c.status === "unverified"
       ? "The quote wasn't found word for word, so the whole cited passage is highlighted. Compare it with the claim; if it supports it, mark it as a verified paraphrase."
@@ -614,17 +622,29 @@ async function loadLibrary() {
   const counts = documents.reduce((m, d) => ((m[d.status] = (m[d.status] || 0) + 1), m), {});
   $("#library-summary").textContent = Object.entries(counts).map(([k, n]) => `${n} ${k.replace("_", " ")}`).join(" · ") || "No documents yet: add files to corpus/ and press Reindex.";
   $("#forget-all").disabled = !counts.removed;
+  $("#ocr-all").hidden = (counts.needs_ocr || 0) < 2;
   $("#library-rows").replaceChildren(...documents.map((d) => {
-    const detail = d.status === "failed" ? d.error : d.status === "needs_ocr" ? `Scanned pages without text: ${(d.scanned_pages || []).join(", ")} (OCR arrives in a later phase)` : null;
-    const nameCell = el("td", {}, el("div", {}, d.label), el("div", { class: "path" }, d.path), detail ? el("div", { class: "muted" }, detail) : null);
+    const detail = d.status === "failed" ? d.error : d.status === "needs_ocr" ? `Scanned pages without text: ${(d.scanned_pages || []).join(", ")}` : null;
+    const csl = d.csl || {};
+    const year = csl.issued?.["date-parts"]?.[0]?.[0];
+    const metaBadge = { matched: d.metadata_source === "manual" ? ["manual", "edited"] : d.metadata_source === "crossref_doi" ? ["matched", "DOI"] : ["matched", "Crossref"],
+      proposed: ["proposed", "confirm"], unmatched: ["unmatched", "no match"], pending: ["pending", "pending"] }[d.metadata_status] || ["pending", "—"];
+    const citeCell = el("td", { class: "cite-cell" },
+      el("div", {}, d.label, el("button", { class: `meta-badge ${metaBadge[0]}`, title: "Citation metadata", onclick: () => openMetadata(d) }, metaBadge[1])),
+      csl.title ? el("div", { class: "title" }, `${csl.title}${year ? ` (${year})` : ""}`) : null);
+    const nameCell = el("td", {}, el("div", { class: "path" }, d.path), detail ? el("div", { class: "muted" }, detail) : null);
     return el("tr", {},
       nameCell,
+      citeCell,
       el("td", {}, el("span", { class: `st ${d.status}` }, d.status.replace("_", " "))),
       el("td", {}, String(d.chunks)),
       el("td", {}, d.pages != null && d.kind === "pdf" ? String(d.pages) : "–"),
       el("td", { class: "actions" }, d.status === "removed"
         ? el("button", { class: "small danger", title: "Permanently delete this document's record, passages and OCR cache", onclick: () => forget(d) }, "Forget")
-        : el("button", { class: "small", title: "Rename the file (no reindexing)", onclick: () => startRename(d, nameCell) }, "Rename")));
+        : el("span", {},
+            d.status === "needs_ocr" ? el("button", { class: "small primary", title: "Recognize the text of the scanned pages with Apple Vision", onclick: () => runOcr(d) }, "Run OCR") : null,
+            " ",
+            el("button", { class: "small", title: "Rename the file (no reindexing)", onclick: () => startRename(d, nameCell) }, "Rename"))));
   }));
 }
 
@@ -810,6 +830,7 @@ function onWorkspaceActivated(active) {
   loadModels();
   refreshStatus();
   if ($("#tab-library").classList.contains("active")) loadLibrary();
+  maybePromptEmail();
 }
 
 // ---------------------------------------------------------------- uploads
@@ -859,6 +880,153 @@ async function waitForSync(before) {
     await new Promise((r) => setTimeout(r, 500));
   }
 }
+
+// ---------------------------------------------------------------- OCR
+
+async function runOcr(d) {
+  try {
+    const before = (await api("/api/status")).sync.runs;
+    await api(`/api/documents/${d.id}/ocr`, { method: "POST" });
+    $("#upload-results").replaceChildren(el("li", { class: "busy" }, `Running OCR on ${d.path}… progress is shown at the top right.`));
+    refreshStatus();
+    await waitForSync(before);
+    $("#upload-results").replaceChildren(el("li", { class: "ok" }, `OCR finished for ${d.path}.`));
+    loadLibrary();
+  } catch (e) {
+    $("#upload-results").replaceChildren(el("li", { class: "err" }, e.message));
+  }
+}
+$("#ocr-all").addEventListener("click", async () => {
+  const before = (await api("/api/status")).sync.runs;
+  try { await api("/api/ocr/all", { method: "POST" }); } catch (e) { alert(e.message); return; }
+  refreshStatus();
+  await waitForSync(before);
+  loadLibrary();
+});
+$("#ocr-cancel").addEventListener("click", () => api("/api/ocr/cancel", { method: "POST" }));
+
+// ---------------------------------------------------------------- Crossref email & settings
+
+async function maybePromptEmail() {
+  const s = await api("/api/settings");
+  if (s.crossref_email || s.crossref_email_prompted) return;
+  $("#email-error").textContent = "";
+  $("#email-dialog").hidden = false;
+  $("#email-input").focus();
+}
+$("#email-save").addEventListener("click", async () => {
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify({ crossref_email: $("#email-input").value }) });
+    $("#email-dialog").hidden = true;
+  } catch (e) { $("#email-error").textContent = e.message; }
+});
+$("#email-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#email-save").click(); });
+$("#email-skip").addEventListener("click", async () => {
+  await api("/api/settings", { method: "PUT", body: JSON.stringify({ crossref_email_prompted: true }) });
+  $("#email-dialog").hidden = true;
+});
+
+$("#settings-btn").addEventListener("click", openSettings);
+$("#settings-close").addEventListener("click", () => ($("#settings-dialog").hidden = true));
+async function openSettings() {
+  const s = await api("/api/settings");
+  $("#settings-error").textContent = "";
+  $("#set-email").value = s.crossref_email || "";
+  $("#set-pool").textContent = s.crossref_email
+    ? "Polite pool: up to 10 DOI lookups and 3 title searches per second. Clear the field to stop sending it."
+    : "Public pool: 5 DOI lookups and 1 title search per second. Stored only on this Mac and sent only to Crossref.";
+  const ws = s.workspace;
+  for (const id of ["#set-model", "#set-numctx", "#set-ocr"]) $(id).disabled = !ws;
+  if (ws) {
+    const { models } = await api("/api/models").catch(() => ({ models: [] }));
+    $("#set-model").replaceChildren(...models.map((m) => el("option", { value: m.name }, m.name)));
+    $("#set-model").value = ws.chat_model;
+    const fill = () => ($("#set-numctx").value = ws.num_ctx[$("#set-model").value] ?? "");
+    $("#set-model").onchange = fill;
+    fill();
+    $("#set-numctx").placeholder = "chosen from this Mac's memory on first use";
+    $("#set-ocr").value = ws.ocr;
+  }
+  $("#settings-dialog").hidden = false;
+}
+$("#settings-save").addEventListener("click", async () => {
+  const body = { crossref_email: $("#set-email").value };
+  if (!$("#set-model").disabled) {
+    body.chat_model = $("#set-model").value;
+    body.ocr = $("#set-ocr").value;
+    const n = parseInt($("#set-numctx").value, 10);
+    if (n) body.num_ctx = { [body.chat_model]: n };
+  }
+  try {
+    await api("/api/settings", { method: "PUT", body: JSON.stringify(body) });
+    $("#settings-dialog").hidden = true;
+    loadModels();
+  } catch (e) { $("#settings-error").textContent = e.message; }
+});
+
+// ---------------------------------------------------------------- metadata
+
+let metaDoc = null;
+$("#meta-close").addEventListener("click", () => ($("#meta-dialog").hidden = true));
+async function openMetadata(d) {
+  metaDoc = d;
+  $("#meta-error").textContent = "";
+  $("#meta-file").textContent = d.path;
+  renderMetadata(await api(`/api/documents/${d.id}/metadata`));
+  $("#meta-dialog").hidden = false;
+}
+function renderMetadata(m) {
+  const csl = m.csl || {};
+  const src = { crossref_doi: "matched on Crossref by DOI", crossref_query: "matched on Crossref by title", manual: "edited by you (never overwritten by lookups)", pdf: "from the PDF's own metadata", frontmatter: "from the Markdown front matter" }[m.source];
+  $("#meta-state").textContent = m.status === "proposed" ? "Crossref found possible matches: pick the right one, or reject them and fill in the details yourself."
+    : m.status === "pending" ? "Not looked up yet: it happens after indexing."
+    : m.status === "unmatched" ? "No confident match on Crossref. You can fill in the details below."
+    : src ? `Source: ${src}.` : "";
+  if (m.error) $("#meta-state").textContent += ` Last lookup failed: ${m.error}`;
+  const cands = m.status === "proposed" ? m.candidates || [] : [];
+  $("#meta-candidates-section").hidden = !cands.length;
+  $("#meta-candidates").replaceChildren(...cands.map((c, i) => {
+    const w = c.work;
+    const who = (w.author || []).slice(0, 3).map((a) => a.family || a.literal).filter(Boolean).join(", ");
+    return el("li", {},
+      el("div", { class: "info" }, el("div", {}, w.title || "(untitled)"), el("div", { class: "score" }, `${who}${w.author?.length > 3 ? " et al." : ""} · ${w.year ?? "?"} · ${w["container-title"] || ""} · ${w.DOI} · ${Math.round(c.score * 100)}% match`)),
+      el("button", { class: "small primary", onclick: async () => { renderMetadata(await api(`/api/documents/${metaDoc.id}/metadata/resolve`, { method: "POST", body: JSON.stringify({ accept: i }) })); loadLibrary(); } }, "This one"));
+  }));
+  $("#meta-title-input").value = csl.title || "";
+  $("#meta-authors").value = (csl.author || []).map((a) => a.literal || [a.family, a.given].filter(Boolean).join(", ")).join("\n");
+  $("#meta-year").value = csl.issued?.["date-parts"]?.[0]?.[0] ?? "";
+  $("#meta-pages").value = csl.page || "";
+  $("#meta-container").value = csl["container-title"] || "";
+  $("#meta-doi").value = csl.DOI || m.doi || "";
+}
+$("#meta-reject").addEventListener("click", async () => {
+  renderMetadata(await api(`/api/documents/${metaDoc.id}/metadata/resolve`, { method: "POST", body: JSON.stringify({ accept: null }) }));
+  loadLibrary();
+});
+$("#meta-refresh").addEventListener("click", async () => {
+  $("#meta-error").textContent = "Looking up…";
+  try {
+    const r = await api(`/api/documents/${metaDoc.id}/metadata/refresh`, { method: "POST" });
+    $("#meta-error").textContent = "";
+    renderMetadata(r.metadata);
+    loadLibrary();
+  } catch (e) { $("#meta-error").textContent = e.message; }
+});
+$("#meta-save").addEventListener("click", async () => {
+  const year = parseInt($("#meta-year").value, 10);
+  const body = {
+    title: $("#meta-title-input").value.trim() || null,
+    authors: $("#meta-authors").value.split("\n").map((a) => a.trim()).filter(Boolean),
+    year: Number.isFinite(year) ? year : null,
+    page: $("#meta-pages").value.trim() || null,
+    container: $("#meta-container").value.trim() || null,
+    doi: $("#meta-doi").value.trim() || null,
+  };
+  try {
+    renderMetadata(await api(`/api/documents/${metaDoc.id}`.concat("/metadata"), { method: "PATCH", body: JSON.stringify(body) }));
+    loadLibrary();
+  } catch (e) { $("#meta-error").textContent = e.message; }
+});
 
 // ---------------------------------------------------------------- start
 

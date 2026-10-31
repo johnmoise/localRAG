@@ -15,6 +15,8 @@ pub struct GlobalConfig {
     pub crossref_email: Option<String>,
     /// Overrides PDFium library discovery.
     pub pdfium_lib: Option<PathBuf>,
+    /// The UI asked for the Crossref email once (set or skipped); don't ask again.
+    pub crossref_email_prompted: bool,
 }
 
 impl Default for GlobalConfig {
@@ -23,6 +25,7 @@ impl Default for GlobalConfig {
             ollama_host: "http://127.0.0.1:11434".into(),
             crossref_email: None,
             pdfium_lib: None,
+            crossref_email_prompted: false,
         }
     }
 }
@@ -99,6 +102,19 @@ impl Default for WorkspaceConfig {
             num_ctx: BTreeMap::new(),
         }
     }
+}
+
+/// A plausible email address, trimmed. Only basic shape is checked: Crossref just uses it to
+/// contact you if your requests cause problems.
+pub fn validate_email(s: &str) -> anyhow::Result<String> {
+    let e = s.trim();
+    let ok = e.len() <= 254
+        && !e.contains(char::is_whitespace)
+        && e.split_once('@').is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'));
+    if !ok {
+        anyhow::bail!("“{e}” doesn't look like an email address");
+    }
+    Ok(e.to_string())
 }
 
 /// `$LOCALRAG_CONFIG_DIR`, else `~/.config/localrag`.

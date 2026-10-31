@@ -230,3 +230,20 @@ table.library { border-collapse: collapse; width: 100%; font-size: 14px; }
   .topbar { gap: 10px; padding: 8px 12px; }
   .status { display: none; }
 }
+
+/* Settings, email, metadata */
+.settings-btn { font-size: 18px; margin-left: 4px; }
+.field { display: block; font-size: 13px; color: var(--muted); margin: 8px 0; flex: 1; }
+.field input, .field select, .field textarea { display: block; width: 100%; margin-top: 4px; }
+.modal-card.wide { width: min(760px, calc(100vw - 32px)); }
+.candidates { list-style: none; padding: 0; margin: 6px 0 10px; }
+.candidates li { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; display: flex; gap: 10px; align-items: flex-start; }
+.candidates li .info { flex: 1; font-size: 14px; }
+.candidates li .score { font-size: 12px; color: var(--muted); }
+.meta-badge { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 10px; margin-left: 4px; white-space: nowrap; }
+.meta-badge.matched { background: var(--verified-bg); color: var(--verified); }
+.meta-badge.manual { background: var(--para-bg); color: var(--para); }
+.meta-badge.proposed { background: var(--unverified-bg); color: var(--unverified); }
+.meta-badge.unmatched, .meta-badge.pending { background: var(--line); color: var(--muted); }
+.cite-cell .title { font-size: 12px; color: var(--muted); }
+.ocr-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; padding: 0 5px; border-radius: 4px; border: 1px solid currentColor; margin-left: 4px; opacity: 0.8; }

@@ -12,7 +12,7 @@ use localrag_core::answer::{Answer, Event, RagEngine, SpanSource};
 use localrag_core::budget::{self, OverBudget};
 use localrag_core::db;
 use localrag_core::llm::Ollama;
-use localrag_core::{eval, history, instance, refs, retrieval};
+use localrag_core::{eval, history, instance, metadata, refs, retrieval};
 
 #[derive(Parser)]
 #[command(name = "localrag", version, about = "Grounded, cited Q&A over your own literature")]
@@ -28,8 +28,26 @@ enum Command {
         /// Directory to initialize (default: current directory)
         dir: Option<PathBuf>,
     },
-    /// Index new and changed files in corpus/; unchanged files are skipped
-    Index,
+    /// Index new and changed files in corpus/ (unchanged files are skipped), then look up
+    /// citation metadata on Crossref for new documents
+    Index {
+        /// Skip the Crossref lookups
+        #[arg(long)]
+        no_metadata: bool,
+    },
+    /// Recognize the text of scanned PDF pages with Apple Vision, then reindex those documents
+    Ocr,
+    /// Look up citation metadata on Crossref for documents that still need it
+    Metadata {
+        /// Re-query every document (bypassing the cache), except manually edited ones
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Show or change machine-wide settings (e.g. `config set crossref_email you@example.org`)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Show index counts, or every document with --docs
     Status {
         #[arg(long)]
@@ -117,10 +135,23 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print all settings
+    Get,
+    /// Set a setting: crossref_email, ollama_host
+    Set { key: String, value: String },
+    /// Clear a setting
+    Unset { key: String },
+}
+
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Init { dir } => init(dir),
-        Command::Index => exclusive().and_then(|_g| index_cmd()),
+        Command::Index { no_metadata } => exclusive().and_then(|_g| index_cmd(!no_metadata)),
+        Command::Metadata { refresh } => exclusive().and_then(|_g| metadata_cmd(refresh)),
+        Command::Ocr => exclusive().and_then(|_g| ocr_cmd()),
+        Command::Config { action } => config_cmd(action),
         Command::Status { docs } => status(docs),
         Command::Forget { doc, all_removed, yes } => exclusive().and_then(|_g| forget(doc, all_removed, yes)),
         Command::Search { query, k } => search(&query, k),
@@ -171,7 +202,7 @@ fn init(dir: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn index_cmd() -> anyhow::Result<()> {
+fn index_cmd(metadata: bool) -> anyhow::Result<()> {
     let ws = Workspace::discover(&std::env::current_dir()?)?;
     let mut conn = db::open(&ws.db_path())?;
     let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
@@ -206,8 +237,96 @@ fn index_cmd() -> anyhow::Result<()> {
         );
     }
     if report.needs_ocr > 0 {
-        println!("{} document(s) have scanned pages that need OCR (Phase 4).", report.needs_ocr);
+        println!("{} document(s) have scanned pages that need OCR: `localrag ocr` or Run OCR in the Library.", report.needs_ocr);
     }
+    if metadata {
+        lookup_metadata(&ws, &conn, false)?;
+    }
+    Ok(())
+}
+
+fn ocr_cmd() -> anyhow::Result<()> {
+    let ws = Workspace::discover(&std::env::current_dir()?)?;
+    let mut conn = db::open(&ws.db_path())?;
+    let parsers = Parsers::new(&ws);
+    let waiting = index::needing_ocr(&conn)?;
+    if waiting.is_empty() {
+        println!("No scanned pages waiting for OCR.");
+        return Ok(());
+    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for (id, path, sha, pages) in &waiting {
+        let mut last = usize::MAX;
+        localrag_core::ocr::ocr_document(&ws, parsers.pdf_helper()?, &ws.corpus_dir().join(path), sha, pages, &cancel, &mut |done, total| {
+            if done != last {
+                print!("\rOCR {path}: page {} of {total}", (done + 1).min(total));
+                let _ = std::io::stdout().flush();
+                last = done;
+            }
+        })?;
+        println!();
+        index::mark_for_reprocess(&conn, *id)?;
+    }
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+    let r = index::sync(&ws, &mut conn, &embedder, &parsers, &mut |e| println!("~ {} ({} chunks, {})", e.path, e.chunks, e.status.as_str()))?;
+    println!("Reindexed {} document(s) with their OCR text.", r.changed);
+    Ok(())
+}
+
+fn metadata_cmd(refresh: bool) -> anyhow::Result<()> {
+    let ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    lookup_metadata(&ws, &conn, refresh)
+}
+
+fn lookup_metadata(ws: &Workspace, conn: &rusqlite::Connection, refresh: bool) -> anyhow::Result<()> {
+    let client = metadata::crossref::shared();
+    client.set_email(ws.global.crossref_email.as_deref());
+    if refresh {
+        conn.execute("UPDATE documents SET metadata_status = 'pending' WHERE metadata_source IS NOT 'manual'", [])?;
+    }
+    let pending: i64 = conn.query_row(
+        "SELECT count(*) FROM documents WHERE metadata_status = 'pending' AND status IN ('indexed', 'needs_ocr')", [], |r| r.get(0))?;
+    if pending == 0 {
+        return Ok(());
+    }
+    let pool = match client.pool() {
+        metadata::crossref::Pool::Polite => "polite pool",
+        metadata::crossref::Pool::Public => "public pool; set an email with `localrag config set crossref_email …` for faster lookups",
+    };
+    println!("Looking up metadata for {pending} document(s) on Crossref ({pool})…");
+    let r = metadata::process_pending(conn, client, &mut |e| {
+        let mark = match e.status.as_str() { "matched" => "✓", "proposed" => "?", _ => "·" };
+        println!("{mark} {}  ({})", e.path, e.detail);
+    })?;
+    println!("{} matched, {} need confirming (Library), {} without a match", r.matched, r.proposed, r.unmatched);
+    for e in &r.errors {
+        eprintln!("warning: {e} (will retry next time)");
+    }
+    Ok(())
+}
+
+fn config_cmd(action: ConfigAction) -> anyhow::Result<()> {
+    let mut g = localrag_core::config::load_global()?;
+    match action {
+        ConfigAction::Get => {
+            println!("crossref_email = {}", g.crossref_email.as_deref().unwrap_or("(not set: Crossref public pool)"));
+            println!("ollama_host    = {}", g.ollama_host);
+            println!("(stored in {}, private to your user)", localrag_core::config::global_config_dir().join("config.toml").display());
+            return Ok(());
+        }
+        ConfigAction::Set { key, value } => match key.as_str() {
+            "crossref_email" => g.crossref_email = Some(localrag_core::config::validate_email(&value)?),
+            "ollama_host" => g.ollama_host = value,
+            _ => anyhow::bail!("unknown setting {key:?}; known: crossref_email, ollama_host"),
+        },
+        ConfigAction::Unset { key } => match key.as_str() {
+            "crossref_email" => g.crossref_email = None,
+            _ => anyhow::bail!("{key:?} can't be unset"),
+        },
+    }
+    localrag_core::config::save_global(&g)?;
+    println!("Saved.");
     Ok(())
 }
 

@@ -231,7 +231,14 @@ pub fn sync(
     }
 
     for (file, row, change, sha) in to_process {
-        let parsed = parsers.parse(file)?;
+        let mut parsed = parsers.parse(file)?;
+        // Scanned pages that were OCR'd earlier get their recognized text (§6).
+        if let Ok(doc) = parsed.as_mut()
+            && !doc.scanned_pages.is_empty()
+            && let Some(cache) = crate::ocr::load_cache(ws, &sha)
+        {
+            crate::ocr::apply_to(doc, &cache);
+        }
         let (status, chunks) = match parsed {
             Ok(doc) => {
                 let chunks = chunk::chunk(&doc, &ws.config.chunking);
@@ -257,10 +264,32 @@ pub fn sync(
         on_event(&Event { path: file.rel_path.clone(), change, status, chunks });
     }
 
+    crate::metadata::assign_labels(conn)?;
     db::set_meta(conn, "chunker_version", &CHUNKER_VERSION.to_string())?;
     db::set_meta(conn, "last_sync", &db::now_rfc3339())?;
     report.millis = started.elapsed().as_millis();
     Ok(report)
+}
+
+/// Makes the next sync reprocess this document (e.g. after OCR filled in its scanned pages).
+pub fn mark_for_reprocess(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
+    conn.execute("UPDATE documents SET chunker_version = 0 WHERE id = ?1", [doc_id])?;
+    Ok(())
+}
+
+/// (document id, path, sha256, scanned pages) of a document waiting for OCR.
+pub type OcrTodo = (i64, String, String, Vec<u32>);
+
+/// Documents with scanned pages still waiting for OCR.
+pub fn needing_ocr(conn: &Connection) -> anyhow::Result<Vec<OcrTodo>> {
+    let rows: Vec<(i64, String, String, Option<String>)> = conn
+        .prepare("SELECT id, path, sha256, scanned_pages FROM documents WHERE status = 'needs_ocr' ORDER BY path")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, path, sha, pages)| (id, path, sha, pages.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default()))
+        .collect())
 }
 
 /// Removed documents only: deletes the record, chunks, vectors and OCR cache (§5).
@@ -401,6 +430,10 @@ fn write_document(
         }
     }
     tx.commit()?;
+    // Reprocessed PDFs lose metadata-derived page numbers with their old chunks; restore them.
+    if doc.is_some() {
+        crate::metadata::apply_page_offset(conn, doc_id)?;
+    }
     Ok(())
 }
 
@@ -567,12 +600,17 @@ pub fn rename_document(ws: &Workspace, conn: &mut Connection, doc_id: i64, new_n
     }
 
     let old_label = crate::cite::doc_label(cite_label.as_deref(), csl.as_deref(), &old_path);
-    let new_label = crate::cite::doc_label(cite_label.as_deref(), csl.as_deref(), &new_path);
     std::fs::rename(&from, &to).with_context(|| format!("renaming {}", from.display()))?;
+    if let Err(e) = conn.execute("UPDATE documents SET path = ?2 WHERE id = ?1", params![doc_id, new_path]) {
+        let _ = std::fs::rename(&to, &from); // keep disk and index consistent
+        return Err(e.into());
+    }
+    // Labels can come from file names (and a/b suffixes depend on the others), so recompute.
+    crate::metadata::assign_labels(conn)?;
+    let new_label: String = conn.query_row("SELECT cite_label FROM documents WHERE id = ?1", [doc_id], |r| r.get(0))?;
 
-    let result = (|| -> anyhow::Result<usize> {
+    let citations_updated = {
         let tx = conn.transaction()?;
-        tx.execute("UPDATE documents SET path = ?2 WHERE id = ?1", params![doc_id, new_path])?;
         let rows: Vec<(i64, String)> = tx
             .prepare("SELECT id, citations_json FROM messages WHERE citations_json IS NOT NULL")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -600,15 +638,7 @@ pub fn rename_document(ws: &Workspace, conn: &mut Connection, doc_id: i64, new_n
             }
         }
         tx.commit()?;
-        Ok(updated)
-    })();
-    let citations_updated = match result {
-        Ok(n) => n,
-        Err(e) => {
-            // Put the file back so the index and disk stay consistent.
-            let _ = std::fs::rename(&to, &from);
-            return Err(e);
-        }
+        updated
     };
     let eval_items_updated = rename_in_eval(ws, &old_path, &new_path)?;
     Ok(RenameReport { path: new_path, label: new_label, citations_updated, eval_items_updated })

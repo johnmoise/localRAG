@@ -6,7 +6,9 @@
 //! background sync.
 
 mod auth;
+mod ocr_jobs;
 mod routes;
+mod settings;
 mod upload;
 mod workspaces;
 
@@ -52,6 +54,12 @@ pub struct SyncState {
     /// The workspace this state describes.
     pub root: Option<PathBuf>,
     pub running: bool,
+    /// What the background job is doing: "indexing", "metadata" or "ocr".
+    pub phase: Option<String>,
+    /// Metadata results of the last run (matched / proposed / unmatched / errors).
+    pub metadata: Option<serde_json::Value>,
+    /// OCR progress: {doc, path, page, pages}.
+    pub ocr: Option<serde_json::Value>,
     /// Another sync was asked for while one ran (e.g. an upload); it starts right after.
     pub rerun: bool,
     /// Completed syncs since the server started; lets the UI tell when "its" sync is done.
@@ -124,6 +132,20 @@ impl AppState {
     /// Starts an index sync of the active workspace in the background. If one is already
     /// running, another is queued to start when it ends (so a just-uploaded file is picked up).
     pub fn start_sync(&self) -> bool {
+        self.start_job(Vec::new())
+    }
+
+    /// OCRs these documents' scanned pages, then syncs (which picks up the OCR text). Refused
+    /// while another job runs.
+    pub fn start_ocr(&self, doc_ids: Vec<i64>) -> bool {
+        if self.sync.lock().expect("sync state").running {
+            return false;
+        }
+        self.start_job(doc_ids)
+    }
+
+    /// The one background worker: optional OCR → indexing → Crossref metadata → (auto OCR).
+    fn start_job(&self, mut ocr_first: Vec<i64>) -> bool {
         let Some(root) = self.root() else { return false };
         {
             let mut s = self.sync.lock().expect("sync state");
@@ -133,13 +155,26 @@ impl AppState {
             }
             *s = SyncState { root: Some(root.clone()), running: true, runs: s.runs, last: s.last.clone(), ..SyncState::default() };
         }
+        crate::ocr_jobs::CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
         let state = self.clone();
         std::thread::spawn(move || loop {
+            let set_phase = |phase: &str| {
+                let mut s = state.sync.lock().expect("sync state");
+                if s.root.as_ref() == Some(&root) {
+                    s.phase = Some(phase.to_string());
+                }
+            };
             let result = (|| -> anyhow::Result<SyncReport> {
                 let ws = Workspace::open(&root)?;
                 let mut conn = db::open(&ws.db_path())?;
                 let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
-                index::sync(&ws, &mut conn, &embedder, &Parsers::new(&ws), &mut |e| {
+                let parsers = Parsers::new(&ws);
+                if !ocr_first.is_empty() {
+                    set_phase("ocr");
+                    crate::ocr_jobs::run(&state, &root, &ws, &conn, &parsers, &std::mem::take(&mut ocr_first))?;
+                }
+                set_phase("indexing");
+                let mut report = index::sync(&ws, &mut conn, &embedder, &parsers, &mut |e| {
                     let mut s = state.sync.lock().expect("sync state");
                     if s.root.as_ref() == Some(&root) {
                         if !matches!(e.change, Change::Touched) {
@@ -147,13 +182,41 @@ impl AppState {
                         }
                         s.current = Some(e.path.clone());
                     }
-                })
+                })?;
+                // Then citation metadata for new documents (network; never fails the sync).
+                set_phase("metadata");
+                let client = localrag_core::metadata::crossref::shared();
+                client.set_email(ws.global.crossref_email.as_deref());
+                let meta = localrag_core::metadata::process_pending(&conn, client, &mut |e| {
+                    let mut s = state.sync.lock().expect("sync state");
+                    if s.root.as_ref() == Some(&root) {
+                        s.current = Some(e.path.clone());
+                    }
+                });
+                let meta = match meta {
+                    Ok(r) => serde_json::to_value(&r).unwrap_or_default(),
+                    Err(e) => serde_json::json!({ "errors": [format!("{e:#}")] }),
+                };
+                state.sync.lock().expect("sync state").metadata = Some(meta);
+                // OCR runs on its own only when the workspace asks for it (ocr = "auto").
+                if ws.config.ocr == localrag_core::config::OcrMode::Auto {
+                    let waiting: Vec<i64> = index::needing_ocr(&conn)?.into_iter().map(|d| d.0).collect();
+                    if !waiting.is_empty() {
+                        set_phase("ocr");
+                        crate::ocr_jobs::run(&state, &root, &ws, &conn, &parsers, &waiting)?;
+                        set_phase("indexing");
+                        report = index::sync(&ws, &mut conn, &embedder, &parsers, &mut |_| {})?;
+                    }
+                }
+                Ok(report)
             })();
             let mut s = state.sync.lock().expect("sync state");
             if s.root.as_ref() != Some(&root) {
                 return; // the user switched workspaces meanwhile
             }
             s.current = None;
+            s.phase = None;
+            s.ocr = None;
             s.runs += 1;
             match result {
                 Ok(r) => {

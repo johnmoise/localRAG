@@ -51,6 +51,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/documents/{id}", delete(forget))
         .route("/api/documents/forget-removed", post(forget_removed))
         .route("/api/documents/{id}/rename", post(rename))
+        .route("/api/documents/{id}/metadata", get(metadata_get).patch(metadata_edit))
+        .route("/api/documents/{id}/metadata/refresh", post(metadata_refresh))
+        .route("/api/documents/{id}/metadata/resolve", post(metadata_resolve))
+        .route("/api/documents/{id}/ocr", post(ocr_one))
+        .route("/api/ocr/all", post(ocr_all))
+        .route("/api/ocr/cancel", post(ocr_cancel))
+        .route("/api/settings", get(crate::settings::get).put(crate::settings::put))
         .route("/api/reindex", post(reindex))
         .route("/api/chunks/{id}", get(chunk))
         .route("/api/highlights", get(highlights))
@@ -324,7 +331,8 @@ async fn documents(State(state): State<AppState>) -> ApiResult {
         let conn = db::open(&ws.db_path())?;
         let mut stmt = conn.prepare(
             "SELECT d.id, d.path, d.status, d.kind, (SELECT count(*) FROM chunks c WHERE c.doc_id = d.id),
-                    d.error, d.scanned_pages, d.cite_label, d.csl_json, d.metadata_source, d.indexed_at, d.removed_at, d.page_count
+                    d.error, d.scanned_pages, d.cite_label, d.csl_json, d.metadata_source, d.indexed_at, d.removed_at, d.page_count,
+                    d.metadata_status, d.doi
              FROM documents d ORDER BY d.path",
         ).map_err(anyhow::Error::from)?;
         let docs: Vec<Value> = stmt
@@ -346,6 +354,9 @@ async fn documents(State(state): State<AppState>) -> ApiResult {
                     "indexed_at": r.get::<_, Option<String>>(10)?,
                     "removed_at": r.get::<_, Option<String>>(11)?,
                     "pages": r.get::<_, Option<i64>>(12)?,
+                    "metadata_status": r.get::<_, Option<String>>(13)?,
+                    "doi": r.get::<_, Option<String>>(14)?,
+                    "csl": csl.as_deref().and_then(|c| serde_json::from_str::<Value>(c).ok()),
                 }))
             })
             .map_err(anyhow::Error::from)?
@@ -377,6 +388,76 @@ async fn forget_removed(State(state): State<AppState>) -> ApiResult {
         Ok(Json(json!({ "forgotten": forgotten })))
     })
     .await
+}
+
+async fn metadata_get(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        Ok(Json(localrag_core::metadata::summary(&db::open(&ws.db_path())?, id)?))
+    })
+    .await
+}
+
+async fn metadata_edit(State(state): State<AppState>, Path(id): Path<i64>, Json(m): Json<localrag_core::metadata::ManualMetadata>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        localrag_core::metadata::set_manual(&conn, id, &m)?;
+        Ok(Json(localrag_core::metadata::summary(&conn, id)?))
+    })
+    .await
+}
+
+async fn metadata_refresh(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        let client = localrag_core::metadata::crossref::shared();
+        client.set_email(ws.global.crossref_email.as_deref());
+        let event = localrag_core::metadata::refresh(&conn, client, id)
+            .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "crossref", format!("{e:#}")))?;
+        Ok(Json(json!({ "event": event, "metadata": localrag_core::metadata::summary(&conn, id)? })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ResolveBody {
+    /// Index of the accepted candidate, or null to reject them all.
+    accept: Option<usize>,
+}
+
+async fn metadata_resolve(State(state): State<AppState>, Path(id): Path<i64>, Json(b): Json<ResolveBody>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        localrag_core::metadata::resolve_proposal(&conn, id, b.accept)?;
+        Ok(Json(localrag_core::metadata::summary(&conn, id)?))
+    })
+    .await
+}
+
+async fn ocr_one(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    if !state.start_ocr(vec![id]) {
+        return Err(ApiError::new(StatusCode::CONFLICT, "busy", "Another job is running; try again when it finishes."));
+    }
+    Ok(Json(json!({ "started": true })))
+}
+
+async fn ocr_all(State(state): State<AppState>) -> ApiResult {
+    let ids = {
+        let ws = state.workspace()?;
+        index::needing_ocr(&db::open(&ws.db_path())?)?.into_iter().map(|d| d.0).collect::<Vec<_>>()
+    };
+    if !state.start_ocr(ids) {
+        return Err(ApiError::new(StatusCode::CONFLICT, "busy", "Another job is running; try again when it finishes."));
+    }
+    Ok(Json(json!({ "started": true })))
+}
+
+async fn ocr_cancel() -> ApiResult {
+    crate::ocr_jobs::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(Json(json!({ "cancelling": true })))
 }
 
 #[derive(Deserialize)]

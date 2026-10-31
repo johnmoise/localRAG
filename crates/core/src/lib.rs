@@ -13,6 +13,8 @@ pub mod history;
 pub mod index;
 pub mod instance;
 pub mod llm;
+pub mod metadata;
+pub mod ocr;
 pub mod parse;
 pub mod pdfhelper;
 pub mod prompts;

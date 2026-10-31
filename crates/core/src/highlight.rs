@@ -38,13 +38,14 @@ struct ChunkLoc {
     page_end: Option<u32>,
     char_start: usize,
     char_end: usize,
+    ocr: bool,
 }
 
 /// Highlights `span` (char range in the chunk's text), or the whole chunk when `None`.
 pub fn for_chunk(ws: &Workspace, conn: &Connection, chunk_id: i64, span: Option<(usize, usize)>) -> anyhow::Result<Highlight> {
     let loc: ChunkLoc = conn
         .query_row(
-            "SELECT d.path, d.sha256, d.kind, d.status, c.text, c.pdf_page_start, c.pdf_page_end, c.char_start, c.char_end
+            "SELECT d.path, d.sha256, d.kind, d.status, c.text, c.pdf_page_start, c.pdf_page_end, c.char_start, c.char_end, c.ocr
              FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE c.id = ?1",
             [chunk_id],
             |r| {
@@ -58,6 +59,7 @@ pub fn for_chunk(ws: &Workspace, conn: &Connection, chunk_id: i64, span: Option<
                     page_end: r.get(6)?,
                     char_start: r.get::<_, i64>(7)? as usize,
                     char_end: r.get::<_, i64>(8)? as usize,
+                    ocr: r.get(9)?,
                 })
             },
         )
@@ -75,6 +77,12 @@ pub fn for_chunk(ws: &Workspace, conn: &Connection, chunk_id: i64, span: Option<
     };
     let (target, _) = normalize_mapped(&target);
 
+    if loc.kind == "pdf" && loc.ocr {
+        return Ok(match crate::ocr::load_cache(ws, &loc.doc_sha) {
+            Some(cache) => ocr_highlight(&cache, &loc, &target),
+            None => Highlight::Unavailable { reason: "the OCR results for this file are missing; run OCR again".into() },
+        });
+    }
     if loc.kind == "pdf" {
         let helper = crate::pdfhelper::PdfHelper::locate(ws.global.pdfium_lib.as_deref())?;
         let (first, last) = (loc.page_start.unwrap_or(1), loc.page_end.or(loc.page_start).unwrap_or(1));
@@ -156,6 +164,44 @@ fn pdf_highlight(pages_in: &[PageChars], loc: &ChunkLoc, target: &str) -> Highli
         } else if r[2] > 0.0 && r[3] > 0.0 {
             rects.push(r);
         }
+    }
+    Highlight::Pdf { pages }
+}
+
+/// OCR'd pages have no PDF characters, only Vision's line boxes: each line in the span is
+/// highlighted, trimmed horizontally by the share of its characters that are covered.
+fn ocr_highlight(cache: &crate::ocr::OcrCache, loc: &ChunkLoc, target: &str) -> Highlight {
+    let (first, last) = (loc.page_start.unwrap_or(1), loc.page_end.or(loc.page_start).unwrap_or(1));
+    let mut region: Vec<(u32, usize, char)> = Vec::new();
+    for p in first..=last {
+        let Some(page) = cache.pages.get(&p) else { continue };
+        for (i, c) in page.text.chars().enumerate() {
+            if (p > first || i >= loc.char_start) && (p < last || i < loc.char_end) {
+                region.push((p, i, c));
+            }
+        }
+    }
+    let chars: Vec<char> = region.iter().map(|r| r.2).collect();
+    let (norm, map) = normalize_mapped(&chars);
+    let (a, b) = find(&norm, &map, target).unwrap_or((0, region.len().saturating_sub(1)));
+    let mut pages: Vec<PageRects> = Vec::new();
+    for p in first..=last {
+        let Some(page) = cache.pages.get(&p) else { continue };
+        let covered: Vec<usize> = region.get(a..=b.min(region.len().saturating_sub(1))).unwrap_or_default().iter().filter(|r| r.0 == p).map(|r| r.1).collect();
+        let (Some(&lo), Some(&hi)) = (covered.first(), covered.last()) else { continue };
+        let mut rects = Vec::new();
+        for line in &page.lines {
+            let len = line.text.chars().count().max(1);
+            let (start, end) = (line.start, line.start + len);
+            if hi < start || lo >= end {
+                continue;
+            }
+            let from = (lo.max(start) - start) as f32 / len as f32;
+            let to = (hi.min(end - 1) - start + 1) as f32 / len as f32;
+            let [x, y, w, h] = line.bbox;
+            rects.push([x + w * from, y, w * (to - from), h]);
+        }
+        pages.push(PageRects { pdf_page: p, rects });
     }
     Highlight::Pdf { pages }
 }

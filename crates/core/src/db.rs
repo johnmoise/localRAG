@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -71,6 +71,9 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 2 {
             conn.execute_batch(SCHEMA_V2).context("migrating to schema v2")?;
+        }
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3).context("migrating to schema v3")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -140,6 +143,15 @@ CREATE TABLE messages (
   supported INTEGER, model TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX messages_session ON messages(session_id, id);
+";
+
+/// Crossref metadata (§7): proposed candidates, errors, and printed page numbers derived
+/// from the metadata's page range (as opposed to the PDF's own page labels).
+const SCHEMA_V3: &str = "
+ALTER TABLE documents ADD COLUMN metadata_candidates TEXT;
+ALTER TABLE documents ADD COLUMN metadata_error TEXT;
+ALTER TABLE documents ADD COLUMN metadata_checked_at TEXT;
+ALTER TABLE chunks ADD COLUMN page_label_offset_applied INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// (Re)creates `chunks_vec` for `dim` dimensions together with the trigger that keeps it

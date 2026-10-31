@@ -1031,6 +1031,49 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 - Email dialog and Settings; proposed-match review; manual edits.
 - Vision OCR with cache, Run OCR and progress.
 
+- **Done (2026-10-31):**
+  - **Crossref client:**
+    - Two limiters (single-record and list), each a no-burst spacing limiter with a
+      concurrency cap, set to the polite or public pool depending on the email.
+    - Stricter `X-Rate-Limit-*` / `X-Concurrency-Limit` headers tighten them; live Crossref
+      sends `x-concurrency-limit: 1` on the public pool.
+    - `Retry-After` / exponential backoff on 429 and 5xx; responses cached in
+      `~/.cache/localrag/crossref/`.
+    - Tested with a simulated clock (no one-second window exceeds the rate) and against a mock
+      server.
+    - Bug the simulated-clock test caught: rounding the spacing *down* let 4 requests into one
+      second at 3/s. It's now rounded up.
+  - **Matching:** DOI from the text first (including DOIs PDF line-wrapping splits after the
+    `/`), else a bibliographic query from the title (PDF metadata if plausible, else a
+    Zotero-style file name) plus the opening text.
+    - Score: 0.7 × title similarity + author + year.
+    - ≥ 0.85 → matched; ≥ 0.45 → *proposed* (candidates kept for review); else unmatched.
+    - **Real run on the 3 PDFs: all matched** (Niemann by a wrapped DOI, the others by title).
+  - **Labels:** `cite_label` is recomputed after every sync, metadata change and rename, with
+    a/b suffixes for collisions.
+  - **Printed pages:** from the metadata's `page` range when the PDF has no page labels and
+    its page count fits (one extra page allowed for a cover sheet). Article-number journals
+    like Baicry's and Niemann's correctly get none.
+  - **Manual edits** (Library → metadata badge) are never overwritten by lookups.
+  - **Settings & email:** the first-load email dialog (validated, or Skip for the public pool)
+    and a Settings dialog (email, default model, `num_ctx`, OCR mode). CLI:
+    `localrag config get|set|unset`, `localrag metadata [--refresh]`; `index` looks up new
+    documents' metadata unless `--no-metadata`.
+  - **OCR:**
+    - The sandboxed helper renders each scanned page at ~300 DPI, and Vision recognizes it
+      in-process (Apple's code on the helper's PNG).
+    - Lines are ordered and grouped into paragraphs by vertical gaps, cached per file hash
+      (saved after each page, so a cancelled run resumes), and merged into the parse at index
+      time.
+    - **Run OCR** and **Run OCR on all** in the Library, `ocr = "auto"` after syncs, Cancel,
+      progress in the status bar; CLI `localrag ocr`.
+    - Citations from OCR text carry an **OCR** badge. Highlights on scanned pages come from
+      Vision's line boxes, trimmed by character position (checked in the browser: the quote
+      lights up on the scanned image).
+  - 62 tests pass.
+  - **Not yet:** search filters by document or year (now possible with metadata; small,
+    Phase 5); bibliography export (later).
+
 **Phase 5: quality & polish**
 - Follow-up rewriting, file watcher, strict mode.
 - Tune the gate, k and chunk size against the eval.

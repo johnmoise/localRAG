@@ -388,3 +388,79 @@ fn rename_updates_references_without_reindexing() {
     assert!(!report.changed_any() && events.is_empty(), "{report:?} {events:?}");
     assert_eq!(e.embedded.get(), embedded);
 }
+
+/// Scanned page → needs_ocr → Vision OCR (cached) → reindexed with OCR text → highlightable.
+#[test]
+fn ocr_fills_scanned_pages_and_is_cached() {
+    use_built_helper();
+    let Ok(lib) = localrag_core::parse::pdf::find_library(None) else { return };
+    let pdfium = localrag_core::parse::pdf::pdfium(&lib).unwrap();
+    let mut f = Fixture::new();
+    f.write("scan.pdf", scanned_pdf(pdfium));
+    let e = FakeEmbedder::new("m", 8);
+    f.sync(&e);
+    assert_eq!(f.status_of("scan.pdf"), Status::NeedsOcr);
+
+    let parsers = Parsers::new(&f.ws);
+    let waiting = index::needing_ocr(&f.conn).unwrap();
+    let (id, path, sha, pages) = waiting[0].clone();
+    assert_eq!(pages, [1]);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let cache = localrag_core::ocr::ocr_document(&f.ws, parsers.pdf_helper().unwrap(), &f.corpus().join(&path), &sha, &pages, &cancel, &mut |_, _| {}).unwrap();
+    assert!(cache.pages[&1].text.to_lowercase().contains("quadratic time"), "{}", cache.pages[&1].text);
+    assert!(f.ws.ocr_cache_path(&sha).is_file());
+
+    index::mark_for_reprocess(&f.conn, id).unwrap();
+    let (r, _) = f.sync(&e);
+    assert_eq!(r.changed, 1);
+    assert_eq!(f.status_of("scan.pdf"), Status::Indexed);
+    let (chunk_id, text, ocr): (i64, String, bool) = f.conn
+        .query_row("SELECT id, text, ocr FROM chunks WHERE text LIKE '%quadratic%'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(ocr, "chunk is flagged as OCR");
+    let start = text[..text.find("quadratic").unwrap()].chars().count();
+    let h = localrag_core::highlight::for_chunk(&f.ws, &f.conn, chunk_id, Some((start, start + "quadratic time".len()))).unwrap();
+    let localrag_core::highlight::Highlight::Pdf { pages } = h else { panic!("{h:?}") };
+    assert_eq!(pages[0].pdf_page, 1);
+    assert!(!pages[0].rects.is_empty(), "OCR line boxes highlight the quote");
+
+    // Rechunking reuses the cache: no OCR needed again, and the doc stays indexed.
+    index::mark_for_reprocess(&f.conn, id).unwrap();
+    f.sync(&e);
+    assert_eq!(f.status_of("scan.pdf"), Status::Indexed);
+}
+
+#[test]
+fn metadata_labels_get_suffixes_and_page_ranges_become_printed_pages() {
+    use localrag_core::metadata::{self, crossref::{Author, Work}};
+    let mut f = Fixture::new();
+    f.write("a.txt", paragraphs(2, "a"));
+    f.write("b.txt", paragraphs(2, "b"));
+    f.sync(&FakeEmbedder::new("m", 8));
+    let id = |p: &str| index::find_document(&f.conn, p).unwrap().unwrap();
+    let work = |title: &str, page: Option<&str>| Work {
+        doi: format!("10.1/{title}"), title: Some(title.into()), year: Some(2021), container: None, kind: None,
+        page: page.map(str::to_string), author: vec![Author { family: Some("Smith".into()), given: Some("A".into()), literal: None }],
+    };
+    metadata::apply_match(&f.conn, id("a.txt"), &work("Alpha study", None), "crossref_doi").unwrap();
+    metadata::apply_match(&f.conn, id("b.txt"), &work("Beta study", None), "crossref_doi").unwrap();
+    metadata::assign_labels(&f.conn).unwrap();
+    let label = |p: &str| -> String { f.conn.query_row("SELECT cite_label FROM documents WHERE path = ?1", [p], |r| r.get(0)).unwrap() };
+    assert_eq!((label("a.txt"), label("b.txt")), ("Smith 2021a".into(), "Smith 2021b".into()));
+
+    // A 2-page "PDF" printed as pp. 345–346: printed numbers come from the page range.
+    f.conn.execute("UPDATE documents SET kind = 'pdf', page_count = 2 WHERE path = 'a.txt'", []).unwrap();
+    f.conn.execute("UPDATE chunks SET pdf_page_start = 1, pdf_page_end = 2 WHERE doc_id = ?1", [id("a.txt")]).unwrap();
+    metadata::apply_match(&f.conn, id("a.txt"), &work("Alpha study", Some("345-346")), "crossref_doi").unwrap();
+    let (ls, le): (String, String) = f.conn.query_row("SELECT page_label_start, page_label_end FROM chunks WHERE doc_id = ?1 LIMIT 1", [id("a.txt")], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((ls.as_str(), le.as_str()), ("345", "346"));
+
+    // Manual edits win and are never overwritten by later lookups.
+    metadata::set_manual(&f.conn, id("a.txt"), &metadata::ManualMetadata {
+        title: Some("Alpha".into()), authors: vec!["Jones, B".into()], year: Some(1999), doi: None, container: None, page: None,
+    }).unwrap();
+    metadata::apply_match(&f.conn, id("a.txt"), &work("Overwritten?", None), "crossref_query").unwrap();
+    assert_eq!(label("a.txt"), "Jones 1999");
+    let src: String = f.conn.query_row("SELECT metadata_source FROM documents WHERE path = 'a.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(src, "manual");
+}

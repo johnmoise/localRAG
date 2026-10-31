@@ -12,6 +12,7 @@ ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2.191"
 objc2 = "0.6.5"
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 objc2-foundation = "0.3.2"
 objc2-vision = "0.3.2"
 pdfium-render = "0.9.4"
