@@ -814,6 +814,19 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 - `tokenizers` counts vs `prompt_eval_count`.
 - One Crossref DOI lookup and one query, with `mailto`.
 - *Exit:* `doctor` all green.
+- **Done (2026-10-31):** `localrag doctor` passes all 8 checks on the M2. Findings:
+  - **Versions:** SQLite 3.53.2 with FTS5, sqlite-vec 0.1.9, and PDFium chromium/7881 (fetched
+    by `scripts/fetch-pdfium.sh`).
+  - **PDFium:** page labels `345`/`346` are read from `/PageLabels`.
+  - **Vision:** OCR of a 300 DPI render reads every line correctly.
+  - **Embedding:** `qwen3-embedding:0.6b` gives 1024 dimensions, and the query instruction
+    ranks the relevant passage first (0.76 vs 0.22).
+  - **Context size:** Ollama loads `qwen3.5:4b` at exactly the requested `num_ctx` (verified
+    via `/api/ps`).
+  - **Token counts:** the Hugging Face Qwen3.5 tokenizer matches Ollama exactly (43 = 43, raw
+    prompt), so exact pre-counting works for Qwen models.
+  - **Crossref:** the public pool reports `X-Rate-Limit-Limit: 5` per `1s`, matching §7.
+  - **Build note:** `image` is pinned to 0.25.6, because 0.25.9 requires an unreleased `png`.
 
 **Phase 1: workspace & stateful indexing (CLI)**
 - `init`, config, `corpus/`, ignore rules; scan/diff; all statuses; restore; `forget`.
