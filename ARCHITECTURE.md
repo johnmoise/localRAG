@@ -826,7 +826,6 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   - **Token counts:** the Hugging Face Qwen3.5 tokenizer matches Ollama exactly (43 = 43, raw
     prompt), so exact pre-counting works for Qwen models.
   - **Crossref:** the public pool reports `X-Rate-Limit-Limit: 5` per `1s`, matching §7.
-  - **Build note:** `image` is pinned to 0.25.6, because 0.25.9 requires an unreleased `png`.
 
 **Phase 1: workspace & stateful indexing (CLI)**
 - `init`, config, `corpus/`, ignore rules; scan/diff; all statuses; restore; `forget`.
@@ -851,7 +850,6 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   - **Environment errors abort the sync** (Ollama down, PDFium missing). Only problems with the
     file itself are recorded as `failed`, so a file never gets stuck as failed because of the
     environment.
-  - **Rust 1.85 pins:** `ignore` 0.4.23 (newer versions need Rust 1.88).
 
 **Phase 2: retrieval & grounded answers (CLI)**
 - Hybrid search (`search`); budget check and warnings; prompting; quote verification;
@@ -874,6 +872,10 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 **Phase 5: quality & polish**
 - Follow-up rewriting, file watcher, strict mode.
 - Tune the gate, k and chunk size against the eval.
+- **Batch embeddings across files.** Phase 1 sends one `/api/embed` request per file, so a
+  corpus of many small files indexes slowly (~7.7 chunks/s: 375 chunks in 49 s). Queue chunks
+  from several files into full batches, and keep one transaction per file by writing each
+  file once all its vectors are back.
 
 **Phase 6: packaging** (§19)
 - Tauri app, bundled PDFium, first-run checks, ad-hoc signing, `.dmg` + README.
