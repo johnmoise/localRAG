@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use localrag_core::agent::{Agent, AgentEvent};
+use localrag_core::agent::{Agent, AgentEvent, Mode};
 use localrag_core::brain::{self, file, integrity::LineView, organize, queue};
 use localrag_core::budget;
 use localrag_core::db;
@@ -291,9 +291,12 @@ async fn queue_action(State(state): State<AppState>, Path((model, id, action)): 
 struct RunBody {
     question: String,
     model: String,
+    /// research (default) or report.
+    #[serde(default)]
+    mode: Mode,
 }
 
-/// Runs the agent; SSE: `step`, `thinking`, `token`, `tool_call`, `tool_result`,
+/// Runs the agent (research, or a report); SSE: `step`, `thinking`, `token`, `tool_call`, `tool_result`,
 /// `brain_update`, `warning`, then `result` (or `error`).
 async fn run(State(state): State<AppState>, Json(body): Json<RunBody>) -> Result<Response, ApiError> {
     let question = body.question.trim().to_string();
@@ -302,6 +305,7 @@ async fn run(State(state): State<AppState>, Json(body): Json<RunBody>) -> Result
     }
     let root = state.root().ok_or(crate::NoWorkspace).map_err(anyhow::Error::from)?;
     let model = body.model.clone();
+    let mode = body.mode;
     {
         let root = root.clone();
         let model = model.clone();
@@ -329,7 +333,7 @@ async fn run(State(state): State<AppState>, Json(body): Json<RunBody>) -> Result
             let (num_ctx, _) = budget::resolve_num_ctx(&mut ws, &llm, &model)?;
             let (corpus_num_ctx, _) = budget::resolve_num_ctx(&mut ws, &llm, &corpus_model)?;
             let agent = Agent { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm, model: &model, num_ctx, corpus_model: &corpus_model, corpus_num_ctx };
-            let r = agent.run(&question, &mut |e| match e {
+            let r = agent.run_mode(mode, &question, &mut |e| match e {
                 AgentEvent::Step(n) => send("step", json!({ "step": n })),
                 AgentEvent::Thinking(t) => send("thinking", json!({ "text": t })),
                 AgentEvent::Token(t) => send("token", json!({ "text": t })),

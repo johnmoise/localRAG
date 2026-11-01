@@ -646,6 +646,19 @@ On 16 GB, the reasoning model also answers `ask_corpus` by default, to avoid Oll
 models at every step. Reasoning models are installed models with the `thinking` and `tools`
 capabilities.
 
+**Reports** (**Generate Report**, next to **Research**; `localrag agent --report`). The same
+agent, with a different start and a single tool:
+1. The program calls `organize_brain` first. If there are no facts, or the layout fails
+   validation, the brain is left as it is and a warning is raised.
+2. It reads the whole brain file into context as Markdown: headings, `[THOUGHT]` lines and
+   facts. This is unlike `read_brain`. Only the 64-character hashes are left out, and facts
+   that fail integrity are listed as not to be cited. Both of these steps appear to the model
+   as its own tool calls.
+3. The model then loops with `ask_corpus` only (`propose_fact` and `read_brain` are refused),
+   for up to 14 steps.
+4. It writes a title and 4–5 paragraphs, citing `[C#]` or fact IDs, which resolve to their
+   original sources as in a research run. A report proposes no facts.
+
 **Brain files**
 - **One per reasoning model:** `brain/<model>.md` (`deepseek-r1:8b` → `deepseek-r1_8b.md`).
   The header records the exact model name. The queue, registry and embeddings are per model
@@ -870,7 +883,7 @@ The server picks a free port and opens the browser on start.
 | `GET /api/brain/{model}/last-change` | Previous and current file, for the diff |
 | `GET /api/brain/{model}/queue` | Proposed facts |
 | `POST /api/brain/{model}/queue/{id}/{approve\|reject\|merge}` | Queue actions (`approve` accepts an edited claim) |
-| `POST /api/agent/run` | Run the reasoning agent; SSE: `step`, `thinking`, `token`, `tool_call`, `tool_result`, `brain_update`, `warning`, `result` |
+| `POST /api/agent/run` | Run the reasoning agent (`mode`: `research` or `report`); SSE: `step`, `thinking`, `token`, `tool_call`, `tool_result`, `brain_update`, `warning`, `result` |
 
 ## 15. User interface
 
@@ -931,8 +944,9 @@ workspace menu, a Settings panel, and first-load dialogs.
   - **Reasoning model selector** (installed models with `thinking` + `tools`). Models that have
     a brain file but are no longer installed appear read-only.
   - **Main pane:** the selected model's accepted facts, in the brain's current structure. A
-    collapsible **Research a question with this model** box at the top runs the agent and
-    streams its steps (tool calls, dropped/queued proposals) and its cited answer.
+    collapsible **Research a question with this model** box at the top has **Research** (answer
+    and propose facts) and **Generate Report** (§12 *Reports*). Both stream the steps (tool
+    calls, dropped or queued proposals) and the cited result.
     - Headings, `[THOUGHT]` lines (styled as interpretation) and facts: the claim, citation
       chips that open the highlighted source, and a status badge (active / stale / broken /
       unresolved).
@@ -1297,6 +1311,14 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     uncached): generation 19.9 vs 20.5 tok/s (+3%), prompt processing 257 vs 211 tok/s (−18%),
     memory 3.2 vs 4.1 GB, load 3.9 vs 2.1 s; tool calls work on both. RAG prompts are long, so
     prompt processing dominates: GGUF stays the default here.
+  - **Reports** (added the same day): from the UI with `qwen3.5:4b` on its 2-fact brain,
+    "What determines how second primary cancers are counted in registry studies, and what do
+    newer biomarkers such as ctDNA add…?" took about 6 minutes.
+    - Steps: organize (reorganized), read the brain file, 3 sub-questions.
+    - One sub-question wasn't answered by the corpus; the model rephrased and continued.
+    - The result is a title and 4 paragraphs with 12 Baicry/Niemann citations. None failed
+      to resolve, and no facts were proposed.
+    - It didn't cite its two facts directly; it re-asked the corpus instead.
   - **Tool calling:** Ollama `tools`. `ask_corpus` runs the full grounded pipeline (§10) and
     numbers each answer's citations `C1, C2, …` for the run, showing the quote and whether it
     verified. Only verified citations can support a proposal. The final answer cites `[C#]` or

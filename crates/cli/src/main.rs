@@ -99,6 +99,10 @@ enum Command {
         /// Reasoning model (default: reasoning_model in the workspace config)
         #[arg(long)]
         model: Option<String>,
+        /// Write a 4–5 paragraph cited report instead: organizes the brain first, reads all of
+        /// it (headings and thoughts too), and proposes no facts
+        #[arg(long)]
+        report: bool,
     },
     /// Inspect and manage a reasoning model's second brain
     Brain {
@@ -193,7 +197,7 @@ fn main() -> ExitCode {
         }
         Command::Serve { port, no_open, dir } => serve(port, no_open, dir),
         Command::Check => check(),
-        Command::Agent { question, model } => exclusive().and_then(|_g| agent_cmd(&question, model)),
+        Command::Agent { question, model, report } => exclusive().and_then(|_g| agent_cmd(&question, model, report)),
         Command::Brain { action, model } => match action {
             BrainAction::Show | BrainAction::Queue => brain_cmd(action, model),
             _ => exclusive().and_then(|_g| brain_cmd(action, model)),
@@ -675,7 +679,7 @@ fn reasoning_model(ws: &Workspace, model: Option<String>) -> anyhow::Result<Stri
     model.or_else(|| ws.config.reasoning_model.clone()).context("name a reasoning model with --model, or set reasoning_model in .localrag/config.toml")
 }
 
-fn agent_cmd(question: &str, model: Option<String>) -> anyhow::Result<()> {
+fn agent_cmd(question: &str, model: Option<String>, report: bool) -> anyhow::Result<()> {
     let mut ws = Workspace::discover(&std::env::current_dir()?)?;
     let conn = db::open(&ws.db_path())?;
     let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
@@ -688,7 +692,8 @@ fn agent_cmd(question: &str, model: Option<String>) -> anyhow::Result<()> {
     let corpus_num_ctx = resolve_num_ctx(&mut ws, &llm, &corpus_model)?;
     let agent = localrag_core::agent::Agent { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm, model: &model, num_ctx, corpus_model: &corpus_model, corpus_num_ctx };
     use localrag_core::agent::AgentEvent;
-    let r = agent.run(question, &mut |e| match e {
+    let mode = if report { localrag_core::agent::Mode::Report } else { localrag_core::agent::Mode::Research };
+    let r = agent.run_mode(mode, question, &mut |e| match e {
         AgentEvent::ToolCall { name, arguments } => eprintln!("→ {name} {}", arguments),
         AgentEvent::ToolResult { name, result } => eprintln!("  {name}: {}", result["summary"].as_str().unwrap_or("")),
         AgentEvent::BrainUpdate(v) => eprintln!("  proposal: {}", v),

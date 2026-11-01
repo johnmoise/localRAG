@@ -325,3 +325,6 @@ td.num, th.num { text-align: right; }
 .brain-diff .del { color: #b0413e; }
 @media (max-width: 900px) { #tab-brain { flex-direction: column; } .brain-queue { width: auto; border-left: none; border-top: 1px solid var(--line); } }
 .qcard mark { background: var(--mark-quote); color: inherit; border-radius: 2px; }
+.composer-row #report-btn { margin-left: 8px; }
+.agent-answer.report { font-size: 15px; line-height: 1.6; }
+.agent-answer.report h1, .agent-answer.report h2 { font-size: 18px; margin: 4px 0 10px; }

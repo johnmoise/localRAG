@@ -15,12 +15,26 @@ use crate::brain::{self, file::FactCitation, integrity::FactView};
 use crate::citations;
 use crate::db;
 use crate::embed::Embedder;
-use crate::llm::{ChatRequest, Delta, Llm, Message};
+use crate::llm::{ChatRequest, Delta, Llm, Message, ToolCall, ToolFunction};
 use crate::prompts;
 use crate::retrieval::ChunkRef;
 use crate::workspace::Workspace;
 
 pub const MAX_STEPS: usize = 10;
+/// A report asks more sub-questions than a research run.
+pub const MAX_REPORT_STEPS: usize = 14;
+
+/// What a run is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Answer a question and propose facts for the brain.
+    #[default]
+    Research,
+    /// Organize the brain, read all of it (headings and thoughts too), then write a
+    /// 4–5 paragraph cited report. Proposes nothing.
+    Report,
+}
 
 pub struct Agent<'a> {
     pub ws: &'a Workspace,
@@ -80,6 +94,7 @@ pub struct Step {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentResult {
     pub run_id: i64,
+    pub mode: Mode,
     pub model: String,
     pub question: String,
     /// The final answer with markers replaced by source labels.
@@ -118,9 +133,17 @@ struct Run {
 
 impl Agent<'_> {
     pub fn run(&self, question: &str, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<AgentResult> {
+        self.run_mode(Mode::Research, question, on)
+    }
+
+    pub fn report(&self, question: &str, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<AgentResult> {
+        self.run_mode(Mode::Report, question, on)
+    }
+
+    pub fn run_mode(&self, mode: Mode, question: &str, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<AgentResult> {
         self.conn.execute("INSERT INTO agent_runs (model, question, status, created_at) VALUES (?1, ?2, 'running', ?3)", params![self.model, question, db::now_rfc3339()])?;
         let run_id = self.conn.last_insert_rowid();
-        let result = self.run_inner(run_id, question, on);
+        let result = self.run_inner(mode, run_id, question, on);
         match &result {
             Ok(r) => self.conn.execute("UPDATE agent_runs SET status = 'done', result_json = ?2, finished_at = ?3 WHERE id = ?1", params![run_id, serde_json::to_string(r)?, db::now_rfc3339()])?,
             Err(e) => self.conn.execute("UPDATE agent_runs SET status = 'failed', error = ?2, finished_at = ?3 WHERE id = ?1", params![run_id, format!("{e:#}"), db::now_rfc3339()])?,
@@ -128,17 +151,23 @@ impl Agent<'_> {
         result
     }
 
-    fn run_inner(&self, run_id: i64, question: &str, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<AgentResult> {
+    fn run_inner(&self, mode: Mode, run_id: i64, question: &str, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<AgentResult> {
         let info = self.llm.model_info(self.model)?;
         let think = info.can("thinking");
         let mut run = Run { citations: Vec::new(), facts: HashMap::new(), steps: Vec::new(), proposals: Vec::new(), warnings: Vec::new() };
-        let mut messages = vec![Message::system(prompts::AGENT_SYSTEM), Message::user(question)];
-        let tools = prompts::agent_tools();
+        let (system, tools, max_steps) = match mode {
+            Mode::Research => (prompts::AGENT_SYSTEM, prompts::agent_tools(), MAX_STEPS),
+            Mode::Report => (prompts::REPORT_SYSTEM, prompts::report_tools(), MAX_REPORT_STEPS),
+        };
+        let mut messages = vec![Message::system(system), Message::user(question)];
+        if mode == Mode::Report {
+            self.prepare_report(&mut run, &mut messages, on)?;
+        }
         let mut thinking = String::new();
         let mut final_text: Option<String> = None;
-        for step in 1..=MAX_STEPS + 1 {
+        for step in 1..=max_steps + 1 {
             on(AgentEvent::Step(step));
-            let last = step > MAX_STEPS;
+            let last = step > max_steps;
             if last {
                 messages.push(Message::user("You have used all your steps. Give your final answer now, citing [C#] / [F#] only."));
             }
@@ -165,7 +194,7 @@ impl Agent<'_> {
             for call in &resp.tool_calls {
                 let a = args(&call.function.arguments);
                 on(AgentEvent::ToolCall { name: &call.function.name, arguments: &a });
-                let (text, data) = match self.tool(run_id, &call.function.name, &a, question, &mut run, on) {
+                let (text, data) = match self.tool(mode, run_id, &call.function.name, &a, question, &mut run, on) {
                     Ok(r) => r,
                     Err(e) => (format!("Error: {e:#}"), json!({ "error": format!("{e:#}") })),
                 };
@@ -178,6 +207,7 @@ impl Agent<'_> {
         let (text, sources, invalid_markers) = self.render(&raw_text, &run);
         Ok(AgentResult {
             run_id,
+            mode,
             model: self.model.to_string(),
             question: question.to_string(),
             text,
@@ -191,7 +221,71 @@ impl Agent<'_> {
         })
     }
 
-    fn tool(&self, run_id: i64, name: &str, a: &Value, question: &str, run: &mut Run, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<(String, Value)> {
+    /// Report mode's fixed first moves, made by the program so they always happen in this
+    /// order: `organize_brain`, then the whole brain file read into context. Both are shown
+    /// to the model as its own tool calls.
+    fn prepare_report(&self, run: &mut Run, messages: &mut Vec<Message>, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<()> {
+        fn call(on: &mut dyn FnMut(AgentEvent), name: &str, run: &mut Run, messages: &mut Vec<Message>, text: String, data: Value) {
+            let a = json!({});
+            on(AgentEvent::ToolCall { name, arguments: &a });
+            on(AgentEvent::ToolResult { name, result: &data });
+            run.steps.push(Step { tool: name.into(), arguments: a.clone(), summary: data["summary"].as_str().unwrap_or_default().to_string() });
+            messages.push(Message { role: "assistant".into(), tool_calls: vec![ToolCall { function: ToolFunction { name: name.into(), arguments: a } }], ..Message::default() });
+            messages.push(Message::tool(name, text));
+        }
+
+        // 1. organize_brain (skipped when there's nothing to organize or it can't run).
+        let (_, checked) = brain::load_checked(self.ws, self.conn, self.model)?;
+        let summary = if checked.usable().is_empty() {
+            "nothing to organize (no facts yet)".to_string()
+        } else {
+            match brain::organize::organize(self.ws, self.llm, self.model, self.num_ctx, &checked) {
+                Ok(o) if o.changed => "reorganized".to_string(),
+                Ok(o) if o.errors.is_empty() => "kept the current layout".to_string(),
+                Ok(o) => {
+                    run.warnings.push(format!("organize_brain's layout failed validation; the brain was left as it was ({})", o.errors.join("; ")));
+                    "layout rejected; brain unchanged".to_string()
+                }
+                Err(e) => {
+                    run.warnings.push(format!("organize_brain didn't run: {e:#}"));
+                    "skipped".to_string()
+                }
+            }
+        };
+        call(on, "organize_brain", run, messages, format!("organize_brain: {summary}."), json!({ "summary": summary }));
+
+        // 2. The whole file as Markdown: headings, thoughts and facts. Only the 64-character
+        //    hashes are left out (they mean nothing to the model and cost ~90 tokens each).
+        let (b, checked) = brain::load_checked(self.ws, self.conn, self.model)?;
+        for f in checked.usable() {
+            run.facts.insert(brain::short_id(&f.id), f.clone());
+        }
+        let hashes = Regex::new(r" <doc:[0-9a-f]{64}, chunk:[0-9a-f]{64}>").expect("valid regex");
+        let mut text = if b.exists { hashes.replace_all(&b.text, "").to_string() } else { "(This model has no brain file yet.)".to_string() };
+        let unusable: Vec<String> = checked
+            .lines
+            .iter()
+            .filter_map(|l| if let crate::brain::integrity::LineView::Fact(f) = l { (!f.usable()).then(|| format!("{} ({})", f.id, f.status)) } else { None })
+            .collect();
+        if !unusable.is_empty() {
+            text.push_str(&format!("\n\nDo not cite these facts; they failed integrity checks: {}\n", unusable.join(", ")));
+        }
+        let tokens = text.chars().count() / 4;
+        if tokens > self.num_ctx as usize / 3 {
+            let w = format!("The brain file is about {tokens} tokens, a large share of the {}-token context.", self.num_ctx);
+            on(AgentEvent::Warning(&w));
+            run.warnings.push(w);
+        }
+        let n = checked.usable().len();
+        call(on, "read_brain_file", run, messages, text, json!({ "summary": format!("{n} fact(s), with headings and thoughts") }));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool(&self, mode: Mode, run_id: i64, name: &str, a: &Value, question: &str, run: &mut Run, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<(String, Value)> {
+        if mode == Mode::Report && name != "ask_corpus" {
+            anyhow::bail!("{name} isn't available while writing a report; only ask_corpus is");
+        }
         match name {
             "read_brain" => {
                 let query = a["query"].as_str().filter(|q| !q.trim().is_empty()).unwrap_or(question);

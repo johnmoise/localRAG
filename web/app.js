@@ -1393,12 +1393,16 @@ function queueCard(q) {
   return card;
 }
 
-$("#agent-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
+$("#agent-form").addEventListener("submit", (e) => { e.preventDefault(); runAgent("research"); });
+$("#report-btn").addEventListener("click", () => ($("#agent-form").reportValidity() ? runAgent("report") : null));
+
+/// Research: answer and propose facts. Report: organize the brain, read all of it, then
+/// write a cited 4–5 paragraph report (no proposals).
+async function runAgent(mode) {
   const question = $("#agent-q").value.trim();
   if (!question || !brain.model) return;
-  const btn = $("#agent-btn");
-  btn.disabled = true;
+  const buttons = [$("#agent-btn"), $("#report-btn")];
+  buttons.forEach((b) => (b.disabled = true));
   $("#agent-error").textContent = "";
   const steps = el("ol", { class: "agent-steps" });
   const live = el("div", { class: "agent-answer muted" });
@@ -1406,7 +1410,7 @@ $("#agent-form").addEventListener("submit", async (e) => {
   const addStep = (...c) => steps.append(el("li", {}, ...c));
   let thinking = false;
   try {
-    const res = await fetch("/api/agent/run", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question, model: brain.model }) });
+    const res = await fetch("/api/agent/run", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question, model: brain.model, mode }) });
     if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || res.statusText); }
     for await (const { event, data } of sse(res)) {
       if (event === "thinking" && !thinking) { thinking = true; live.textContent = "Thinking…"; }
@@ -1423,7 +1427,7 @@ $("#agent-form").addEventListener("submit", async (e) => {
       } else if (event === "warning") addStep(el("span", { class: "problem" }, data.message));
       else if (event === "result") {
         const html = DOMPurify.sanitize(marked.parse(data.text || "(no answer)"));
-        const ans = el("div", { class: "agent-answer" });
+        const ans = el("div", { class: `agent-answer${mode === "report" ? " report" : ""}` });
         ans.innerHTML = html;
         if (data.invalid_markers.length) ans.append(el("div", { class: "problem" }, `Citations that don't resolve: ${data.invalid_markers.join(", ")}`));
         if (data.sources.length) ans.append(el("div", { class: "cites" }, el("span", { class: "muted small-text" }, "Sources: "),
@@ -1439,6 +1443,6 @@ $("#agent-form").addEventListener("submit", async (e) => {
   } catch (err) {
     $("#agent-error").textContent = err.message;
   } finally {
-    btn.disabled = false;
+    buttons.forEach((b) => (b.disabled = false));
   }
-});
+}

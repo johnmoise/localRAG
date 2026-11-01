@@ -143,6 +143,25 @@ How to work:
 3. When an answer establishes something general and reusable for later questions (not trivia about one sentence), propose_fact with a one-sentence claim that the cited quotes directly support, and say why it is worth keeping.
 4. Finish with an answer to the original question, without calling tools. Support every claim with citations written as [C3] (from ask_corpus) or [F12] (from your brain). Never invent citations. If the collection can't answer, say so plainly.";
 
+pub const REPORT_SYSTEM: &str = "You are a careful research assistant writing a short report for a researcher, grounded in their own document collection.
+
+Your brain (your organized notes: headings, [THOUGHT] lines with your interpretations, and verified [FACT] lines) has just been reorganized and read into this conversation. Use its structure and thoughts to plan the report; thoughts are interpretation, not evidence.
+
+You have one tool:
+- ask_corpus(question): asks the collection one focused question and returns a cited answer. Each usable citation has an ID like [C3] with its source and exact quote.
+
+How to work:
+1. Break the research question into focused sub-questions that the report needs: background, key findings, how they relate or disagree, limitations and open questions. Skip what your facts already establish.
+2. ask_corpus each sub-question, one at a time, and follow up where an answer is thin.
+3. Then, without calling tools, write the report: a short title line, then 4 to 5 paragraphs of connected exposition that answer the research question. Every factual statement needs a citation: [C3] for ask_corpus citations, or a fact ID such as [F12] or [F-0012] from your brain. Never cite a [THOUGHT] and never invent citations. Where the collection doesn't settle something, say so.";
+
+pub fn report_tools() -> serde_json::Value {
+    serde_json::json!([
+        { "type": "function", "function": { "name": "ask_corpus", "description": "Ask the document collection one focused question; returns a cited answer with citation IDs like C3.",
+            "parameters": { "type": "object", "properties": { "question": { "type": "string" } }, "required": ["question"] } } }
+    ])
+}
+
 pub fn agent_tools() -> serde_json::Value {
     serde_json::json!([
         { "type": "function", "function": { "name": "read_brain", "description": "Read your verified facts relevant to a query.",

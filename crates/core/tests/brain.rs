@@ -355,3 +355,45 @@ fn organize_rearranges_without_touching_fact_lines_and_can_be_undone() {
     assert_eq!(f.file_text(), before);
     assert!(matches!(file::load(&f.ws, MODEL).unwrap().lines[0], Line::Heading { level: 1, .. }));
 }
+
+#[test]
+fn a_report_organizes_first_reads_the_whole_brain_and_proposes_nothing() {
+    let f = Fixture::new();
+    let mut llm = Scripted::new(vec![], "");
+    for (needle, quote, claim) in [("quadratic", "takes quadratic time in the sequence length", CLAIM), ("linear time", "reduce the cost of attention to linear time", "Linear attention variants reduce the cost of attention to linear time.")] {
+        let Admission::Queued { queue_id } = propose(&f, &llm, claim, cite(&f, needle, quote), None) else { panic!() };
+        f.gate(&llm).approve(queue_id, None).unwrap();
+    }
+    llm.organize = json!({ "lines": [format!("# Brain · {MODEL}"), "", "## Cost of attention", "[THOUGHT] F-0001 and F-0002 describe different mechanisms.", "[FACT F-0001]", "[FACT F-0002]"] });
+    // The two program-made calls (organize_brain, read_brain_file) come first; then the model's.
+    llm.moves = vec![
+        ("pad", json!({})),
+        ("pad", json!({})),
+        ("propose_fact", json!({ "claim": "x", "citations": ["C1"], "reason": "y" })),
+        ("ask_corpus", json!({ "question": "How does self-attention time scale with sequence length?" })),
+    ];
+    llm.final_text = "# Attention cost\n\nSelf-attention is quadratic [C1], as noted before [F-0001]; linear variants differ [F2].".into();
+    let queued_before = brain::queue::pending(&f.conn, MODEL).unwrap().len();
+    let r = f.agent(&llm).report("Why is attention expensive, and what helps?", &mut |_| {}).unwrap();
+
+    let tools: Vec<&str> = r.steps.iter().map(|s| s.tool.as_str()).collect();
+    assert_eq!(tools, ["organize_brain", "read_brain_file", "propose_fact", "ask_corpus"]);
+    assert_eq!(r.steps[0].summary, "reorganized");
+    assert!(r.proposals.is_empty() && brain::queue::pending(&f.conn, MODEL).unwrap().len() == queued_before, "a report proposes nothing");
+    assert!(r.invalid_markers.is_empty(), "{:?}", r.invalid_markers);
+    let vias: Vec<&str> = r.sources.iter().map(|s| s.via.as_str()).collect();
+    assert_eq!(vias, ["C1", "F1", "F2"], "facts resolve to their original citations");
+
+    let reqs = llm.requests.borrow();
+    let organize_at = reqs.iter().position(|q| q.messages[0].content.contains("You organize your own research notes")).unwrap();
+    let report_at = reqs.iter().position(|q| q.messages[0].content.contains("writing a short report")).unwrap();
+    assert!(organize_at < report_at, "organize_brain runs before anything else");
+    let first = &reqs[report_at];
+    let names: Vec<&str> = first.tools.as_ref().unwrap().as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["ask_corpus"], "no propose_fact or read_brain in a report");
+    let brain_text = &first.messages.iter().find(|m| m.tool_name.as_deref() == Some("read_brain_file")).unwrap().content;
+    assert!(brain_text.contains("## Cost of attention") && brain_text.contains("[THOUGHT] F-0001 and F-0002"), "headings and thoughts are visible: {brain_text}");
+    assert!(brain_text.contains("[FACT] F-0001 | Self-attention takes quadratic time") && !brain_text.contains("<doc:"), "{brain_text}");
+    let refused = reqs.iter().flat_map(|q| q.messages.iter()).find(|m| m.tool_name.as_deref() == Some("propose_fact")).unwrap();
+    assert!(refused.content.contains("isn't available"), "{}", refused.content);
+}
