@@ -1,4 +1,5 @@
 pub mod answer;
+pub mod bibliography;
 pub mod budget;
 pub mod chunk;
 pub mod citations;
@@ -18,6 +19,7 @@ pub mod ocr;
 pub mod parse;
 pub mod pdfhelper;
 pub mod prompts;
+pub mod references;
 pub mod refs;
 pub mod registry;
 pub mod resources;

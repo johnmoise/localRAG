@@ -55,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/documents/{id}/metadata/refresh", post(metadata_refresh))
         .route("/api/documents/{id}/metadata/resolve", post(metadata_resolve))
         .route("/api/documents/{id}/ocr", post(ocr_one))
+        .route("/api/documents/{id}/references", get(references))
         .route("/api/ocr/all", post(ocr_all))
         .route("/api/ocr/cancel", post(ocr_cancel))
         .route("/api/settings", get(crate::settings::get).put(crate::settings::put))
@@ -334,7 +335,8 @@ async fn documents(State(state): State<AppState>) -> ApiResult {
         let mut stmt = conn.prepare(
             "SELECT d.id, d.path, d.status, d.kind, (SELECT count(*) FROM chunks c WHERE c.doc_id = d.id),
                     d.error, d.scanned_pages, d.cite_label, d.csl_json, d.metadata_source, d.indexed_at, d.removed_at, d.page_count,
-                    d.metadata_status, d.doi
+                    d.metadata_status, d.doi, d.reference_count, d.cited_by,
+                    (SELECT count(*) FROM doc_references r WHERE r.doc_id = d.id AND r.in_corpus_doc_id IS NOT NULL)
              FROM documents d ORDER BY d.path",
         ).map_err(anyhow::Error::from)?;
         let docs: Vec<Value> = stmt
@@ -358,6 +360,9 @@ async fn documents(State(state): State<AppState>) -> ApiResult {
                     "pages": r.get::<_, Option<i64>>(12)?,
                     "metadata_status": r.get::<_, Option<String>>(13)?,
                     "doi": r.get::<_, Option<String>>(14)?,
+                    "reference_count": r.get::<_, Option<i64>>(15)?,
+                    "cited_by": r.get::<_, Option<i64>>(16)?,
+                    "references_in_corpus": r.get::<_, i64>(17)?,
                     "csl": csl.as_deref().and_then(|c| serde_json::from_str::<Value>(c).ok()),
                 }))
             })
@@ -435,6 +440,15 @@ async fn metadata_resolve(State(state): State<AppState>, Path(id): Path<i64>, Js
         let conn = db::open(&ws.db_path())?;
         localrag_core::metadata::resolve_proposal(&conn, id, b.accept)?;
         Ok(Json(localrag_core::metadata::summary(&conn, id)?))
+    })
+    .await
+}
+
+async fn references(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        Ok(Json(json!({ "references": localrag_core::references::for_document(&conn, id)? })))
     })
     .await
 }

@@ -8,8 +8,8 @@ use crate::config::ChunkingConfig;
 use crate::parse::ParsedDoc;
 use crate::scan::sha256_str;
 
-/// Bump to make the next sync rechunk every document.
-pub const CHUNKER_VERSION: i64 = 1;
+/// Bump to make the next sync rechunk every document. 2: bibliographies split from the body.
+pub const CHUNKER_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {

@@ -75,6 +75,7 @@ async function refreshStatus() {
       const o = s.sync.ocr;
       text = s.sync.phase === "ocr" && o ? `OCR: ${o.path} · page ${Math.min(o.done + 1, o.pages)} of ${o.pages}`
         : s.sync.phase === "metadata" ? `Looking up citations on Crossref…${s.sync.current ? ` · ${s.sync.current}` : ""}`
+        : s.sync.phase === "references" ? `Looking up bibliography references on Crossref…${s.sync.current ? ` · ${s.sync.current}` : ""}`
         : `Indexing… ${s.sync.processed} file(s)${s.sync.current ? ` · ${s.sync.current}` : ""}`;
     } else if (s.sync.error) {
       dot = "bad";
@@ -216,7 +217,7 @@ function bindChips(container, messageId) {
   );
 }
 
-function answerBlock({ placeholderMd, text, citations, supported, notFound, sources, suggestions, warnings, unsupported, invalid, thinking, model, messageId }) {
+function answerBlock({ placeholderMd, text, citations, supported, notFound, sources, suggestions, suggestedRefs, warnings, unsupported, invalid, thinking, model, messageId }) {
   const wrap = el("div", { class: "msg assistant" });
   for (const w of warnings || []) wrap.append(el("div", { class: "warning" }, "⚠ ", w.message || describeWarning(w)));
   if (thinking) wrap.append(el("details", {}, el("summary", {}, "Model reasoning"), el("div", { class: "thinking" }, thinking)));
@@ -234,9 +235,17 @@ function answerBlock({ placeholderMd, text, citations, supported, notFound, sour
     wrap.append(el("div", { class: "closest" }, el("div", { class: "muted" }, "Closest material found (not sufficient to answer):"),
       el("ul", {}, sources.map((c) => el("li", {}, el("button", { class: "chip unverified", onclick: () => inspectChunk(c) }, `${c.doc_label}${c.locator ? `, ${c.locator}` : ""}`))))));
   }
+  if (suggestedRefs?.length) {
+    wrap.append(el("div", { class: "suggestions" },
+      el("div", { class: "label" }, "Works your documents cite that aren't in your corpus yet (chosen from their bibliographies):"),
+      el("ul", { class: "sugg-refs" }, suggestedRefs.map((r) => el("li", {},
+        el("strong", {}, r.label), r.title ? ` — ${r.title}` : ` — ${r.raw}`, r.container ? el("span", { class: "muted" }, ` (${r.container})`) : null,
+        r.doi ? el("span", {}, " · ", el("a", { href: `https://doi.org/${encodeURIComponent(r.doi).replace(/%2F/g, "/")}`, target: "_blank", rel: "noopener noreferrer" }, "DOI")) : null,
+        el("div", { class: "why" }, `${r.reason}${r.reason ? " · " : ""}cited by ${r.cited_in.join(", ")}`))))));
+  }
   if (suggestions?.length) {
     wrap.append(el("div", { class: "suggestions" },
-      el("div", { class: "label" }, "Material that could help (suggested from the model's general knowledge, unverified):"),
+      el("div", { class: "label" }, "Topics to look for (suggested from the model's general knowledge, unverified):"),
       el("ul", {}, suggestions.map((s) => el("li", {}, s)))));
   }
   const flags = [];
@@ -265,6 +274,7 @@ function assistantFromHistory(m) {
     supported: m.supported,
     notFound: x.not_found ?? m.content.startsWith("The indexed literature doesn't contain"),
     suggestions: x.suggestions,
+    suggestedRefs: x.suggested_references,
     unsupported: x.unsupported_sentences,
     invalid: x.invalid_markers,
     sources: x.closest,
@@ -348,7 +358,7 @@ $("#composer").addEventListener("submit", async (e) => {
         state.sessionId = data.session_id;
         live.replaceWith(answerBlock({
           placeholderMd: data.placeholder_markdown, text: a.text, citations: a.citations.map(liveCitation),
-          supported: a.supported, notFound: a.not_found, sources: a.sources, suggestions: a.suggestions,
+          supported: a.supported, notFound: a.not_found, sources: a.sources, suggestions: a.suggestions, suggestedRefs: a.suggested_references,
           warnings: a.warnings.map((w) => ({ ...w, message: warningText(w) })), unsupported: a.unsupported_sentences,
           invalid: a.invalid_markers, thinking: a.thinking, model: a.model, messageId: data.message_id,
         }));
@@ -643,8 +653,39 @@ async function loadSearchDocs() {
 
 // ---------------------------------------------------------------- library
 
+const docSort = { key: null, dir: 1 };
+const STATUS_ORDER = { indexed: 0, needs_ocr: 1, pending: 2, failed: 3, removed: 4 };
+document.querySelectorAll("th.sortable").forEach((th) => th.addEventListener("click", () => {
+  docSort.dir = docSort.key === th.dataset.sort ? -docSort.dir : (th.dataset.sort === "status" ? 1 : -1);
+  docSort.key = th.dataset.sort;
+  document.querySelectorAll("th.sortable").forEach((x) => x.removeAttribute("data-dir"));
+  th.dataset.dir = docSort.dir > 0 ? "asc" : "desc";
+  loadDocuments();
+}));
+/// Sort value; N/A (null) always goes last whichever the direction.
+function sortValue(d, key) {
+  switch (key) {
+    case "status": return STATUS_ORDER[d.status] ?? 9;
+    case "chunks": return d.chunks;
+    case "pages": return d.kind === "pdf" ? d.pages : null;
+    case "references": return d.reference_count;
+    case "cited_by": return d.cited_by;
+    default: return null;
+  }
+}
+
 async function loadDocuments() {
-  const { documents } = await api("/api/documents");
+  refCache.clear();
+  const { documents: all } = await api("/api/documents");
+  const documents = docSort.key
+    ? [...all].sort((a, b) => {
+        const [x, y] = [sortValue(a, docSort.key), sortValue(b, docSort.key)];
+        if (x == null && y == null) return a.path.localeCompare(b.path);
+        if (x == null) return 1;
+        if (y == null) return -1;
+        return (x - y) * docSort.dir || a.path.localeCompare(b.path);
+      })
+    : all;
   const counts = documents.reduce((m, d) => ((m[d.status] = (m[d.status] || 0) + 1), m), {});
   $("#library-summary").textContent = Object.entries(counts).map(([k, n]) => `${n} ${k.replace("_", " ")}`).join(" · ") || "No documents yet: add files to corpus/ and press Reindex.";
   $("#forget-all").disabled = !counts.removed;
@@ -663,8 +704,12 @@ async function loadDocuments() {
       nameCell,
       citeCell,
       el("td", {}, el("span", { class: `st ${d.status}` }, d.status.replace("_", " "))),
-      el("td", {}, String(d.chunks)),
-      el("td", {}, d.pages != null && d.kind === "pdf" ? String(d.pages) : "–"),
+      el("td", { class: "num" }, String(d.chunks)),
+      el("td", { class: "num" }, d.pages != null && d.kind === "pdf" ? String(d.pages) : el("span", { class: "na" }, "–")),
+      el("td", { class: "num" }, d.reference_count == null ? el("span", { class: "na", title: "No bibliography found in this document" }, "N/A")
+        : el("span", { class: "ref-count", onmouseenter: (e) => showRefs(d, e.currentTarget), onmouseleave: hideRefsSoon },
+            String(d.reference_count), d.references_in_corpus ? el("span", { class: "in", title: "of them in corpus/" }, `(${d.references_in_corpus} here)`) : null)),
+      el("td", { class: "num" }, d.cited_by == null ? el("span", { class: "na", title: "Not found on Crossref" }, "N/A") : d.cited_by.toLocaleString()),
       el("td", { class: "actions" }, d.status === "removed"
         ? el("button", { class: "small danger", title: "Permanently delete this document's record, passages and OCR cache", onclick: () => forget(d) }, "Forget")
         : el("span", {},
@@ -672,6 +717,37 @@ async function loadDocuments() {
             " ",
             el("button", { class: "small", title: "Rename the file (no reindexing)", onclick: () => startRename(d, nameCell) }, "Rename"))));
   }));
+}
+
+// Hover list of a document's references (fetched on first hover).
+const refCache = new Map();
+let refHideTimer = null;
+const refPop = $("#ref-pop");
+refPop.addEventListener("mouseenter", () => clearTimeout(refHideTimer));
+refPop.addEventListener("mouseleave", hideRefsSoon);
+function hideRefsSoon() {
+  clearTimeout(refHideTimer);
+  refHideTimer = setTimeout(() => (refPop.hidden = true), 250);
+}
+async function showRefs(d, anchor) {
+  clearTimeout(refHideTimer);
+  const r = anchor.getBoundingClientRect();
+  refPop.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 120)}px`;
+  refPop.style.left = `${Math.max(12, Math.min(r.right - 560, window.innerWidth - 572))}px`;
+  refPop.replaceChildren(el("div", { class: "muted" }, "Loading references…"));
+  refPop.hidden = false;
+  let refs = refCache.get(d.id);
+  if (!refs) {
+    refs = (await api(`/api/documents/${d.id}/references`)).references;
+    refCache.set(d.id, refs);
+  }
+  refPop.replaceChildren(
+    el("div", {}, el("strong", {}, `${refs.length} references in ${d.label}`), d.references_in_corpus ? el("span", { class: "muted" }, ` · ${d.references_in_corpus} in corpus/`) : null),
+    el("ol", {}, refs.map((x) => el("li", { value: x.number ?? undefined },
+      el("span", {}, x.label), x.title ? el("span", { class: "t" }, ` — ${x.title}`) : el("span", { class: "t" }, ` — ${x.raw.slice(0, 160)}${x.raw.length > 160 ? "…" : ""}`),
+      x.in_corpus ? el("span", { class: "tag corpus", title: x.in_corpus.path }, "✓ in corpus")
+        : x.status === "stub" ? el("span", { class: "tag stub", title: "Not on Crossref: built from the citation only" }, "citation only")
+        : x.status === "pending" ? el("span", { class: "tag stub" }, "looking up…") : null))));
 }
 
 /// Inline rename: Enter saves, Escape cancels. Only the name changes: the extension is shown

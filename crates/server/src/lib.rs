@@ -208,6 +208,18 @@ impl AppState {
                     Err(e) => serde_json::json!({ "errors": [format!("{e:#}")] }),
                 };
                 state.sync.lock().expect("sync state").metadata = Some(meta);
+                // References from bibliographies: Crossref enrichment, then corpus links.
+                let _ = localrag_core::references::backfill_cited_by(&conn, client);
+                set_phase("references");
+                let refs = localrag_core::references::enrich_pending(&conn, client, &mut |done, total| {
+                    let mut s = state.sync.lock().expect("sync state");
+                    if s.root.as_ref() == Some(&root) {
+                        s.current = Some(format!("{done} of {total} references"));
+                    }
+                });
+                if refs.is_err() {
+                    localrag_core::references::link(&conn)?;
+                }
                 // OCR runs on its own only when the workspace asks for it (ocr = "auto").
                 if ws.config.ocr == localrag_core::config::OcrMode::Auto {
                     let waiting: Vec<i64> = index::needing_ocr(&conn)?.into_iter().map(|d| d.0).collect();

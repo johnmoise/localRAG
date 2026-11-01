@@ -70,6 +70,15 @@ pub struct Citation {
     pub support: Option<Support>,
 }
 
+/// A reference the model suggested adding. It is always one of the bibliography entries the
+/// model was shown (validated by number), never a work the model named itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestedReference {
+    #[serde(flatten)]
+    pub reference: crate::references::MissingReferenceOwned,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Support {
@@ -90,7 +99,10 @@ pub struct Answer {
     pub invalid_markers: Vec<String>,
     pub sources: Vec<ChunkRef>,
     pub unsupported_sentences: Vec<String>,
+    /// Topics or keywords to look for (model suggestions, unverified).
     pub suggestions: Vec<String>,
+    /// Works the corpus cites but doesn't contain, chosen by the model from that list only.
+    pub suggested_references: Vec<SuggestedReference>,
     pub warnings: Vec<ContextWarning>,
     pub model: String,
     pub thinking: Option<String>,
@@ -176,6 +188,7 @@ impl RagEngine<'_> {
             sources: Vec::new(),
             unsupported_sentences: Vec::new(),
             suggestions: Vec::new(),
+            suggested_references: Vec::new(),
             warnings: Vec::new(),
             model: model.to_string(),
             thinking: None,
@@ -197,7 +210,7 @@ impl RagEngine<'_> {
             answer.text = NOT_FOUND_TEXT.to_string();
             answer.sources = hits.iter().take(3).map(|h| h.chunk.clone()).collect();
             on(Event::Sources(&answer.sources));
-            answer.suggestions = self.suggestions(model, num_ctx, question, &answer.sources)?;
+            (answer.suggestions, answer.suggested_references) = self.suggestions(model, num_ctx, question, &answer.sources)?;
             return Ok(answer);
         }
 
@@ -293,7 +306,7 @@ impl RagEngine<'_> {
         answer.text = resp.content.trim().to_string();
 
         if answer.text.starts_with("INSUFFICIENT") {
-            answer.suggestions = self.suggestions(model, num_ctx, question, &answer.sources[..answer.sources.len().min(3)])?;
+            (answer.suggestions, answer.suggested_references) = self.suggestions(model, num_ctx, question, &answer.sources[..answer.sources.len().min(3)])?;
             return Ok(answer);
         }
         let markers = citations::parse_markers(&answer.text);
@@ -449,26 +462,72 @@ impl RagEngine<'_> {
         Ok(if q.is_empty() { question.to_string() } else { q.to_string() })
     }
 
-    fn suggestions(&self, model: &str, num_ctx: u32, question: &str, closest: &[ChunkRef]) -> anyhow::Result<Vec<String>> {
+    /// What to add to the collection. With relevant works that the corpus cites but doesn't
+    /// contain, the model picks from that numbered list (picks outside it are dropped);
+    /// otherwise it only suggests topics.
+    fn suggestions(&self, model: &str, num_ctx: u32, question: &str, closest: &[ChunkRef]) -> anyhow::Result<(Vec<String>, Vec<SuggestedReference>)> {
+        let candidates = crate::references::missing_for_question(self.conn, question, 15)?;
+        if candidates.is_empty() {
+            let req = ChatRequest {
+                model: model.to_string(),
+                messages: vec![Message::system(prompts::SUGGEST_SYSTEM), Message::user(prompts::suggest_request(question, closest))],
+                num_ctx,
+                temperature: 0.3,
+                think: false,
+                num_predict: Some(300),
+                format: None,
+            };
+            return Ok((bullets(&self.llm.chat(&req, &mut |_| {})?.content), Vec::new()));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "references": { "type": "array", "items": { "type": "object",
+                    "properties": { "id": { "type": "string" }, "reason": { "type": "string" } }, "required": ["id", "reason"] } },
+                "topics": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["references", "topics"]
+        });
         let req = ChatRequest {
             model: model.to_string(),
-            messages: vec![Message::system(prompts::SUGGEST_SYSTEM), Message::user(prompts::suggest_request(question, closest))],
+            messages: vec![Message::system(prompts::SUGGEST_REFS_SYSTEM), Message::user(prompts::suggest_refs_request(question, &candidates))],
             num_ctx,
-            temperature: 0.3,
+            temperature: 0.2,
             think: false,
-            num_predict: Some(300),
-            format: None,
+            num_predict: Some(500),
+            format: Some(schema),
         };
-        let resp = self.llm.chat(&req, &mut |_| {})?;
-        Ok(resp
-            .content
-            .lines()
-            .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim())
-            .map(|l| l.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches(['.', ')']).trim())
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect())
+        let reply = self.llm.chat(&req, &mut |_| {})?.content;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(reply.trim()) else {
+            return Ok((bullets(&reply), Vec::new()));
+        };
+        let topics = v["topics"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect();
+        let mut picked: Vec<SuggestedReference> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for r in v["references"].as_array().into_iter().flatten() {
+            // "R3" must name an entry of the list the model was shown.
+            let Some(i) = r["id"].as_str().and_then(|id| id.trim().trim_start_matches(['R', 'r']).parse::<usize>().ok()).filter(|i| (1..=candidates.len()).contains(i)) else {
+                continue;
+            };
+            if !seen.insert(i) || picked.len() == 3 {
+                continue;
+            }
+            picked.push(SuggestedReference {
+                reference: candidates[i - 1].clone(),
+                reason: r["reason"].as_str().unwrap_or_default().trim().to_string(),
+            });
+        }
+        Ok((topics, picked))
     }
+}
+
+fn bullets(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim())
+        .map(|l| l.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches(['.', ')']).trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The sentence a marker at byte `pos` supports: the sentence the marker sits in, or the one

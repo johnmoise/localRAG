@@ -34,6 +34,9 @@ pub struct Work {
     pub page: Option<String>,
     #[serde(rename = "type")]
     pub kind: Option<String>,
+    /// How many works cite this one (Crossref's `is-referenced-by-count`).
+    #[serde(rename = "is-referenced-by-count", default)]
+    pub cited_by: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +57,7 @@ impl Work {
             "container-title": self.container,
             "page": self.page,
             "type": self.kind,
+            "is-referenced-by-count": self.cited_by,
         });
         if let Some(y) = self.year {
             v["issued"] = serde_json::json!({ "date-parts": [[y]] });
@@ -85,6 +89,7 @@ impl Work {
             container: first("container-title"),
             page: m["page"].as_str().map(str::to_string),
             kind: m["type"].as_str().map(str::to_string),
+            cited_by: m["is-referenced-by-count"].as_i64(),
         })
     }
 }

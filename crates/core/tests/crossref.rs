@@ -62,7 +62,7 @@ fn mock(behaviour: fn(&str, usize) -> Reply) -> (String, Arc<Mutex<Vec<Seen>>>) 
 fn work_json(doi: &str, title: &str) -> String {
     serde_json::json!({ "message": {
         "DOI": doi, "title": [title], "author": [{ "family": "Parry", "given": "Carla" }],
-        "issued": { "date-parts": [[2011, 10]] }, "container-title": ["Biomarkers &amp; Prevention"], "page": "1996-2005", "type": "journal-article"
+        "issued": { "date-parts": [[2011, 10]] }, "container-title": ["Biomarkers &amp; Prevention"], "page": "1996-2005", "type": "journal-article", "is-referenced-by-count": 42
     }})
     .to_string()
 }
@@ -137,4 +137,36 @@ fn rate_limited_responses_are_retried_after_the_server_says() {
     assert!(c.work("10.5555/retry", false).unwrap().is_some());
     assert_eq!(seen.lock().unwrap().len(), 2);
     assert!(started.elapsed() >= Duration::from_secs(1), "waited Retry-After");
+}
+
+#[test]
+fn references_are_enriched_by_doi_or_citation_search_else_kept_as_stubs() {
+    let (base, _seen) = mock(|target, _| {
+        if target.starts_with("/works/10.1000%2Fknown") {
+            (200, vec![], work_json("10.1000/known", "A Known Work"))
+        } else if target.contains("query.bibliographic=Parry") {
+            (200, vec![], serde_json::json!({ "message": { "items": [serde_json::from_str::<serde_json::Value>(&work_json("10.1158/x", "Cancer Survivors: A Booming Population")).unwrap()["message"]] } }).to_string())
+        } else {
+            (200, vec![], serde_json::json!({ "message": { "items": [] } }).to_string())
+        }
+    });
+    let (c, _cache) = client(&base);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = localrag_core::db::open(&dir.path().join("index.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO documents (id, path, size, mtime_ns, sha256, status, kind, parser_version, chunker_version) VALUES (1, 'a.pdf', 1, 1, 'x', 'indexed', 'pdf', 1, 2);
+         INSERT INTO doc_references (doc_id, ord, raw, doi) VALUES
+           (1, 0, 'Someone A. A known work. J. 2011. doi:10.1000/known', '10.1000/known'),
+           (1, 1, 'Parry C, Kent EE. Cancer survivors: a booming population. Cancer Epidemiol Biomarkers Prev. 2011;20:1996–2005.', NULL),
+           (1, 2, 'Nobody Z. An obscure report nobody indexed. Local Press. 1987.', NULL);",
+    ).unwrap();
+    let r = localrag_core::references::enrich_pending(&conn, &c, &mut |_, _| {}).unwrap();
+    assert_eq!((r.matched, r.stubs), (2, 1));
+    let rows: Vec<(String, Option<String>, Option<i64>)> = conn
+        .prepare("SELECT status, doi, cited_by FROM doc_references ORDER BY ord").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(rows[0].0, "matched");
+    assert_eq!((rows[1].0.as_str(), rows[1].1.as_deref()), ("matched", Some("10.1158/x")));
+    assert_eq!(rows[1].2, Some(42), "Crossref's is-referenced-by-count");
+    assert_eq!(rows[2].0, "stub");
 }

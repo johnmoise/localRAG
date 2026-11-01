@@ -288,7 +288,7 @@ fn lookup_metadata(ws: &Workspace, conn: &rusqlite::Connection, refresh: bool) -
     let pending: i64 = conn.query_row(
         "SELECT count(*) FROM documents WHERE metadata_status = 'pending' AND status IN ('indexed', 'needs_ocr')", [], |r| r.get(0))?;
     if pending == 0 {
-        return Ok(());
+        return lookup_references(conn, client);
     }
     let pool = match client.pool() {
         metadata::crossref::Pool::Polite => "polite pool",
@@ -300,6 +300,28 @@ fn lookup_metadata(ws: &Workspace, conn: &rusqlite::Connection, refresh: bool) -
         println!("{mark} {}  ({})", e.path, e.detail);
     })?;
     println!("{} matched, {} need confirming (Documents tab), {} without a match", r.matched, r.proposed, r.unmatched);
+    for e in &r.errors {
+        eprintln!("warning: {e} (will retry next time)");
+    }
+    lookup_references(conn, client)
+}
+
+fn lookup_references(conn: &rusqlite::Connection, client: &metadata::crossref::Crossref) -> anyhow::Result<()> {
+    let _ = localrag_core::references::backfill_cited_by(conn, client);
+    let pending: i64 = conn.query_row("SELECT count(*) FROM doc_references WHERE status = 'pending'", [], |r| r.get(0))?;
+    if pending == 0 {
+        return Ok(());
+    }
+    println!("Looking up {pending} bibliography reference(s) on Crossref…");
+    let mut last = usize::MAX;
+    let r = localrag_core::references::enrich_pending(conn, client, &mut |done, total| {
+        if done / 10 != last {
+            last = done / 10;
+            print!("\r  {done} of {total}");
+            let _ = std::io::stdout().flush();
+        }
+    })?;
+    println!("\r  {} matched on Crossref, {} kept as stubs from the citation text", r.matched, r.stubs);
     for e in &r.errors {
         eprintln!("warning: {e} (will retry next time)");
     }

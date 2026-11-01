@@ -80,7 +80,15 @@
       </div>
       <ul id="upload-results" class="upload-results"></ul>
       <table class="library">
-        <thead><tr><th>Document</th><th>Citation</th><th>Status</th><th>Chunks</th><th>Pages</th><th></th></tr></thead>
+        <thead><tr>
+          <th>Document</th><th>Citation</th>
+          <th class="sortable" data-sort="status">Status</th>
+          <th class="sortable num" data-sort="chunks">Chunks</th>
+          <th class="sortable num" data-sort="pages">Pages</th>
+          <th class="sortable num" data-sort="references" title="Entries in the document's bibliography (hover a count for the list)">References</th>
+          <th class="sortable num" data-sort="cited_by" title="How many works cite this one, according to Crossref">Cited-By</th>
+          <th></th>
+        </tr></thead>
         <tbody id="library-rows"></tbody>
       </table>
     </section>
@@ -187,6 +195,8 @@
       </div>
     </div>
   </div>
+
+  <div id="ref-pop" class="ref-pop" hidden></div>
 
   <div id="viewer" class="viewer" hidden>
     <div class="viewer-bar">

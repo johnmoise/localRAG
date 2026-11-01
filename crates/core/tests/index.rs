@@ -440,7 +440,7 @@ fn metadata_labels_get_suffixes_and_page_ranges_become_printed_pages() {
     let id = |p: &str| index::find_document(&f.conn, p).unwrap().unwrap();
     let work = |title: &str, page: Option<&str>| Work {
         doi: format!("10.1/{title}"), title: Some(title.into()), year: Some(2021), container: None, kind: None,
-        page: page.map(str::to_string), author: vec![Author { family: Some("Smith".into()), given: Some("A".into()), literal: None }],
+        page: page.map(str::to_string), cited_by: None, author: vec![Author { family: Some("Smith".into()), given: Some("A".into()), literal: None }],
     };
     metadata::apply_match(&f.conn, id("a.txt"), &work("Alpha study", None), "crossref_doi").unwrap();
     metadata::apply_match(&f.conn, id("b.txt"), &work("Beta study", None), "crossref_doi").unwrap();
@@ -463,4 +463,41 @@ fn metadata_labels_get_suffixes_and_page_ranges_become_printed_pages() {
     assert_eq!(label("a.txt"), "Jones 1999");
     let src: String = f.conn.query_row("SELECT metadata_source FROM documents WHERE path = 'a.txt'", [], |r| r.get(0)).unwrap();
     assert_eq!(src, "manual");
+
+    // Reprocessing a file (e.g. after an edit) keeps its Crossref metadata.
+    std::fs::write(f.corpus().join("b.txt"), paragraphs(3, "b edited")).unwrap();
+    set_mtime(&f.corpus().join("b.txt"), 60);
+    f.sync(&FakeEmbedder::new("m", 8));
+    let (src, lbl): (String, String) = f.conn.query_row("SELECT metadata_source, cite_label FROM documents WHERE path = 'b.txt'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((src.as_str(), lbl.as_str()), ("crossref_doi", "Smith 2021"), "Crossref data survives reprocessing");
+}
+
+#[test]
+fn bibliographies_are_split_off_counted_and_linked_to_the_corpus() {
+    let mut f = Fixture::new();
+    let body = paragraphs(6, "synchronous cancers in registries");
+    f.write("baicry.md", format!(
+        "---\ntitle: What is the most appropriate period to define synchronous cancers\nauthor: Baicry, F.\nyear: 2021\n---\n# Study\n{body}\n# References\n\
+         1. Parry C, Kent EE, Mariotto AB. Cancer survivors: a booming population of zebrafinches. Cancer Epidemiol Biomarkers Prev. 2011;20(10):1996–2005.\n\
+         2. Utada M, Ohno Y. Incidence of multiple primary cancers and interval between first and second primary cancers. Cancer Sci. 2014;105(7):890–6.\n\
+         3. Gass B, Marrer E. Use of a case-mix approach to study the trends in the incidence of second primary cancers. Ann Epidemiol. 2018;28(5):322–7.\n"));
+    f.write("parry.md", format!("---\ntitle: Cancer survivors: a booming population of zebrafinches\nauthor: Parry, C.\nyear: 2011\n---\n# Survivors\n{}", paragraphs(3, "survivors")));
+    f.write("plain.txt", paragraphs(2, "no bibliography here"));
+    f.sync(&FakeEmbedder::new("m", 8));
+
+    let id = |p: &str| index::find_document(&f.conn, p).unwrap().unwrap();
+    let count = |p: &str| -> Option<i64> { f.conn.query_row("SELECT reference_count FROM documents WHERE path = ?1", [p], |r| r.get(0)).unwrap() };
+    assert_eq!(count("baicry.md"), Some(3));
+    assert_eq!(count("plain.txt"), None, "no bibliography → N/A");
+    assert_eq!(f.count("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'zebrafinches'"), 0, "the bibliography entry isn't chunked (and front matter never is)");
+    assert_eq!(f.count("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'utada'"), 0, "bibliography entries aren't chunked");
+
+    let refs = localrag_core::references::for_document(&f.conn, id("baicry.md")).unwrap();
+    assert_eq!(refs[0].in_corpus.as_ref().map(|v| v["id"].as_i64().unwrap()), Some(id("parry.md")), "reference 1 is a corpus document");
+    assert!(refs[1].in_corpus.is_none());
+    assert_eq!(refs[1].label, "Utada 2014");
+
+    let missing = localrag_core::references::missing_for_question(&f.conn, "What is the interval between first and second primary cancers?", 10).unwrap();
+    assert_eq!(missing[0].label, "Utada 2014", "ranked by overlap with the question");
+    assert!(missing.iter().all(|m| !m.raw.contains("zebrafinches")), "works already in corpus/ aren't suggested");
 }

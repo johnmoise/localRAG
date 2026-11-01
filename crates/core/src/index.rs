@@ -239,12 +239,22 @@ pub fn sync(
         {
             crate::ocr::apply_to(doc, &cache);
         }
+        // The bibliography is stored as references, not chunked or embedded.
+        let bib = parsed.as_mut().ok().and_then(|doc| {
+            let bib = crate::bibliography::detect(doc);
+            if let Some(b) = &bib {
+                crate::bibliography::remove_from_body(doc, b);
+            }
+            bib
+        });
         let (status, chunks) = match parsed {
             Ok(doc) => {
                 let chunks = chunk::chunk(&doc, &ws.config.chunking);
                 let vectors = vectors_for(conn, embedder, &chunks, &mut report)?;
                 let status = if doc.scanned_pages.is_empty() { Status::Indexed } else { Status::NeedsOcr };
                 write_document(conn, file, row.map(|r| r.id), &sha, status, None, Some(&doc), &chunks, &vectors)?;
+                let doc_id = row.map(|r| r.id).map_or_else(|| conn.query_row("SELECT id FROM documents WHERE path = ?1", [&file.rel_path], |r| r.get(0)), Ok)?;
+                crate::references::store(conn, doc_id, bib.as_ref())?;
                 (status, chunks.len())
             }
             Err(FileError(msg)) => {
@@ -265,6 +275,8 @@ pub fn sync(
     }
 
     crate::metadata::assign_labels(conn)?;
+    // A document added or removed can be (or stop being) one that others cite.
+    crate::references::link(conn)?;
     db::set_meta(conn, "chunker_version", &CHUNKER_VERSION.to_string())?;
     db::set_meta(conn, "last_sync", &db::now_rfc3339())?;
     report.millis = started.elapsed().as_millis();
@@ -390,9 +402,11 @@ fn write_document(
                 "UPDATE documents SET path = ?2, size = ?3, mtime_ns = ?4, sha256 = ?5, status = ?6, kind = ?7,
                    parser_version = ?8, chunker_version = ?9, page_count = ?10, scanned_pages = ?11, error = ?12,
                    indexed_at = ?13, removed_at = NULL,
-                   csl_json = CASE WHEN metadata_source = 'manual' THEN csl_json ELSE ?14 END,
-                   doi = COALESCE(?15, doi),
-                   metadata_source = CASE WHEN metadata_source = 'manual' THEN metadata_source ELSE ?16 END
+                   -- Crossref matches and manual edits survive reprocessing; only metadata that
+                   -- came from the file itself is refreshed from the new parse.
+                   csl_json = CASE WHEN metadata_source IN ('manual', 'crossref_doi', 'crossref_query') THEN csl_json ELSE ?14 END,
+                   doi = CASE WHEN metadata_source IN ('manual', 'crossref_doi', 'crossref_query') THEN doi ELSE COALESCE(?15, doi) END,
+                   metadata_source = CASE WHEN metadata_source IN ('manual', 'crossref_doi', 'crossref_query') THEN metadata_source ELSE ?16 END
                  WHERE id = ?1",
                 params![id, file.rel_path, file.size as i64, file.mtime_ns, sha, status.as_str(), file.kind.as_str(),
                     file.kind.parser_version(), CHUNKER_VERSION, page_count, scanned, error, db::now_rfc3339(),

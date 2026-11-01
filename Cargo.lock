@@ -1391,6 +1391,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-vision",
  "pdfium-render",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

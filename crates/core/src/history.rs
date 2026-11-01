@@ -231,6 +231,7 @@ pub fn record(conn: &Connection, session: i64, question: &str, answer: &Answer) 
             now,
             serde_json::json!({
                 "suggestions": answer.suggestions,
+                "suggested_references": answer.suggested_references,
                 "unsupported_sentences": answer.unsupported_sentences,
                 "invalid_markers": answer.invalid_markers,
                 "not_found": answer.not_found,

@@ -182,7 +182,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .results .snippet { color: var(--muted); font-size: 14px; }
 
 /* Documents */
-#tab-library { flex-direction: column; padding: 20px 24px; overflow-y: auto; }
+#tab-documents { flex-direction: column; padding: 20px 24px; overflow-y: auto; }
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
 table.library { border-collapse: collapse; width: 100%; font-size: 14px; }
 .library th { text-align: left; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); padding: 6px 8px; }
@@ -254,3 +254,23 @@ table.library { border-collapse: collapse; width: 100%; font-size: 14px; }
 .search-filters input { width: 80px; padding: 4px 6px; }
 .check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--text); margin: 8px 0; }
 .check input { margin-top: 3px; }
+
+/* Documents: sorting, references */
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--text); }
+th.sortable[data-dir="asc"]::after { content: " ▲"; font-size: 10px; }
+th.sortable[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
+td.num, th.num { text-align: right; }
+.na { color: var(--muted); font-size: 12px; }
+.ref-count { cursor: help; border-bottom: 1px dotted var(--muted); }
+.ref-count .in { color: var(--verified); font-size: 11px; margin-left: 3px; }
+.ref-pop { position: fixed; z-index: 35; width: min(560px, calc(100vw - 24px)); max-height: 60vh; overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0,0,0,0.2); padding: 10px 12px; font-size: 13px; }
+.ref-pop[hidden] { display: none; }
+.ref-pop ol { margin: 6px 0 0; padding-left: 26px; }
+.ref-pop li { margin: 4px 0; }
+.ref-pop .t { color: var(--muted); }
+.ref-pop .tag { font-size: 11px; font-weight: 600; margin-left: 4px; }
+.ref-pop .tag.corpus { color: var(--verified); }
+.ref-pop .tag.stub { color: var(--muted); }
+.sugg-refs li { margin: 6px 0; }
+.sugg-refs .why { color: var(--muted); font-size: 13px; }

@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -77,6 +77,9 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 4 {
             conn.execute_batch(SCHEMA_V4).context("migrating to schema v4")?;
+        }
+        if version < 5 {
+            conn.execute_batch(SCHEMA_V5).context("migrating to schema v5")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -161,6 +164,30 @@ ALTER TABLE chunks ADD COLUMN page_label_offset_applied INTEGER NOT NULL DEFAULT
 /// invalid citations, whether it was "not found", and the closest material.
 const SCHEMA_V4: &str = "
 ALTER TABLE messages ADD COLUMN extra_json TEXT;
+";
+
+/// Bibliographies (§5): each document's references, enriched from Crossref or kept as stubs,
+/// and linked to the corpus document they refer to when it's in `corpus/`. Never chunked or
+/// embedded. `reference_count` is NULL when no bibliography was found.
+const SCHEMA_V5: &str = "
+CREATE TABLE doc_references (
+  id INTEGER PRIMARY KEY,
+  doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  ord INTEGER NOT NULL,
+  number INTEGER,
+  raw TEXT NOT NULL,
+  doi TEXT,
+  year INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending|matched|stub
+  csl_json TEXT,
+  title TEXT,
+  cited_by INTEGER,
+  in_corpus_doc_id INTEGER,                 -- not a foreign key: recomputed by link_references
+  checked_at TEXT
+);
+CREATE INDEX doc_references_doc ON doc_references(doc_id, ord);
+ALTER TABLE documents ADD COLUMN reference_count INTEGER;
+ALTER TABLE documents ADD COLUMN cited_by INTEGER;
 ";
 
 /// (Re)creates `chunks_vec` for `dim` dimensions together with the trigger that keeps it

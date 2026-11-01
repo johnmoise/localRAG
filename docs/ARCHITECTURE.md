@@ -272,6 +272,57 @@ Metadata comes from Crossref's REST API (`api.crossref.org`), which needs no key
   `localrag config set crossref_email …`.
 - Stored in the global config and sent only to Crossref.
 
+### 7.1 Bibliographies and references
+
+Each document's bibliography is split from its body when it's indexed (`bibliography.rs`).
+The body is chunked and embedded as usual. The bibliography isn't chunked or embedded, so
+reference entries never show up in search or answers. Its entries go to `doc_references`.
+
+**Detection**
+- **Start:** a heading (References, Bibliography, Literature cited, Works cited, …, with an
+  optional `#` or section number) in the last 65% of the document. The first such heading
+  followed by an entry-like line wins, else the last one.
+- **End:** the next table, figure, appendix, supplementary-material, disclaimer or
+  publisher's-note heading, or a Markdown heading; otherwise the end of the document.
+- **Entries:** numbered lists (`1.`, `[1]`) are split on consecutive numbers, tolerating one
+  missing number. Unnumbered lists are split where a line starts like an author
+  (`Surname, I.` / `Surname I`). Page furniture (`Downloaded from …`, `[CrossRef]`,
+  `[PubMed]`) is removed.
+- Removing the region keeps page text intact, so character offsets, page labels and
+  highlights still line up. Bumping `CHUNKER_VERSION` (now 2) re-chunks every document when
+  the rules change; unchanged chunks reuse their embeddings.
+
+**Enrichment** (after document metadata, same client and limits)
+1. **DOI in the entry** → `GET /works/{doi}`.
+2. **Otherwise** → `query.bibliographic=<entry text>&rows=3`. A candidate is accepted at score
+   ≥ 0.8: 0.75 × the share of its title words found in the entry, + 0.15 for a matching year,
+   + 0.1 for a matching first-author surname.
+3. **Otherwise** → a **stub**: guessed title (the segment after the authors) and year from the
+   entry text, marked *citation only*.
+
+**Linking to the corpus** (after every sync and enrichment): a reference is *in corpus* when
+its DOI matches a document's, or its title matches with similarity ≥ 0.85 and the same year,
+or a corpus title of 4+ words appears word for word in the entry text.
+
+**Documents tab**
+- **References:** the entry count ("N/A" when no bibliography was found), with "(N here)"
+  when some are in the corpus. Hovering shows the list: label, title, *in corpus* or
+  *citation only*.
+- **Cited-By:** Crossref's `is-referenced-by-count` ("N/A" without a Crossref record).
+- Status, Chunks, Pages, References and Cited-By sort on click (again to reverse); N/A
+  always sorts last.
+
+**Suggesting additions.** When an answer is "I don't know" (or has gaps), the references
+*not* in the corpus are ranked lexically against the question, deduplicated across documents,
+and up to 15 are given to the model as `R1`…`Rn`, each with how many corpus documents cite it.
+The model answers with a JSON schema (`{references: [{id, reason}], topics: [...]}`).
+- Only ids from that list are kept (at most 3, no duplicates), and the shown reference is
+  taken from the database, never from the model's text. So a suggested work always exists in
+  some corpus document's bibliography.
+- Free-text topics are still allowed and are labelled as unverified.
+- With no candidates, or if the JSON doesn't parse, it falls back to the earlier bullet
+  suggestions.
+
 ## 8. Storage schema (sketch)
 
 ```sql
@@ -301,6 +352,17 @@ CREATE TABLE chunks (
   section TEXT, char_start INTEGER, char_end INTEGER, n_tokens INTEGER, ocr INTEGER
 );
 CREATE INDEX chunks_text_sha ON chunks(text_sha);
+
+-- v5: bibliography entries (documents also gains reference_count, NULL = no bibliography,
+-- and cited_by)
+CREATE TABLE doc_references (
+  id INTEGER PRIMARY KEY,
+  doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  ord INTEGER, number INTEGER, raw TEXT, doi TEXT, year INTEGER,
+  status TEXT DEFAULT 'pending',          -- pending|matched|stub
+  csl_json TEXT, title TEXT, cited_by INTEGER,
+  in_corpus_doc_id INTEGER, checked_at TEXT
+);
 
 CREATE VIRTUAL TABLE chunks_fts USING fts5(text, section, content='chunks', content_rowid='id');
 CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[1024]);    -- rowid = chunks.id
@@ -749,6 +811,7 @@ The server picks a free port and opens the browser on start.
 | `POST /api/search` | Retrieval only |
 | `POST /api/ask` | Budget check (`413` "Over token count by X"), then SSE: `sources` → `context_warning` → `thinking`/`token` → `answer` |
 | `GET /api/documents[/{id}]` | Documents tab listing and details |
+| `GET /api/documents/{id}/references` | Bibliography entries for the References hover |
 | `PATCH /api/documents/{id}` | Edit metadata; confirm/reject a proposed Crossref match |
 | `POST /api/documents/{id}/metadata/refresh` | Re-query Crossref |
 | `POST /api/documents/{id}/ocr` | Start OCR |
@@ -1137,7 +1200,23 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   - **Cross-file embedding batching:** measured and reverted (see above).
   - **Seen, for later:** reference-list chunks ("12. Conroy, T.; …") rank fairly high in
     search. Detecting References sections and down-weighting them would clean up results.
+    (Done below: they're now removed from the body.)
   - 67 tests pass.
+
+- **Done (2026-11-01): bibliographies and references** (§7.1)
+  - On the three test papers: 33 + 29 + 42 = 104 entries; **82 matched on Crossref**, 22
+    stubs (reports, books, conference abstracts). Baicry 2021's reference 1 links to Parry
+    2011 in the corpus. Chunks went from 75 to 62, and only the 6 chunks that had held
+    reference text were re-embedded.
+  - No reference passages in search results any more. Page recall@5 went from 92% to 88%:
+    "Who funded the study?" fell from rank 3 to 10 because its acknowledgments chunk had been
+    padded with reference text. Two other questions ranked better.
+  - **Bug fixed:** reindexing a document overwrote its Crossref metadata with the PDF's own
+    (so `metadata_source` went back to `pdf`). Manual and Crossref metadata now survive
+    reprocessing; regression test added.
+  - **Bug fixed:** the Documents tab lost its column layout after the Library → Documents
+    rename (a stale `#tab-library` selector).
+  - 77 tests pass.
 
 **Phase 6: packaging** (§19)
 - Tauri app, bundled PDFium, first-run checks, ad-hoc signing, `.dmg` + README.
@@ -1150,7 +1229,7 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   `organize_brain` restructures without changing any fact line; `check` is clean.
 
 **Later**
-- Grounded "add this paper" suggestions from reference lists; bibliography export.
+- Bibliography export.
 - Vision-model OCR for hard pages; reranker.
 - An MCP server exposing `search` / `ask`.
 

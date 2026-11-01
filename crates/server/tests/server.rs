@@ -288,8 +288,16 @@ async fn uploads_are_indexed_by_one_watcher_sync() {
         let r = authed("POST", &format!("/api/documents/upload?name={name}")).body(Body::from("# Note\nSome text.\n")).unwrap();
         assert_eq!(send(&s, r).await.0, StatusCode::OK);
     }
-    // The watcher settles after 1.5 s of quiet, then syncs once for all three files.
-    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    // The watcher settles after 1.5 s of quiet, then syncs once for all three files. Wait for
+    // that sync (slow on a loaded machine), then long enough for any second one to show up.
+    for _ in 0..100 {
+        if s.sync.lock().unwrap().runs > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    settle().await;
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
     let after = settle().await;
     assert_eq!(after, before + 1, "three uploads → exactly one sync (no extra sync from the upload itself)");
     let ws = Workspace::open(dir.path()).unwrap();

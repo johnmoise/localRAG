@@ -156,6 +156,11 @@ fn tokens(s: &str) -> Vec<String> {
     s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2).map(str::to_string).collect()
 }
 
+/// Word-set similarity of two titles (Dice coefficient), 0–1.
+pub fn title_similarity(a: &str, b: &str) -> f32 {
+    dice(a, b)
+}
+
 /// Dice coefficient over word sets.
 fn dice(a: &str, b: &str) -> f32 {
     let (a, b): (std::collections::HashSet<String>, std::collections::HashSet<String>) = (tokens(a).into_iter().collect(), tokens(b).into_iter().collect());
@@ -228,6 +233,7 @@ pub fn apply_match(conn: &Connection, doc_id: i64, work: &Work, source: &str) ->
          WHERE id = ?1 AND metadata_source IS NOT 'manual'",
         params![doc_id, work.to_csl().to_string(), work.doi, source, db::now_rfc3339()],
     )?;
+    conn.execute("UPDATE documents SET cited_by = ?2 WHERE id = ?1 AND metadata_source IS NOT 'manual'", params![doc_id, work.cited_by])?;
     apply_page_offset(conn, doc_id)
 }
 

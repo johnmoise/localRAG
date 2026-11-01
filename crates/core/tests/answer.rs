@@ -248,7 +248,7 @@ fn search_filters_by_document_and_year() {
     let only = SearchOptions { filter: Filter { doc_ids: Some(vec![birds]), ..Filter::default() }, ..SearchOptions::default() };
     assert_eq!(docs(&retrieval::search(&f.conn, &WordEmbedder, q, &only).unwrap()), ["birds.txt".to_string()].into());
 
-    let work = Work { doi: "10.1/b".into(), title: Some("Terns".into()), year: Some(2015), author: vec![Author { family: Some("Avis".into()), given: None, literal: None }], container: None, page: None, kind: None };
+    let work = Work { doi: "10.1/b".into(), title: Some("Terns".into()), year: Some(2015), author: vec![Author { family: Some("Avis".into()), given: None, literal: None }], container: None, page: None, kind: None, cited_by: None };
     metadata::apply_match(&f.conn, birds, &work, "crossref_doi").unwrap();
     let years = |from, to| SearchOptions { filter: Filter { year_from: from, year_to: to, ..Filter::default() }, ..SearchOptions::default() };
     assert_eq!(docs(&retrieval::search(&f.conn, &WordEmbedder, q, &years(Some(2010), Some(2020))).unwrap()), ["birds.txt".to_string()].into());
@@ -286,4 +286,40 @@ fn strict_mode_rejects_citations_whose_passage_does_not_support_the_claim() {
     assert!(!a.supported);
     let req = llm.requests.borrow().iter().find(|r| r.format.is_some()).cloned().expect("structured request");
     assert!(req.messages[1].content.contains("Claim: Attention is linear"));
+}
+
+#[test]
+fn suggested_references_come_only_from_the_bibliography_list() {
+    let f = Fixture::new();
+    // Give birds.txt a bibliography whose works aren't in the corpus.
+    let birds = index::find_document(&f.conn, "birds.txt").unwrap().unwrap();
+    f.conn.execute_batch(&format!(
+        "UPDATE documents SET reference_count = 2 WHERE id = {birds};
+         INSERT INTO doc_references (doc_id, ord, raw, title, year, status) VALUES
+           ({birds}, 0, 'Egevang C. Tracking of Arctic terns reveals longest animal migration. PNAS. 2010.', 'Tracking of Arctic terns reveals longest animal migration', 2010, 'stub'),
+           ({birds}, 1, 'Other A. Something unrelated about soil chemistry. Soil J. 2001.', 'Something unrelated about soil chemistry', 2001, 'stub');"
+    )).unwrap();
+    struct Picky;
+    impl Llm for Picky {
+        fn chat(&self, req: &ChatRequest, on: &mut dyn FnMut(Delta)) -> anyhow::Result<ChatResponse> {
+            let sys = &req.messages[0].content;
+            let content = if sys.contains("NOT in the collection") {
+                assert!(req.messages[1].content.contains("R1 Egevang 2010"), "{}", req.messages[1].content);
+                r#"{"references":[{"id":"R1","reason":"tracks tern migration"},{"id":"R7","reason":"made up"},{"id":"Smith 2020","reason":"invented"}],"topics":["arctic tern migration routes"]}"#.to_string()
+            } else {
+                "INSUFFICIENT: the sources don't cover migration distances.".to_string()
+            };
+            on(Delta::Content(&content));
+            Ok(ChatResponse { content, ..ChatResponse::default() })
+        }
+        fn model_info(&self, model: &str) -> anyhow::Result<ModelInfo> {
+            Ok(ModelInfo { name: model.into(), capabilities: vec!["completion".into()], ..ModelInfo::default() })
+        }
+    }
+    let a = f.engine(&Picky).ask("How far do Arctic terns migrate each year?", "m", 16_384, &[], &mut |_| {}).unwrap();
+    assert!(!a.supported);
+    assert_eq!(a.suggested_references.len(), 1, "R7 and an invented name are dropped");
+    assert_eq!(a.suggested_references[0].reference.label, "Egevang 2010");
+    assert_eq!(a.suggested_references[0].reference.cited_in, ["birds"]);
+    assert_eq!(a.suggestions, ["arctic tern migration routes"]);
 }
