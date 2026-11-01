@@ -96,3 +96,64 @@ pub fn support_request(items: &[(String, String)]) -> String {
     }
     s
 }
+
+// ---------------------------------------------------------------- second brain (§12)
+
+pub const PROBE_SYSTEM: &str = "Answer the question from your own knowledge only, in one to three sentences, with specific facts and numbers where you know them. If you don't know, say \"I don't know\".";
+
+pub const KNOWN_SYSTEM: &str = "You compare a claim with an answer someone gave without looking anything up. Reply same=true only if the answer states the same specific information as the claim (the same finding, and the same numbers where the claim has numbers). A vaguer, different, hedged or \"I don't know\" answer is same=false.";
+
+pub fn known_request(claim: &str, unaided: &str) -> String {
+    format!("Claim: {claim}\n\nAnswer given without sources: {unaided}")
+}
+
+pub const CONFLICT_SYSTEM: &str = "For each numbered statement, say whether it contradicts the new statement: both cannot be true at the same time about the same thing. Statements about different populations, methods or conditions do not contradict. Items are numbered from 0.";
+
+pub fn conflict_request(claim: &str, others: &[(String, String)]) -> String {
+    let mut s = format!("New statement: {claim}\n\nExisting statements:\n");
+    for (i, (_, c)) in others.iter().enumerate() {
+        s.push_str(&format!("{i}. {c}\n"));
+    }
+    s
+}
+
+pub const ORGANIZE_SYSTEM: &str = "You organize your own research notes (your \"brain\"). It holds verified facts, written as [FACT F-0012] lines, under Markdown headings, with [THOUGHT] lines: your notes on how facts relate (agreements, apparent contradictions and why, open questions).
+
+Rearrange it so related facts sit together:
+- Group facts under clear # / ## / ### headings; reorder facts within and between sections.
+- Add, revise or remove [THOUGHT] lines. Thoughts are interpretation: mention facts by ID (F-0012) and never restate a fact as if it were verified.
+- Keep the first line (# Brain · <model>) as it is.
+- Write each fact ONLY as [FACT <id>], exactly once each, every fact included. Never write a fact's text: the program fills it in.
+- Every line must be a heading, a [THOUGHT] line, a [FACT <id>] line or empty.
+
+Return JSON: {\"lines\": [ ...one string per line... ]}.";
+
+pub fn organize_request(layout: &str) -> String {
+    format!("Your brain now:\n\n{layout}")
+}
+
+pub const AGENT_SYSTEM: &str = "You are a careful research assistant working over a researcher's own document collection. You have tools:
+- read_brain(query): the verified facts you have learned before. Call it first.
+- ask_corpus(question): asks the collection one focused question and returns a cited answer. Each usable citation has an ID like [C3] with its source and exact quote.
+- propose_fact(claim, citations, reason): proposes a durable fact for your brain, supported by citation IDs from ask_corpus results. The researcher approves or rejects it later.
+
+How to work:
+1. read_brain with the question.
+2. Break what the brain doesn't cover into a few focused sub-questions and ask_corpus each (at most a handful).
+3. When an answer establishes something general and reusable for later questions (not trivia about one sentence), propose_fact with a one-sentence claim that the cited quotes directly support, and say why it is worth keeping.
+4. Finish with an answer to the original question, without calling tools. Support every claim with citations written as [C3] (from ask_corpus) or [F12] (from your brain). Never invent citations. If the collection can't answer, say so plainly.";
+
+pub fn agent_tools() -> serde_json::Value {
+    serde_json::json!([
+        { "type": "function", "function": { "name": "read_brain", "description": "Read your verified facts relevant to a query.",
+            "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } } },
+        { "type": "function", "function": { "name": "ask_corpus", "description": "Ask the document collection one focused question; returns a cited answer with citation IDs like C3.",
+            "parameters": { "type": "object", "properties": { "question": { "type": "string" } }, "required": ["question"] } } },
+        { "type": "function", "function": { "name": "propose_fact", "description": "Propose a durable, general fact for your brain, supported by citation IDs from ask_corpus.",
+            "parameters": { "type": "object", "properties": {
+                "claim": { "type": "string", "description": "One sentence, directly supported by the cited quotes." },
+                "citations": { "type": "array", "items": { "type": "string" }, "description": "Citation IDs such as C3." },
+                "reason": { "type": "string", "description": "Why this is worth remembering for later questions." } },
+              "required": ["claim", "citations", "reason"] } } }
+    ])
+}

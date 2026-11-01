@@ -89,8 +89,25 @@ enum Command {
         #[arg(long, short = 'C')]
         dir: Option<PathBuf>,
     },
-    /// Check that every citation in chat history still resolves to its source
+    /// Check that every citation in chat history, every brain and the Fact queue still
+    /// resolve (exits non-zero if anything is broken)
     Check,
+    /// Research a question with a reasoning model: it reads its brain, asks the corpus
+    /// sub-questions and proposes facts for its brain (approve them with `brain approve`)
+    Agent {
+        question: String,
+        /// Reasoning model (default: reasoning_model in the workspace config)
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Inspect and manage a reasoning model's second brain
+    Brain {
+        #[command(subcommand)]
+        action: BrainAction,
+        /// Reasoning model (default: reasoning_model in the workspace config)
+        #[arg(long, global = true)]
+        model: Option<String>,
+    },
     /// Measure retrieval recall and answer grounding against .localrag/eval.jsonl
     Eval {
         /// Only measure retrieval (no model calls)
@@ -136,6 +153,22 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum BrainAction {
+    /// Print the brain's facts and integrity problems
+    Show,
+    /// List proposed facts waiting for review
+    Queue,
+    /// Approve a proposed fact (optionally with an edited claim)
+    Approve { id: i64, #[arg(long)] claim: Option<String> },
+    /// Reject a proposed fact (it won't be proposed again)
+    Reject { id: i64 },
+    /// Let the model reorganize its brain (fact lines are never changed)
+    Organize,
+    /// Undo the last reorganization
+    Undo,
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Print all settings
     Get,
@@ -160,6 +193,11 @@ fn main() -> ExitCode {
         }
         Command::Serve { port, no_open, dir } => serve(port, no_open, dir),
         Command::Check => check(),
+        Command::Agent { question, model } => exclusive().and_then(|_g| agent_cmd(&question, model)),
+        Command::Brain { action, model } => match action {
+            BrainAction::Show | BrainAction::Queue => brain_cmd(action, model),
+            _ => exclusive().and_then(|_g| brain_cmd(action, model)),
+        },
         Command::Eval { retrieval_only, model } => exclusive().and_then(|_g| eval_cmd(retrieval_only, model)),
         Command::Doctor { ollama_host, embed_model, chat_model, num_ctx, pdfium, tokenizer, crossref_email, offline } => {
             let cfg = DoctorConfig {
@@ -617,7 +655,120 @@ fn check() -> anyhow::Result<()> {
     for (s, m, label, path) in &r.broken {
         println!("  BROKEN   session {s}, message {m}: [{label}] ({path})");
     }
-    anyhow::ensure!(r.ok(), "{} broken citation(s)", r.broken.len());
+    let (brains, queue) = localrag_core::brain::check_all(&ws, &conn)?;
+    let mut brain_problems = 0;
+    for b in &brains {
+        println!("Brain {}: {} usable fact(s), {} problem(s)", b.model, b.usable().len(), b.problems.len());
+        for p in &b.problems {
+            println!("  {:<16} {}", p.kind, p.message);
+        }
+        brain_problems += b.problems.len();
+    }
+    for q in &queue {
+        println!("  queue  {}: {}", q.model, q.message);
+    }
+    anyhow::ensure!(r.ok() && brain_problems == 0 && queue.is_empty(), "{} broken citation(s), {brain_problems} brain problem(s), {} queue problem(s)", r.broken.len(), queue.len());
+    Ok(())
+}
+
+fn reasoning_model(ws: &Workspace, model: Option<String>) -> anyhow::Result<String> {
+    model.or_else(|| ws.config.reasoning_model.clone()).context("name a reasoning model with --model, or set reasoning_model in .localrag/config.toml")
+}
+
+fn agent_cmd(question: &str, model: Option<String>) -> anyhow::Result<()> {
+    let mut ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+    let llm = Ollama::new(&ws.global.ollama_host)?;
+    let model = reasoning_model(&ws, model)?;
+    let info = localrag_core::llm::Llm::model_info(&llm, &model)?;
+    anyhow::ensure!(info.can("tools") && info.can("thinking"), "{model} isn't a reasoning model (it needs Ollama's tools and thinking capabilities)");
+    let corpus_model = ws.config.agent_corpus_model.clone().unwrap_or_else(|| model.clone());
+    let num_ctx = resolve_num_ctx(&mut ws, &llm, &model)?;
+    let corpus_num_ctx = resolve_num_ctx(&mut ws, &llm, &corpus_model)?;
+    let agent = localrag_core::agent::Agent { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm, model: &model, num_ctx, corpus_model: &corpus_model, corpus_num_ctx };
+    use localrag_core::agent::AgentEvent;
+    let r = agent.run(question, &mut |e| match e {
+        AgentEvent::ToolCall { name, arguments } => eprintln!("→ {name} {}", arguments),
+        AgentEvent::ToolResult { name, result } => eprintln!("  {name}: {}", result["summary"].as_str().unwrap_or("")),
+        AgentEvent::BrainUpdate(v) => eprintln!("  proposal: {}", v),
+        AgentEvent::Warning(w) => eprintln!("warning: {w}"),
+        _ => {}
+    })?;
+    println!("\n{}\n", r.text);
+    if !r.invalid_markers.is_empty() {
+        println!("Citations that don't resolve: {}", r.invalid_markers.join(", "));
+    }
+    let queued = r.proposals.iter().filter(|p| p["admission"]["outcome"] != "dropped").count();
+    if queued > 0 {
+        println!("{queued} fact(s) proposed: review them with `localrag brain queue --model {model}`.");
+    }
+    Ok(())
+}
+
+fn brain_cmd(action: BrainAction, model: Option<String>) -> anyhow::Result<()> {
+    use localrag_core::brain::{self, integrity::LineView, organize, queue};
+    let mut ws = Workspace::discover(&std::env::current_dir()?)?;
+    let conn = db::open(&ws.db_path())?;
+    let model = reasoning_model(&ws, model)?;
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+    let llm = Ollama::new(&ws.global.ollama_host)?;
+    let gate_ctx = |ws: &mut Workspace| -> anyhow::Result<(String, u32)> {
+        let judge = ws.config.agent_corpus_model.clone().unwrap_or_else(|| model.clone());
+        let n = resolve_num_ctx(ws, &llm, &judge)?;
+        Ok((judge, n))
+    };
+    match action {
+        BrainAction::Show => {
+            let (_, c) = brain::load_checked(&ws, &conn, &model)?;
+            for l in &c.lines {
+                match l {
+                    LineView::Heading { level, text } => println!("{} {text}", "#".repeat(*level)),
+                    LineView::Thought { text, .. } => println!("  (thought) {text}"),
+                    LineView::Fact(f) => println!("  {} [{}] {} ({})", f.id, f.status, f.claim, f.citations.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join("; ")),
+                    LineView::Invalid { raw, .. } => println!("  (invalid) {raw}"),
+                    LineView::Blank => {}
+                }
+            }
+            for p in &c.problems {
+                println!("problem: {}", p.message);
+            }
+        }
+        BrainAction::Queue => {
+            let items = queue::pending(&conn, &model)?;
+            if items.is_empty() {
+                println!("No proposed facts for {model}.");
+            }
+            for i in items {
+                let merge = i.target_fact_id.as_deref().map(|t| format!(" (adds support to {t})")).unwrap_or_default();
+                println!("{:>4}. {}{merge}\n      {}\n      why: {}", i.id, i.claim, i.citations.iter().map(|c| format!("{} \"{}\"", c.label, c.quote)).collect::<Vec<_>>().join("; "), i.reason.unwrap_or_default());
+            }
+        }
+        BrainAction::Approve { id, claim } => {
+            let (judge, n) = gate_ctx(&mut ws)?;
+            let gate = queue::Gate { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm, model: &model, judge_model: &judge, num_ctx: n };
+            println!("Approved as {}.", gate.approve(id, claim.as_deref())?);
+        }
+        BrainAction::Reject { id } => {
+            let (judge, n) = gate_ctx(&mut ws)?;
+            queue::Gate { ws: &ws, conn: &conn, embedder: &embedder, llm: &llm, model: &model, judge_model: &judge, num_ctx: n }.reject(id)?;
+            println!("Rejected.");
+        }
+        BrainAction::Organize => {
+            let n = resolve_num_ctx(&mut ws, &llm, &model)?;
+            let (_, c) = brain::load_checked(&ws, &conn, &model)?;
+            let r = organize::organize(&ws, &llm, &model, n, &c)?;
+            match (r.changed, r.errors.is_empty()) {
+                (true, _) => println!("Reorganized (undo with `localrag brain undo`)."),
+                (false, true) => println!("No changes."),
+                (false, false) => println!("Not saved; the layout failed validation twice:\n- {}", r.errors.join("\n- ")),
+            }
+        }
+        BrainAction::Undo => {
+            localrag_core::brain::file::undo(&ws, &model)?;
+            println!("Restored the previous version.");
+        }
+    }
     Ok(())
 }
 

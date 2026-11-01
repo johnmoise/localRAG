@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -83,6 +83,9 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 6 {
             conn.execute_batch(SCHEMA_V6).context("migrating to schema v6")?;
+        }
+        if version < 7 {
+            conn.execute_batch(SCHEMA_V7).context("migrating to schema v7")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -204,6 +207,73 @@ ALTER TABLE doc_references ADD COLUMN details_version INTEGER NOT NULL DEFAULT 0
 ALTER TABLE doc_references ADD COLUMN embed_text_sha TEXT;
 ";
 
+/// Second brains (§12, §13), per reasoning model. `brain_facts` is the registry and source
+/// of truth for fact IDs (never reused: deleted facts stay as tombstones); `line` is the
+/// registered `[FACT]` line, so a fact missing from its file can be restored byte for byte.
+/// Fact and rejected-fact embeddings live in `brain_vec` (rowid = brain_embeddings.id),
+/// created with the embedding dimension.
+const SCHEMA_V7: &str = "
+CREATE TABLE brain_facts (
+  model TEXT NOT NULL,
+  fact_id TEXT NOT NULL,                  -- F-0001, …
+  line TEXT NOT NULL,
+  line_sha TEXT NOT NULL,
+  claim TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',  -- active|stale|broken|deleted
+  added_at TEXT NOT NULL,
+  run_id INTEGER,
+  reason TEXT,
+  PRIMARY KEY (model, fact_id)
+);
+CREATE TABLE fact_citations (
+  model TEXT NOT NULL, fact_id TEXT NOT NULL, ord INTEGER NOT NULL,
+  label TEXT NOT NULL, doc_sha256 TEXT NOT NULL, chunk_text_sha TEXT NOT NULL, quote TEXT NOT NULL,
+  resolution TEXT,                        -- resolved|relocated|source_removed|broken
+  resolved_chunk_id INTEGER, checked_at TEXT,
+  PRIMARY KEY (model, fact_id, ord)
+);
+CREATE TABLE fact_links (model TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (model, a, b, kind));
+CREATE TABLE fact_queue (
+  id INTEGER PRIMARY KEY,
+  model TEXT NOT NULL,
+  kind TEXT NOT NULL,                     -- new|merge
+  target_fact_id TEXT,                    -- for merge
+  claim TEXT NOT NULL,
+  citations_json TEXT NOT NULL,
+  reason TEXT,
+  question TEXT,                          -- the sub-question whose answer it came from
+  related_json TEXT,                      -- near-duplicate / conflicting active facts
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected|merged
+  run_id INTEGER,
+  created_at TEXT NOT NULL,
+  decided_at TEXT
+);
+CREATE INDEX fact_queue_model ON fact_queue(model, status);
+CREATE TABLE rejected_facts (
+  id INTEGER PRIMARY KEY, model TEXT NOT NULL, claim TEXT NOT NULL, citations_json TEXT,
+  origin TEXT NOT NULL,                   -- queue_reject|deleted
+  at TEXT NOT NULL
+);
+CREATE TABLE brain_embeddings (
+  id INTEGER PRIMARY KEY, model TEXT NOT NULL,
+  kind TEXT NOT NULL,                     -- fact|rejected
+  ref TEXT NOT NULL,                      -- fact_id or rejected_facts.id
+  text_sha TEXT NOT NULL,
+  UNIQUE (model, kind, ref)
+);
+CREATE TABLE agent_runs (
+  id INTEGER PRIMARY KEY, model TEXT NOT NULL, question TEXT NOT NULL,
+  status TEXT NOT NULL,                   -- running|done|failed
+  result_json TEXT, error TEXT, created_at TEXT NOT NULL, finished_at TEXT
+);
+";
+
+/// Creates `brain_vec` for `dim` dimensions if it doesn't exist.
+pub fn ensure_brain_vec(conn: &Connection, dim: usize) -> anyhow::Result<()> {
+    conn.execute_batch(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS brain_vec USING vec0(embedding float[{dim}]);"))?;
+    Ok(())
+}
+
 /// Creates `reference_vec` for `dim` dimensions if it doesn't exist, with the trigger that
 /// drops a reference's vector when the reference is deleted.
 pub fn ensure_reference_vec(conn: &Connection, dim: usize) -> anyhow::Result<()> {
@@ -234,7 +304,9 @@ pub fn recreate_vec_table(conn: &Connection, dim: usize) -> anyhow::Result<()> {
          -- Reference vectors are from the same model: drop them too; they're re-embedded.
          DROP TRIGGER IF EXISTS doc_references_ad;
          DROP TABLE IF EXISTS reference_vec;
-         UPDATE doc_references SET embed_text_sha = NULL;"
+         UPDATE doc_references SET embed_text_sha = NULL;
+         DROP TABLE IF EXISTS brain_vec;
+         DELETE FROM brain_embeddings;"
     ))?;
     set_meta(conn, "embed_dim", &dim.to_string())
 }

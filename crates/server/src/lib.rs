@@ -6,6 +6,7 @@
 //! background sync.
 
 mod auth;
+mod brain;
 mod ocr_jobs;
 mod routes;
 mod settings;

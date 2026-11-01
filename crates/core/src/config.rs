@@ -96,6 +96,11 @@ pub struct WorkspaceConfig {
     pub strict: bool,
     /// Context size per chat model (§11); filled in on first use.
     pub num_ctx: BTreeMap<String, u32>,
+    /// Default reasoning model for the agent and Second Brain (§12).
+    pub reasoning_model: Option<String>,
+    /// Answers the agent's `ask_corpus` calls and judges its proposals. Unset: the reasoning
+    /// model itself, so Ollama doesn't swap models at every step on a 16 GB machine.
+    pub agent_corpus_model: Option<String>,
 }
 
 impl Default for WorkspaceConfig {
@@ -111,6 +116,8 @@ impl Default for WorkspaceConfig {
             repair_quotes: true,
             strict: false,
             num_ctx: BTreeMap::new(),
+            reasoning_model: None,
+            agent_corpus_model: None,
         }
     }
 }

@@ -1,5 +1,7 @@
+pub mod agent;
 pub mod answer;
 pub mod bibliography;
+pub mod brain;
 pub mod budget;
 pub mod chunk;
 pub mod citations;

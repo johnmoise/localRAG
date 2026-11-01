@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/chunks/{id}", get(chunk))
         .route("/api/highlights", get(highlights))
         .route("/files/{id}", get(file))
+        .merge(crate::brain::routes())
         .with_state(state)
 }
 
@@ -82,6 +83,9 @@ impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         if e.downcast_ref::<crate::NoWorkspace>().is_some() {
             return ApiError::new(StatusCode::CONFLICT, "no_workspace", e.to_string());
+        }
+        if e.downcast_ref::<localrag_core::brain::file::Conflict>().is_some() {
+            return ApiError::new(StatusCode::CONFLICT, "brain_changed", e.to_string());
         }
         if let Some(over) = e.downcast_ref::<OverBudget>() {
             let mut body = serde_json::to_value(over).unwrap_or_default();
@@ -108,7 +112,7 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ApiError>
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?
 }
 
-fn not_found(what: &str) -> ApiError {
+pub(crate) fn not_found(what: &str) -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", what)
 }
 

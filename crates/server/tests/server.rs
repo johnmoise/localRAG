@@ -68,7 +68,7 @@ async fn rejects_foreign_hosts_and_origins() {
 #[tokio::test]
 async fn data_routes_need_the_token() {
     let (_d, s) = setup();
-    for path in ["/api/sessions", "/api/documents", "/files/1"] {
+    for path in ["/api/sessions", "/api/documents", "/files/1", "/api/brain/models", "/api/brain/m/queue"] {
         assert_eq!(send(&s, req("GET", path).body(Body::empty()).unwrap()).await.0, StatusCode::UNAUTHORIZED, "{path}");
     }
     let wrong_port_cookie = req("GET", "/api/sessions").header(header::COOKIE, format!("localrag_token_9999={TOKEN}"));
@@ -296,4 +296,29 @@ async fn an_upload_indexes_and_a_batch_can_defer_to_one_sync() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(settled_runs(&s).await, 2);
     assert_eq!(document_count(dir.path()), 4);
+}
+
+#[tokio::test]
+async fn brain_edits_name_the_file_version_they_were_based_on() {
+    let (_d, s) = setup();
+    let (status, v) = send_json(&s, authed("GET", "/api/brain/thinker%3A1b").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["exists"], false);
+    assert_eq!(v["lines"][0]["text"], "Brain · thinker:1b");
+    // Write a thought by hand, then edit it with a stale hash: refused with 409.
+    let ws = Workspace::open(&s.root().unwrap()).unwrap();
+    let path = localrag_core::brain::file::path_for(&ws, "thinker:1b");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "# Brain · thinker:1b\n\n## Notes\n[THOUGHT] first idea\n").unwrap();
+    let edit = |hash: &str| authed("PATCH", "/api/brain/thinker%3A1b/lines/3").header("if-match", hash).header(header::CONTENT_TYPE, "application/json").body(Body::from(r#"{"text":"second idea"}"#)).unwrap();
+    let (status, v) = send_json(&s, edit(v["hash"].as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    let (_, v) = send_json(&s, authed("GET", "/api/brain/thinker%3A1b").body(Body::empty()).unwrap()).await;
+    let (status, v) = send_json(&s, edit(v["hash"].as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("[THOUGHT] second idea"));
+    // Fact lines can't be smuggled in through a thought.
+    let (_, v) = send_json(&s, authed("GET", "/api/brain/thinker%3A1b").body(Body::empty()).unwrap()).await;
+    let bad = authed("PATCH", "/api/brain/thinker%3A1b/lines/3").header("if-match", v["hash"].as_str().unwrap()).header(header::CONTENT_TYPE, "application/json").body(Body::from(r#"{"text":"[FACT] F-0001 | x | y"}"#)).unwrap();
+    assert_eq!(send(&s, bad).await.0, StatusCode::UNPROCESSABLE_ENTITY);
 }

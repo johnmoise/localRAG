@@ -49,6 +49,7 @@ document.querySelectorAll(".tabs button").forEach((b) =>
     document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.id === `tab-${b.dataset.tab}`));
     if (b.dataset.tab === "documents") loadDocuments();
     if (b.dataset.tab === "search") loadSearchDocs();
+    if (b.dataset.tab === "brain") loadBrainModels();
   }),
 );
 
@@ -934,6 +935,9 @@ function onWorkspaceActivated(active) {
   loadModels();
   refreshStatus();
   if ($("#tab-documents").classList.contains("active")) loadDocuments();
+  brain.model = null;
+  $("#agent-out").replaceChildren();
+  if ($("#tab-brain").classList.contains("active")) loadBrainModels();
   maybePromptEmail();
 }
 
@@ -1160,3 +1164,275 @@ $("#meta-save").addEventListener("click", async () => {
   onWorkspaceActivated(active);
   loadSessions();
 })();
+
+// ---------------------------------------------------------------- second brain (§12, §15)
+
+const brain = { model: null, data: null, facts: [] };
+const bpath = (rest = "") => `/api/brain/${encodeURIComponent(brain.model)}${rest}`;
+
+async function loadBrainModels() {
+  const { models, default: def } = await api("/api/brain/models").catch(() => ({ models: [] }));
+  const sel = $("#brain-model");
+  $("#brain-none").hidden = models.some((m) => m.installed);
+  sel.replaceChildren(...models.map((m) => el("option", { value: m.name }, m.installed ? m.name : `${m.name} (not installed: read-only)`)));
+  if (!models.length) { $("#brain-lines").replaceChildren(); $("#queue-list").replaceChildren(); return; }
+  brain.model = models.some((m) => m.name === brain.model) ? brain.model : def || models[0].name;
+  sel.value = brain.model;
+  brain.readOnly = !models.find((m) => m.name === brain.model)?.installed;
+  await loadBrain();
+}
+$("#brain-model").addEventListener("change", (e) => { brain.model = e.target.value; $("#brain-diff-view").hidden = true; loadBrainModels(); });
+
+async function loadBrain(data) {
+  brain.data = data || await api(bpath());
+  renderBrain();
+  loadQueue();
+}
+
+/// Writes that name the file version they're based on; a 409 means it changed (edited in
+/// another app?), so the brain is reloaded.
+async function brainWrite(path, opts) {
+  try {
+    const r = await api(bpath(path), { ...opts, headers: { "If-Match": brain.data.hash, ...(opts.headers || {}) } });
+    await loadBrain(r.brain || r);
+    return r;
+  } catch (e) {
+    if (e.status === 409) { await loadBrain(); alert("The brain file changed since it was shown (edited elsewhere?). It has been reloaded; try again."); }
+    else alert(e.message);
+    throw e;
+  }
+}
+
+function factCitationChip(c) {
+  const ok = c.resolution === "resolved" || c.resolution === "relocated";
+  const chip = el("button", { class: `chip ${ok ? "verified" : "unverified"}`, title: ok ? `“${c.quote}”` : `Source ${c.resolution.replace("_", " ")}` }, ok ? "✓" : "⚠", ` ${c.label}`);
+  chip.addEventListener("click", () => {
+    if (!c.chunk_id) return;
+    inspectCitation({ label: c.label, status: "verified", quote: c.quote, chunk_id: c.chunk_id, chunk_text_sha: c.chunk_text_sha, doc_sha256: c.doc_sha256 }, null, chip);
+  });
+  return chip;
+}
+
+function renderBrain() {
+  const d = brain.data;
+  const ro = brain.readOnly;
+  $("#brain-summary").textContent = `${d.usable} fact(s)${d.pending ? ` · ${d.pending} proposed` : ""} · ${d.path}`;
+  $("#brain-undo").hidden = !d.can_undo || ro;
+  $("#brain-diff").hidden = !d.can_undo;
+  $("#brain-organize").disabled = ro || !d.usable;
+  $("#brain-research").hidden = ro;
+
+  const probs = $("#brain-problems");
+  probs.hidden = !d.problems.length;
+  probs.replaceChildren(
+    el("strong", {}, `${d.problems.length} integrity problem(s)`),
+    el("ul", {}, d.problems.map((p) => el("li", {}, p.message,
+      p.kind === "missing" && !ro ? [
+        el("button", { class: "small", onclick: () => brainWrite(`/facts/${p.fact_id}/restore`, { method: "POST" }) }, "Restore"),
+        el("button", { class: "small danger", onclick: () => confirm(`Delete ${p.fact_id}? It is recorded as rejected and won't be proposed again.`) && brainWrite(`/facts/${p.fact_id}`, { method: "DELETE" }) }, "Delete"),
+      ] : null,
+      p.kind === "broken" && !ro ? el("button", { class: "small", onclick: () => findQuote(p.fact_id) }, "Find quote") : null))));
+
+  const lines = d.lines.map((l, n) => {
+    if (l.type === "heading") {
+      if (n === 0) return null;
+      return el(`h${Math.min(l.level + 1, 4)}`, {}, l.text, ro ? null : el("span", { class: "row-actions" },
+        el("button", { onclick: () => editLine(n, l.text) }, "Edit"),
+        l.level > 1 ? el("button", { onclick: () => brainWrite(`/lines/${n}`, { method: "DELETE" }) }, "Delete") : null));
+    }
+    if (l.type === "thought") {
+      return el("div", { class: "thought" }, el("span", { class: "tag" }, "Thought"), el("span", { class: "text" }, l.text),
+        ro ? null : el("span", { class: "row-actions" },
+          el("button", { onclick: () => editLine(n, l.text) }, "Edit"),
+          el("button", { onclick: () => brainWrite(`/lines/${n}`, { method: "DELETE" }) }, "Delete")));
+    }
+    if (l.type === "fact") return factCard(l);
+    if (l.type === "invalid") return el("div", { class: "fact inactive" }, el("div", { class: "problem" }, `Ignored line: ${l.error}`), el("code", {}, l.raw));
+    return null;
+  });
+  const box = $("#brain-lines");
+  box.replaceChildren(...lines.filter(Boolean));
+  if (!d.lines.some((l) => l.type === "fact")) box.append(el("p", { class: "muted" }, ro ? "This brain has no facts." : "No approved facts yet. Research a question above; the facts the model proposes appear on the right for you to approve."));
+}
+
+function factCard(f) {
+  const ro = brain.readOnly;
+  const card = el("div", { class: `fact${f.status === "active" ? "" : " inactive"}`, id: `fact-${f.id}` },
+    el("div", { class: "fact-head" }, el("span", { class: "fact-id" }, f.id), el("span", { class: "claim" }, f.claim),
+      el("span", { class: `fact-status ${f.status}` }, f.status),
+      ro ? null : el("span", { class: "row-actions" },
+        el("button", { onclick: () => editFact(f, card) }, "Edit"),
+        el("button", { onclick: () => confirm(`Delete ${f.id}? The line is removed, the ID retired, and the claim recorded as rejected so it isn't proposed again.`) && brainWrite(`/facts/${f.id}`, { method: "DELETE" }) }, "Delete"))),
+    el("div", { class: "cites" }, f.citations.map(factCitationChip)),
+    f.conflicts.length ? el("div", { class: "conflict" }, `⚠ Conflicts with ${f.conflicts.join(", ")}`) : null,
+    f.problem ? el("div", { class: "problem" }, f.problem) : null);
+  return card;
+}
+
+async function editLine(n, text) {
+  const t = prompt("Edit line:", text);
+  if (t === null || t.trim() === text) return;
+  await brainWrite(`/lines/${n}`, { method: "PATCH", body: JSON.stringify({ text: t }) }).catch(() => {});
+}
+
+function editFact(f, card) {
+  const ta = el("textarea", { rows: 2 }, f.claim);
+  const err = el("div", { class: "problem" });
+  const save = el("button", { class: "small primary" }, "Save (re-verified)");
+  const cancel = el("button", { class: "small", onclick: () => renderBrain() }, "Cancel");
+  save.addEventListener("click", async () => {
+    save.disabled = true; save.textContent = "Checking against the quotes…";
+    try {
+      await api(bpath(`/facts/${f.id}`), { method: "PATCH", body: JSON.stringify({ claim: ta.value }), headers: { "If-Match": brain.data.hash } });
+      await loadBrain();
+    } catch (e) {
+      err.textContent = e.message; save.disabled = false; save.textContent = "Save (re-verified)";
+      if (e.status === 409) loadBrain();
+    }
+  });
+  card.querySelector(".fact-head .claim").replaceWith(el("div", { class: "claim" }, ta, el("div", { class: "row" }, save, cancel), err));
+}
+
+async function findQuote(factId) {
+  const f = brain.data.lines.find((l) => l.type === "fact" && l.id === factId);
+  const c = f?.citations.find((c) => c.resolution === "broken");
+  if (!c) return;
+  document.querySelector('[data-tab="search"]').click();
+  $("#search-q").value = c.quote;
+  $("#search-form").requestSubmit();
+}
+
+$("#brain-check").addEventListener("click", () => loadBrain());
+$("#brain-undo").addEventListener("click", async () => {
+  if (!confirm("Restore the brain as it was before the last change?")) return;
+  await api(bpath("/undo"), { method: "POST" }).then(loadBrain).catch((e) => alert(e.message));
+  $("#brain-diff-view").hidden = true;
+});
+$("#brain-organize").addEventListener("click", async () => {
+  const b = $("#brain-organize");
+  b.disabled = true; b.textContent = "Organizing…";
+  try {
+    const r = await api(bpath("/organize"), { method: "POST" });
+    await loadBrain(r.brain);
+    if (r.result.changed) showDiff();
+    else alert(r.result.errors.length ? `Not saved: the model's layout failed validation twice.\n- ${r.result.errors.join("\n- ")}` : "The model kept the current layout.");
+  } catch (e) { alert(e.message); } finally { b.textContent = "Organize brain"; b.disabled = false; }
+});
+$("#brain-diff").addEventListener("click", () => ($("#brain-diff-view").hidden ? showDiff() : ($("#brain-diff-view").hidden = true)));
+
+/// Line diff (LCS) of the last saved version against the current file.
+async function showDiff() {
+  const { before, after } = await api(bpath("/last-change"));
+  const a = (before || "").split("\n"), b = after.split("\n");
+  const L = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  const short = (s) => s.replace(/ <doc:[0-9a-f]+, chunk:[0-9a-f]+>/g, "");
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) { out.push(el("div", {}, `  ${short(a[i])}`)); i++; j++; }
+    else if (j < b.length && (i >= a.length || L[i][j + 1] >= L[i + 1][j])) { out.push(el("div", { class: "add" }, `+ ${short(b[j])}`)); j++; }
+    else { out.push(el("div", { class: "del" }, `- ${short(a[i])}`)); i++; }
+  }
+  const v = $("#brain-diff-view");
+  v.replaceChildren(el("strong", {}, "Last change (fact lines are compared byte for byte; hashes hidden)"), ...out);
+  v.hidden = false;
+}
+
+async function loadQueue() {
+  const { items, facts } = await api(bpath("/queue"));
+  brain.facts = facts;
+  $("#queue-count").textContent = items.length ? `(${items.length})` : "";
+  const list = $("#queue-list");
+  if (!items.length) { list.replaceChildren(el("p", { class: "muted small-text" }, "Nothing waiting.")); return; }
+  list.replaceChildren(...items.map(queueCard));
+}
+
+function queueCard(q) {
+  const ro = brain.readOnly;
+  const err = el("div", { class: "problem" });
+  const act = async (action, body) => {
+    card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    err.textContent = action === "reject" ? "" : "Re-verifying against the sources…";
+    try {
+      const r = await api(bpath(`/queue/${q.id}/${action}`), { method: "POST", body: JSON.stringify(body || {}) });
+      await loadBrain(r.brain);
+      if (r.fact_id) document.getElementById(`fact-${r.fact_id}`)?.scrollIntoView({ block: "center" });
+    } catch (e) {
+      err.textContent = e.message;
+      card.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    }
+  };
+  const editBox = el("textarea", { rows: 3, hidden: true }, q.claim);
+  const mergeSel = el("select", { hidden: true }, brain.facts.map((f) => el("option", { value: f.id }, `${f.id}: ${f.claim.slice(0, 60)}`)));
+  if (q.target_fact_id) mergeSel.value = q.target_fact_id;
+  const card = el("div", { class: "qcard" },
+    q.kind === "merge" && q.target ? el("div", { class: "rel" }, `Near-duplicate of ${q.target.id}: approving adds these citations to it.`) : null,
+    el("div", { class: "claim" }, q.claim),
+    q.citations.map((c) => el("div", { class: "quote" }, factCitationChip(c), " ", el("mark", {}, `“${c.quote}”`))),
+    q.sources_ok ? null : el("div", { class: "problem" }, "A cited source changed since this was proposed; it's re-verified when you approve."),
+    q.reason ? el("div", { class: "why" }, `Why keep it: ${q.reason}`) : null,
+    q.related.filter((r) => r.relation !== "duplicate" || !q.target).map((r) => el("div", { class: "rel" },
+      r.relation === "conflicts" ? `⚠ Conflicts with ${r.id}: ${r.claim}` : `Related to ${r.id} (similarity ${r.similarity.toFixed(2)}): ${r.claim}`)),
+    editBox, mergeSel,
+    ro ? null : el("div", { class: "actions" },
+      el("button", { class: "small primary", onclick: () => editBox.hidden ? act("approve") : act("approve", { claim: editBox.value }) }, q.kind === "merge" ? "Approve merge" : "Approve"),
+      el("button", { class: "small", onclick: (e) => { editBox.hidden = !editBox.hidden; e.target.textContent = editBox.hidden ? "Edit & approve" : "Use original"; } }, "Edit & approve"),
+      brain.facts.length ? el("button", { class: "small", onclick: (e) => {
+        if (mergeSel.hidden) { mergeSel.hidden = false; e.target.textContent = "Merge into selected"; return; }
+        act("merge", { target: mergeSel.value });
+      } }, "Merge…") : null,
+      el("button", { class: "small danger", onclick: () => act("reject") }, "Reject")),
+    err);
+  return card;
+}
+
+$("#agent-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = $("#agent-q").value.trim();
+  if (!question || !brain.model) return;
+  const btn = $("#agent-btn");
+  btn.disabled = true;
+  $("#agent-error").textContent = "";
+  const steps = el("ol", { class: "agent-steps" });
+  const live = el("div", { class: "agent-answer muted" });
+  $("#agent-out").replaceChildren(steps, live);
+  const addStep = (...c) => steps.append(el("li", {}, ...c));
+  let thinking = false;
+  try {
+    const res = await fetch("/api/agent/run", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question, model: brain.model }) });
+    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || res.statusText); }
+    for await (const { event, data } of sse(res)) {
+      if (event === "thinking" && !thinking) { thinking = true; live.textContent = "Thinking…"; }
+      else if (event === "token") { if (thinking) { live.textContent = ""; thinking = false; } live.textContent += data.text; }
+      else if (event === "tool_call") {
+        thinking = false; live.textContent = "";
+        const arg = data.arguments?.question || data.arguments?.query || data.arguments?.claim || "";
+        addStep(el("span", { class: "tool" }, data.name), arg ? ` “${arg}”` : "");
+      } else if (event === "tool_result") steps.lastChild?.append(` → ${data.result.summary || data.result.error || ""}`);
+      else if (event === "brain_update") {
+        const a = data.admission;
+        steps.lastChild?.append(a.outcome === "dropped" ? ` (dropped: ${a.reason})` : " (sent to Proposed facts)");
+        if (a.outcome !== "dropped") loadQueue();
+      } else if (event === "warning") addStep(el("span", { class: "problem" }, data.message));
+      else if (event === "result") {
+        const html = DOMPurify.sanitize(marked.parse(data.text || "(no answer)"));
+        const ans = el("div", { class: "agent-answer" });
+        ans.innerHTML = html;
+        if (data.invalid_markers.length) ans.append(el("div", { class: "problem" }, `Citations that don't resolve: ${data.invalid_markers.join(", ")}`));
+        if (data.sources.length) ans.append(el("div", { class: "cites" }, el("span", { class: "muted small-text" }, "Sources: "),
+          [...new Map(data.sources.map((s) => [`${s.chunk_id}|${s.quote}`, s])).values()].map((s) => {
+            const chip = el("button", { class: "chip verified", title: s.quote ? `“${s.quote}” (via ${s.via})` : s.via }, `✓ ${s.label}`);
+            chip.addEventListener("click", () => s.chunk_id && inspectCitation({ label: s.label, status: "verified", quote: s.quote, chunk_id: s.chunk_id, chunk_text_sha: s.chunk_text_sha, doc_sha256: s.doc_sha256 }, null, chip));
+            return chip;
+          })));
+        live.replaceWith(ans);
+        loadBrain();
+      } else if (event === "error") { live.textContent = ""; $("#agent-error").textContent = data.message; }
+    }
+  } catch (err) {
+    $("#agent-error").textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});

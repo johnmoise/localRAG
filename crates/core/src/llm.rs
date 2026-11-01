@@ -6,21 +6,44 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Tool calls an assistant message made (sent back so the model sees its own calls).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// For a `tool` message: which tool's result this is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// A function call requested by the model (Ollama tool calling).
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
 }
 
 impl Message {
     pub fn system(c: impl Into<String>) -> Self {
-        Message { role: "system".into(), content: c.into() }
+        Message { role: "system".into(), content: c.into(), ..Message::default() }
     }
     pub fn user(c: impl Into<String>) -> Self {
-        Message { role: "user".into(), content: c.into() }
+        Message { role: "user".into(), content: c.into(), ..Message::default() }
     }
     pub fn assistant(c: impl Into<String>) -> Self {
-        Message { role: "assistant".into(), content: c.into() }
+        Message { role: "assistant".into(), content: c.into(), ..Message::default() }
+    }
+    /// A tool's result, answering one of the assistant's tool calls.
+    pub fn tool(name: &str, c: impl Into<String>) -> Self {
+        Message { role: "tool".into(), content: c.into(), tool_name: Some(name.into()), ..Message::default() }
     }
 }
 
@@ -34,6 +57,8 @@ pub struct ChatRequest {
     pub num_predict: Option<i64>,
     /// Ollama structured output: a JSON schema the reply must follow.
     pub format: Option<Value>,
+    /// Tool definitions (Ollama `tools`); calls come back in `ChatResponse::tool_calls`.
+    pub tools: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,6 +68,7 @@ pub struct ChatResponse {
     /// Prompt tokens Ollama actually evaluated; less than sent means it truncated (§11).
     pub prompt_eval_count: Option<u64>,
     pub eval_count: Option<u64>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 pub enum Delta<'a> {
@@ -123,6 +149,9 @@ impl Llm for Ollama {
                 if let Some(f) = &req.format {
                     body["format"] = f.clone();
                 }
+                if let Some(t) = &req.tools {
+                    body["tools"] = t.clone();
+                }
                 body
             })
             .send()
@@ -149,6 +178,9 @@ impl Llm for Ollama {
             if let Some(t) = v["message"]["content"].as_str().filter(|t| !t.is_empty()) {
                 out.content.push_str(t);
                 on_delta(Delta::Content(t));
+            }
+            if let Some(calls) = v["message"]["tool_calls"].as_array() {
+                out.tool_calls.extend(calls.iter().filter_map(|c| serde_json::from_value::<ToolCall>(c.clone()).ok()));
             }
             if v["done"].as_bool() == Some(true) {
                 out.prompt_eval_count = v["prompt_eval_count"].as_u64();

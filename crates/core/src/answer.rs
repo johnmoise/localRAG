@@ -286,7 +286,7 @@ impl RagEngine<'_> {
         messages.push(Message::user(prompts::question_with_sources(question, &answer.sources)));
         let sent: usize = messages.iter().map(|m| counter.count(&m.content) + PER_MESSAGE_OVERHEAD).sum();
 
-        let req = ChatRequest { model: model.to_string(), messages: messages.clone(), num_ctx, temperature: 0.2, think, num_predict: None, format: None };
+        let req = ChatRequest { model: model.to_string(), messages: messages.clone(), num_ctx, temperature: 0.2, think, num_predict: None, format: None, tools: None };
         let resp = self.llm.chat(&req, &mut |d| match d {
             Delta::Thinking(t) => on(Event::Thinking(t)),
             Delta::Content(t) => on(Event::Token(t)),
@@ -372,6 +372,7 @@ impl RagEngine<'_> {
                 think: false,
                 num_predict: Some(60),
                 format: None,
+                tools: None,
             };
             let reply = self.llm.chat(&req, &mut |_| {})?.content;
             let phrase = reply.trim().trim_matches(['"', '“', '”', '\'']).trim();
@@ -407,36 +408,9 @@ impl RagEngine<'_> {
                 (c.claim.clone(), passage)
             })
             .collect();
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": { "verdicts": { "type": "array", "items": {
-                "type": "object",
-                "properties": { "item": { "type": "integer" }, "verdict": { "type": "string", "enum": ["yes", "partial", "no"] } },
-                "required": ["item", "verdict"]
-            } } },
-            "required": ["verdicts"]
-        });
-        let req = ChatRequest {
-            model: model.to_string(),
-            messages: vec![Message::system(prompts::SUPPORT_SYSTEM), Message::user(prompts::support_request(&items))],
-            num_ctx,
-            temperature: 0.0,
-            think: false,
-            num_predict: Some(40 * items.len() as i64 + 50),
-            format: Some(schema),
-        };
-        let reply = self.llm.chat(&req, &mut |_| {})?.content;
-        let parsed: serde_json::Value = serde_json::from_str(reply.trim()).unwrap_or_default();
-        for v in parsed["verdicts"].as_array().into_iter().flatten() {
-            let (Some(i), Some(verdict)) = (v["item"].as_u64(), v["verdict"].as_str()) else { continue };
-            if let Some(c) = answer.citations.get_mut(i as usize) {
-                c.support = match verdict {
-                    "yes" => Some(Support::Yes),
-                    "partial" => Some(Support::Partial),
-                    "no" => Some(Support::No),
-                    _ => None,
-                };
-            }
+        let verdicts = judge_support(self.llm, model, num_ctx, &items)?;
+        for (c, v) in answer.citations.iter_mut().zip(verdicts) {
+            c.support = v;
         }
         Ok(())
     }
@@ -456,6 +430,7 @@ impl RagEngine<'_> {
             think: false,
             num_predict: Some(80),
             format: None,
+            tools: None,
         };
         let resp = self.llm.chat(&req, &mut |_| {})?;
         let q = resp.content.lines().find(|l| !l.trim().is_empty()).unwrap_or(question).trim().trim_matches('"');
@@ -476,6 +451,7 @@ impl RagEngine<'_> {
                 think: false,
                 num_predict: Some(300),
                 format: None,
+                tools: None,
             };
             return Ok((bullets(&self.llm.chat(&req, &mut |_| {})?.content), Vec::new()));
         }
@@ -496,6 +472,7 @@ impl RagEngine<'_> {
             think: false,
             num_predict: Some(500),
             format: Some(schema),
+            tools: None,
         };
         let reply = self.llm.chat(&req, &mut |_| {})?.content;
         let Ok(v) = serde_json::from_str::<serde_json::Value>(reply.trim()) else {
@@ -519,6 +496,48 @@ impl RagEngine<'_> {
         }
         Ok((topics, picked))
     }
+}
+
+/// Strict check (§10): one structured-output request judging, for each (claim, passage)
+/// pair, whether the passage supports the claim. `None` where the model gave no verdict.
+pub fn judge_support(llm: &dyn Llm, model: &str, num_ctx: u32, items: &[(String, String)]) -> anyhow::Result<Vec<Option<Support>>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "verdicts": { "type": "array", "items": {
+            "type": "object",
+            "properties": { "item": { "type": "integer" }, "verdict": { "type": "string", "enum": ["yes", "partial", "no"] } },
+            "required": ["item", "verdict"]
+        } } },
+        "required": ["verdicts"]
+    });
+    let req = ChatRequest {
+        model: model.to_string(),
+        messages: vec![Message::system(prompts::SUPPORT_SYSTEM), Message::user(prompts::support_request(items))],
+        num_ctx,
+        temperature: 0.0,
+        think: false,
+        num_predict: Some(40 * items.len() as i64 + 50),
+        format: Some(schema),
+        tools: None,
+    };
+    let reply = llm.chat(&req, &mut |_| {})?.content;
+    let parsed: serde_json::Value = serde_json::from_str(reply.trim()).unwrap_or_default();
+    let mut out = vec![None; items.len()];
+    for v in parsed["verdicts"].as_array().into_iter().flatten() {
+        let (Some(i), Some(verdict)) = (v["item"].as_u64(), v["verdict"].as_str()) else { continue };
+        if let Some(slot) = out.get_mut(i as usize) {
+            *slot = match verdict {
+                "yes" => Some(Support::Yes),
+                "partial" => Some(Support::Partial),
+                "no" => Some(Support::No),
+                _ => None,
+            };
+        }
+    }
+    Ok(out)
 }
 
 fn bullets(text: &str) -> Vec<String> {

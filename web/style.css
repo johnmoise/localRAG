@@ -276,3 +276,52 @@ td.num, th.num { text-align: right; }
 .sugg-refs .why { color: var(--muted); font-size: 13px; }
 .sugg-refs .abstract summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .sugg-refs .abstract p { margin: 4px 0 0; font-size: 13px; white-space: pre-line; }
+
+/* Second Brain (§15) */
+#tab-brain { flex-direction: row; }
+.brain-main { flex: 1; min-width: 0; padding: 16px 24px; overflow-y: auto; }
+.brain-toolbar { flex-wrap: wrap; }
+.brain-queue { width: 340px; flex-shrink: 0; border-left: 1px solid var(--line); padding: 14px 16px; overflow-y: auto; }
+.brain-queue h3 { margin: 0 0 4px; }
+.brain-research { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 8px 12px; margin-bottom: 14px; }
+.brain-research summary { cursor: pointer; font-weight: 600; }
+.brain-research textarea { width: 100%; margin-top: 8px; resize: vertical; }
+.agent-out:empty { display: none; }
+.agent-out { margin-top: 10px; font-size: 14px; }
+.agent-steps { list-style: none; padding: 0; margin: 0 0 10px; color: var(--muted); font-size: 13px; }
+.agent-steps li { margin: 3px 0; }
+.agent-steps .tool { font-family: var(--mono); color: var(--text); }
+.agent-answer { border-top: 1px solid var(--line); padding-top: 8px; }
+.brain-problems { border: 1px solid var(--line); border-left: 4px solid #c58a1b; border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; font-size: 14px; background: var(--panel); }
+.brain-problems li { margin: 4px 0; }
+.brain-problems button { margin-left: 6px; }
+.brain-lines h2, .brain-lines h3, .brain-lines h4 { margin: 18px 0 6px; display: flex; gap: 8px; align-items: center; }
+.brain-lines h2 { font-size: 20px; }
+.brain-lines .row-actions { visibility: hidden; display: inline-flex; gap: 4px; }
+.brain-lines :hover > .row-actions { visibility: visible; }
+.brain-lines .row-actions button { padding: 1px 6px; font-size: 12px; }
+.thought { font-style: italic; color: var(--muted); margin: 4px 0; padding-left: 10px; border-left: 2px dashed var(--line); display: flex; gap: 6px; align-items: baseline; }
+.thought .tag { font-style: normal; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.thought .text { flex: 1; }
+.fact { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 8px 12px; margin: 6px 0; }
+.fact.inactive { opacity: 0.75; border-style: dashed; }
+.fact-head { display: flex; gap: 8px; align-items: baseline; }
+.fact-id { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.fact .claim { flex: 1; }
+.fact .cites { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 6px; }
+.fact .problem { color: #b25d00; font-size: 13px; margin-top: 4px; }
+.fact-status { font-size: 11px; font-weight: 600; border-radius: 10px; padding: 1px 7px; background: var(--verified-bg); color: var(--verified); }
+.fact-status.stale, .fact-status.broken, .fact-status.unresolved { background: #fbe9d0; color: #8a4b00; }
+.conflict { font-size: 12px; color: #8a4b00; }
+.qcard { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 10px; margin: 10px 0; font-size: 14px; }
+.qcard .claim { font-weight: 600; margin-bottom: 6px; }
+.qcard .why { color: var(--muted); font-size: 13px; margin: 6px 0; }
+.qcard .rel { font-size: 13px; margin: 4px 0; }
+.qcard .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.qcard textarea { width: 100%; margin-top: 6px; }
+.qcard .quote { font-size: 13px; margin: 4px 0; }
+.brain-diff { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px; font-size: 12px; white-space: pre-wrap; max-height: 40vh; overflow-y: auto; }
+.brain-diff .add { color: var(--verified); }
+.brain-diff .del { color: #b0413e; }
+@media (max-width: 900px) { #tab-brain { flex-direction: column; } .brain-queue { width: auto; border-left: none; border-top: 1px solid var(--line); } }
+.qcard mark { background: var(--mark-quote); color: inherit; border-radius: 2px; }

@@ -26,6 +26,7 @@
       <button role="tab" data-tab="search">Search</button>
       <button role="tab" data-tab="ask" class="active">Ask</button>
       <button role="tab" data-tab="documents">Documents</button>
+      <button role="tab" data-tab="brain">Second Brain</button>
     </nav>
     <div id="status" class="status" title=""></div>
     <button id="settings-btn" class="icon settings-btn" aria-label="Settings" title="Settings">⚙︎</button>
@@ -53,6 +54,36 @@
           </div>
         </form>
       </div>
+    </section>
+
+    <section id="tab-brain" class="tab">
+      <div class="brain-main">
+        <div class="toolbar brain-toolbar">
+          <label class="model">Reasoning model <select id="brain-model"></select></label>
+          <button id="brain-organize" class="small">Organize brain</button>
+          <button id="brain-undo" class="small" hidden>Undo</button>
+          <button id="brain-diff" class="small" hidden>Last change</button>
+          <button id="brain-check" class="small">Re-check</button>
+          <span id="brain-summary" class="muted small-text"></span>
+        </div>
+        <p id="brain-none" class="muted" hidden>No installed model can reason with tools. Install one with Ollama's <em>thinking</em> and <em>tools</em> capabilities (for example <code>ollama pull qwen3.5:9b</code>).</p>
+        <details id="brain-research" class="brain-research">
+          <summary>Research a question with this model</summary>
+          <form id="agent-form">
+            <textarea id="agent-q" rows="2" placeholder="A question for the reasoning model: it reads its brain, asks your documents sub-questions, and proposes facts for you to review…" required></textarea>
+            <div class="composer-row"><span id="agent-error" class="error" role="alert"></span><button id="agent-btn" class="primary" type="submit">Research</button></div>
+          </form>
+          <div id="agent-out" class="agent-out"></div>
+        </details>
+        <div id="brain-problems" class="brain-problems" hidden></div>
+        <pre id="brain-diff-view" class="brain-diff" hidden></pre>
+        <div id="brain-lines" class="brain-lines"></div>
+      </div>
+      <aside class="brain-queue">
+        <h3>Proposed facts <span id="queue-count" class="muted"></span></h3>
+        <p class="muted small-text">Facts the model proposed. Only approved facts enter its brain.</p>
+        <div id="queue-list"></div>
+      </aside>
     </section>
 
     <section id="tab-search" class="tab">
