@@ -96,7 +96,8 @@ pub struct WorkspaceConfig {
     pub strict: bool,
     /// Context size per chat model (§11); filled in on first use.
     pub num_ctx: BTreeMap<String, u32>,
-    /// Default reasoning model for the agent and Second Brain (§12).
+    /// Default reasoning model for the agent and Second Brain (§12); falls back to another
+    /// installed reasoning model when this one isn't installed.
     pub reasoning_model: Option<String>,
     /// Answers the agent's `ask_corpus` calls and judges its proposals. Unset: the reasoning
     /// model itself, so Ollama doesn't swap models at every step on a 16 GB machine.
@@ -116,7 +117,7 @@ impl Default for WorkspaceConfig {
             repair_quotes: true,
             strict: false,
             num_ctx: BTreeMap::new(),
-            reasoning_model: None,
+            reasoning_model: Some(DEFAULT_REASONING_MODEL.into()),
             agent_corpus_model: None,
         }
     }
@@ -134,6 +135,9 @@ pub fn validate_email(s: &str) -> anyhow::Result<String> {
     }
     Ok(e.to_string())
 }
+
+/// The agent's default reasoning model (§12): needs Ollama's thinking and tools capabilities.
+pub const DEFAULT_REASONING_MODEL: &str = "qwen3.5:9b";
 
 /// Upper bound for `cache_refresh_interval_days` (ten years).
 pub const MAX_CACHE_REFRESH_DAYS: u32 = 3650;

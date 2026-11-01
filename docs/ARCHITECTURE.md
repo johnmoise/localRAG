@@ -1291,7 +1291,12 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     `core/src/agent.rs`, `server/src/brain.rs`, the Second Brain tab, and the CLI commands
     `localrag agent "<question>" --model M` and `localrag brain show|queue|approve|reject|organize|undo`.
     `localrag check` now covers brains and the queue. Workspace config gains `reasoning_model`
-    and `agent_corpus_model` (unset: the reasoning model answers `ask_corpus` too).
+    (default `qwen3.5:9b`; the Second Brain picker saves your choice there) and
+    `agent_corpus_model` (unset: the reasoning model answers `ask_corpus` too).
+  - **MLX vs GGUF** (Ollama, M2 16 GB, `qwen3.5:4b` vs `qwen3.5:4b-mlx`, 1,650-token prompt,
+    uncached): generation 19.9 vs 20.5 tok/s (+3%), prompt processing 257 vs 211 tok/s (−18%),
+    memory 3.2 vs 4.1 GB, load 3.9 vs 2.1 s; tool calls work on both. RAG prompts are long, so
+    prompt processing dominates: GGUF stays the default here.
   - **Tool calling:** Ollama `tools`. `ask_corpus` runs the full grounded pipeline (§10) and
     numbers each answer's citations `C1, C2, …` for the run, showing the quote and whether it
     verified. Only verified citations can support a proposal. The final answer cites `[C#]` or

@@ -1181,7 +1181,13 @@ async function loadBrainModels() {
   brain.readOnly = !models.find((m) => m.name === brain.model)?.installed;
   await loadBrain();
 }
-$("#brain-model").addEventListener("change", (e) => { brain.model = e.target.value; $("#brain-diff-view").hidden = true; loadBrainModels(); });
+$("#brain-model").addEventListener("change", (e) => {
+  brain.model = e.target.value;
+  $("#brain-diff-view").hidden = true;
+  // Remembered per workspace (reasoning_model), so the CLI and the next visit use it too.
+  api("/api/settings", { method: "PUT", body: JSON.stringify({ reasoning_model: brain.model }) }).catch(() => {});
+  loadBrainModels();
+});
 
 async function loadBrain(data) {
   brain.data = data || await api(bpath());
