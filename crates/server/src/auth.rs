@@ -83,6 +83,6 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-const LOCKED_PAGE: &str = "<!doctype html><meta charset=utf-8><title>localrag</title>\
-<body style=\"font:16px system-ui;margin:3rem\"><h1>localrag</h1>\
+const LOCKED_PAGE: &str = "<!doctype html><meta charset=utf-8><title>localRAG</title>\
+<body style=\"font:16px system-ui;margin:3rem\"><h1>localRAG</h1>\
 <p>Open the link printed by <code>localrag serve</code> in your terminal. It carries this session's access token.</p></body>";

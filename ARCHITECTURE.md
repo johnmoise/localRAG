@@ -46,13 +46,13 @@ Guiding principles:
 | Brains | One Markdown file per reasoning model. `[FACT]` lines are immutable to the model; headings and `[THOUGHT]` lines are visible to it only in `organize_brain` | 12 |
 | Fact review | Proposed facts wait in a queue for your approval. Rejected or deleted facts are never proposed again | 12 |
 | Reference integrity | Every fact ID and chunk reference is resolved and checked; unresolvable ones are excluded and reported | 13 |
-| UI | Four tabs (Ask, Search, Library, Second Brain), a File menu, and Settings | 15 |
+| UI | Four tabs (Search, Ask, Documents, Second Brain), a workspace menu named after the open workspace, and Settings. The app is called **localRAG** | 15 |
 | One instance | Only one copy of localrag runs at a time, with one workspace active. A second `serve` opens the running one; CLI commands that write refuse while it runs | 4 |
-| Workspace picker | On first load the UI lists known workspaces to choose from. With none known, it asks where to create one; the location can only be picked with the macOS folder chooser, never typed. The File menu has New / Open / Recent | 4, 15 |
-| Adding documents | Library → **Add documents…** uploads into `corpus/` and triggers indexing. Only `.pdf`/`.md`/`.txt`; each file is parsed first and refused with a specific reason if it fails | 15 |
+| Workspace picker | On first load the UI lists known workspaces to choose from. With none known, it asks where to create one; the location can only be picked with the macOS folder chooser, never typed. The workspace menu has New / Open / Recent | 4, 15 |
+| Adding documents | Documents → **Add documents…** uploads into `corpus/` and triggers indexing. Only `.pdf`/`.md`/`.txt`; each file is parsed first and refused with a specific reason if it fails | 15 |
 | Git safety | `.localrag/` and `corpus/` each ignore themselves in git; secrets are never stored in a workspace (§14) | 4, 14 |
 | PDF parsing | PDFium runs only in a separate helper process (`localrag-pdf`), sandboxed with no network and no file writes. A crash or hang fails that one file | 14 |
-| Renaming documents | Library → **Rename** changes the file name only (the extension is fixed), with no reindex. References to the name are updated: document path, chat-history citations, eval set | 15 |
+| Renaming documents | Documents → **Rename** changes the file name only (the extension is fixed), with no reindex. References to the name are updated: document path, chat-history citations, eval set | 15 |
 
 ## 3. Platform & tech stack
 
@@ -168,7 +168,7 @@ scan corpus/ → diff against DB → parse → (OCR) → chunk → embed → wri
 **Removed vs. forgotten**
 - **Removed** documents keep their chunks, so citations in past answers and brain facts still
   resolve (§13), and a returning file is restored instantly.
-- **Forget** (Library, or `localrag forget <doc>`) permanently deletes the record, chunks,
+- **Forget** (Documents tab, or `localrag forget <doc>`) permanently deletes the record, chunks,
   vectors and OCR cache, after confirmation. Bulk version: "Forget all removed".
   - Chat history keeps a citation snapshot, so old answers stay readable, showing the source
     as *forgotten*.
@@ -217,7 +217,7 @@ confirm the exact template in Phase 0.
 4. **Cache:** `.localrag/ocr/<sha256>.json`, including the engine version. Corpus files are
    never modified. Only a change to the file's content triggers OCR again.
 5. **When:** `ocr = "ask" | "auto" | "off"`, default `ask`.
-   - With `ask`, the Library shows **Run OCR**, since a 300-page book takes minutes.
+   - With `ask`, the Documents tab shows **Run OCR**, since a 300-page book takes minutes.
    - Jobs run in the background with progress and cancel.
 6. **Downstream:** citations get an *OCR* badge, quote matching is fuzzy, and highlighting
    works from Vision's boxes.
@@ -235,11 +235,11 @@ Metadata comes from Crossref's REST API (`api.crossref.org`), which needs no key
 2. **No DOI** → `GET /works?query.bibliographic=<title + first author>&rows=5`, a *list*
    request. Candidates are scored on title similarity, author and year.
    - A high-confidence match is accepted.
-   - Otherwise it's shown in the Library as a *proposed* match to confirm or reject.
+   - Otherwise it's shown in the Documents tab as a *proposed* match to confirm or reject.
 3. **No match or offline** → PDF metadata → first-page heuristics → manual edit.
 
 - **Precedence:** manual > Crossref DOI > confirmed Crossref query > PDF metadata >
-  heuristics. `metadata_source` is shown in the Library.
+  heuristics. `metadata_source` is shown in the Documents tab.
 - **What's used:** authors, `issued` year, title, container, `page`, DOI (stored as CSL-JSON).
   It drives citation labels, the page-label offset and bibliography export.
 - **What is sent:** only the DOI or the extracted title/author, plus the email if set.
@@ -748,7 +748,7 @@ The server picks a free port and opens the browser on start.
 | `GET/PUT /api/settings` | Global settings incl. `crossref_email` |
 | `POST /api/search` | Retrieval only |
 | `POST /api/ask` | Budget check (`413` "Over token count by X"), then SSE: `sources` → `context_warning` → `thinking`/`token` → `answer` |
-| `GET /api/documents[/{id}]` | Library listing and details |
+| `GET /api/documents[/{id}]` | Documents tab listing and details |
 | `PATCH /api/documents/{id}` | Edit metadata; confirm/reject a proposed Crossref match |
 | `POST /api/documents/{id}/metadata/refresh` | Re-query Crossref |
 | `POST /api/documents/{id}/ocr` | Start OCR |
@@ -769,7 +769,8 @@ The server picks a free port and opens the browser on start.
 
 ## 15. User interface
 
-One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
+One page with four tabs (in order: Search, Ask, Documents, and later Second Brain), the
+workspace menu, a Settings panel, and first-load dialogs.
 
 - **First load:**
   - **Workspace picker**, when no workspace is active. It lists known workspaces (Open, or ×
@@ -781,8 +782,9 @@ One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
   - If no workspaces are known, the dialog opens on "Create your first workspace". It can't
     be dismissed until a workspace is open.
   - Then the Crossref email dialog, if no email is set (§7).
-- **File menu:** New workspace…, Open workspace…, and up to 6 recent workspaces (the active
-  one ticked). Switching resets every tab to the new workspace.
+- **Workspace menu** (labelled with the open workspace's name, top left next to localRAG):
+  New workspace…, Open workspace…, and up to 6 recent workspaces (the active one ticked).
+  Switching resets every tab to the new workspace.
 - **Ask:**
   - Chat with a model dropdown and session list.
   - An over-budget Submit shows "Over token count by X tokens".
@@ -792,7 +794,7 @@ One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
     the whole chunk otherwise) and **Open at p. 12** (PDF.js with the same highlight).
     Unverified chips have **Mark as verified paraphrase**; promoted ones have **Undo**.
 - **Search:** ranked passages, filterable by document or year.
-- **Library:**
+- **Documents** (called Library before 2026-11-01):
   - **Add documents…** (multiple files):
     - Only `.pdf`, `.md`, `.markdown`, `.txt`; anything else is refused naming the accepted
       types.
@@ -801,8 +803,10 @@ One page with four tabs, a File menu, a Settings panel, and first-load dialogs.
       password-protected, the byte offset and line of invalid UTF-8, empty, or no text and no
       scanned pages. Files over `max_file_mb` are refused too.
     - Accepted files are written atomically (hidden temp name, then rename). Name clashes
-      become `name (2).pdf`. The file reports its pages and any scanned pages, and indexing
-      starts (queued if a sync is running).
+      become `name (2).pdf`. The file reports its pages and any scanned pages.
+    - Indexing is left to the folder watcher, which sees the file arrive in `corpus/`:
+      several uploads in a row produce one sync (tested), and the upload starts no sync of its
+      own. It does start one only if the watcher isn't running.
   - **Rename** (any document still in `corpus/`):
     - Edits the name inline. The extension is shown as a fixed suffix, because changing the
       type would mean reindexing.
@@ -1006,7 +1010,7 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     exactly. They are merged per line. The viewer scrolls to the topmost one, because PDF
     text order puts footers first.
   - **Follow-up (same day): one instance, workspace picker, uploads, security review.**
-    - Single-instance lock; File menu; picker and creation flow; Library uploads with
+    - Single-instance lock; workspace menu; picker and creation flow; Library uploads with
       detailed parse errors (§4, §15); the security review above. 48 tests pass.
     - Bug found by the browser test: two connections opening a brand-new database raced to
       create the schema. The migration now takes SQLite's write lock (`BEGIN IMMEDIATE`) and
@@ -1054,7 +1058,7 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   - **Printed pages:** from the metadata's `page` range when the PDF has no page labels and
     its page count fits (one extra page allowed for a cover sheet). Article-number journals
     like Baicry's and Niemann's correctly get none.
-  - **Manual edits** (Library → metadata badge) are never overwritten by lookups.
+  - **Manual edits** (Documents → metadata badge) are never overwritten by lookups.
   - **Settings & email:** the first-load email dialog (validated, or Skip for the public pool)
     and a Settings dialog (email, default model, `num_ctx`, OCR mode). CLI:
     `localrag config get|set|unset`, `localrag metadata [--refresh]`; `index` looks up new
@@ -1065,7 +1069,7 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     - Lines are ordered and grouped into paragraphs by vertical gaps, cached per file hash
       (saved after each page, so a cancelled run resumes), and merged into the parse at index
       time.
-    - **Run OCR** and **Run OCR on all** in the Library, `ocr = "auto"` after syncs, Cancel,
+    - **Run OCR** and **Run OCR on all** in the Documents tab, `ocr = "auto"` after syncs, Cancel,
       progress in the status bar; CLI `localrag ocr`.
     - Citations from OCR text carry an **OCR** badge. Highlights on scanned pages come from
       Vision's line boxes, trimmed by character position (checked in the browser: the quote

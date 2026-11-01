@@ -47,7 +47,7 @@ document.querySelectorAll(".tabs button").forEach((b) =>
   b.addEventListener("click", () => {
     document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
     document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.id === `tab-${b.dataset.tab}`));
-    if (b.dataset.tab === "library") loadLibrary();
+    if (b.dataset.tab === "documents") loadDocuments();
     if (b.dataset.tab === "search") loadSearchDocs();
   }),
 );
@@ -59,12 +59,12 @@ async function refreshStatus() {
   try {
     const s = await api("/api/status");
     if (!s.workspace) {
-      $("#ws-name").textContent = "";
+      $("#ws-btn-name").textContent = "No workspace";
       $("#status").innerHTML = `<span class="dot bad"></span>No workspace open`;
       return;
     }
-    $("#ws-name").textContent = s.name || "";
-    document.title = s.name ? `localrag · ${s.name}` : "localrag";
+    $("#ws-btn-name").textContent = s.name || "Workspace";
+    document.title = s.name ? `localRAG · ${s.name}` : "localRAG";
     const docs = Object.values(s.documents || {}).reduce((a, b) => a + b, 0);
     let dot = "", text;
     if (!s.ollama.reachable) {
@@ -85,7 +85,7 @@ async function refreshStatus() {
     $("#status").innerHTML = `<span class="dot ${dot}"></span>${esc(text)}`;
     $("#status").title = s.workspace;
     $("#ocr-cancel").hidden = !(s.sync.running && s.sync.phase === "ocr");
-    if (syncWasRunning && !s.sync.running && $("#tab-library").classList.contains("active")) loadLibrary();
+    if (syncWasRunning && !s.sync.running && $("#tab-documents").classList.contains("active")) loadDocuments();
     syncWasRunning = s.sync.running;
     statusTimer = setTimeout(refreshStatus, s.sync.running ? 1500 : 8000);
   } catch (e) {
@@ -643,7 +643,7 @@ async function loadSearchDocs() {
 
 // ---------------------------------------------------------------- library
 
-async function loadLibrary() {
+async function loadDocuments() {
   const { documents } = await api("/api/documents");
   const counts = documents.reduce((m, d) => ((m[d.status] = (m[d.status] || 0) + 1), m), {});
   $("#library-summary").textContent = Object.entries(counts).map(([k, n]) => `${n} ${k.replace("_", " ")}`).join(" · ") || "No documents yet: add files to corpus/ and press Reindex.";
@@ -702,7 +702,7 @@ function startRename(d, cell) {
       if (r.citations_updated) notes.push(`${r.citations_updated} citation(s) in chat history updated`);
       if (r.eval_items_updated) notes.push(`${r.eval_items_updated} eval question(s) updated`);
       $("#upload-results").replaceChildren(el("li", { class: "ok" }, `Renamed ${file} → ${r.path.split("/").pop()}${notes.length ? ` · ${notes.join(", ")}` : ""}. Not reindexed.`));
-      loadLibrary();
+      loadDocuments();
     } catch (ex) {
       input.disabled = false;
       err.textContent = ex.message;
@@ -713,12 +713,12 @@ function startRename(d, cell) {
 async function forget(d) {
   if (!confirm(`Permanently forget “${d.label}”?\n\nIts record, passages and OCR cache are deleted. Old answers stay readable, but their citations to it will show as forgotten. This can't be undone.`)) return;
   try { await api(`/api/documents/${d.id}`, { method: "DELETE" }); } catch (e) { alert(e.message); }
-  loadLibrary();
+  loadDocuments();
 }
 $("#forget-all").addEventListener("click", async () => {
   if (!confirm("Permanently forget every removed document? This can't be undone.")) return;
   await api("/api/documents/forget-removed", { method: "POST" });
-  loadLibrary();
+  loadDocuments();
 });
 $("#reindex").addEventListener("click", async () => {
   const btn = $("#reindex");
@@ -728,26 +728,26 @@ $("#reindex").addEventListener("click", async () => {
   refreshStatus();
   await waitForSync(before);
   btn.disabled = false;
-  loadLibrary();
+  loadDocuments();
   refreshStatus();
 });
 
 // ---------------------------------------------------------------- workspaces
 
-const fileBtn = $("#file-btn");
-const fileMenu = $("#file-menu");
-fileBtn.addEventListener("click", async (e) => {
+const wsBtn = $("#ws-btn");
+const wsMenu = $("#ws-menu");
+wsBtn.addEventListener("click", async (e) => {
   e.stopPropagation();
-  const open = fileMenu.hidden;
+  const open = wsMenu.hidden;
   if (open) await fillRecent();
-  fileMenu.hidden = !open;
-  fileBtn.setAttribute("aria-expanded", String(open));
+  wsMenu.hidden = !open;
+  wsBtn.setAttribute("aria-expanded", String(open));
 });
 document.addEventListener("click", (e) => {
-  if (!fileMenu.hidden && !fileMenu.contains(e.target)) { fileMenu.hidden = true; fileBtn.setAttribute("aria-expanded", "false"); }
+  if (!wsMenu.hidden && !wsMenu.contains(e.target)) { wsMenu.hidden = true; wsBtn.setAttribute("aria-expanded", "false"); }
 });
-$("#menu-new").addEventListener("click", () => { fileMenu.hidden = true; showWorkspaceDialog("create"); });
-$("#menu-open").addEventListener("click", () => { fileMenu.hidden = true; showWorkspaceDialog("open"); });
+$("#menu-new").addEventListener("click", () => { wsMenu.hidden = true; showWorkspaceDialog("create"); });
+$("#menu-open").addEventListener("click", () => { wsMenu.hidden = true; showWorkspaceDialog("open"); });
 
 async function fillRecent() {
   const { active, known } = await api("/api/workspaces");
@@ -755,7 +755,7 @@ async function fillRecent() {
   $("#menu-recent").replaceChildren(...(recent.length ? recent.map((w) =>
     el("button", {
       role: "menuitem", class: active?.path === w.path ? "current" : "",
-      onclick: () => { fileMenu.hidden = true; if (active?.path !== w.path) switchWorkspace(w.path); },
+      onclick: () => { wsMenu.hidden = true; if (active?.path !== w.path) switchWorkspace(w.path); },
     }, el("span", { class: "name" }, w.name), el("span", { class: "path" }, w.path)),
   ) : [el("div", { class: "menu-label" }, "None yet")]));
 }
@@ -847,7 +847,8 @@ async function switchWorkspace(path, init = false) {
 function onWorkspaceActivated(active) {
   dialogRequired = false;
   $("#ws-dialog").hidden = true;
-  $("#ws-name").textContent = active?.name || "";
+  $("#ws-btn-name").textContent = active?.name || "No workspace";
+  document.title = active?.name ? `localRAG · ${active.name}` : "localRAG";
   closeViewer();
   viewer.doc = null; viewer.docId = null;
   $("#search-results").replaceChildren();
@@ -855,7 +856,7 @@ function onWorkspaceActivated(active) {
   newChat();
   loadModels();
   refreshStatus();
-  if ($("#tab-library").classList.contains("active")) loadLibrary();
+  if ($("#tab-documents").classList.contains("active")) loadDocuments();
   maybePromptEmail();
 }
 
@@ -894,7 +895,7 @@ $("#add-docs-input").addEventListener("change", async (e) => {
   }
   if (list.querySelector("li.ok")) await waitForSync(before);
   for (const row of list.querySelectorAll("li.ok")) row.textContent = row.textContent.replace(/ Indexing…$/, " Indexed.");
-  loadLibrary();
+  loadDocuments();
 });
 
 /// Small corpora sync in milliseconds, faster than the status poll notices: wait until a
@@ -917,7 +918,7 @@ async function runOcr(d) {
     refreshStatus();
     await waitForSync(before);
     $("#upload-results").replaceChildren(el("li", { class: "ok" }, `OCR finished for ${d.path}.`));
-    loadLibrary();
+    loadDocuments();
   } catch (e) {
     $("#upload-results").replaceChildren(el("li", { class: "err" }, e.message));
   }
@@ -927,7 +928,7 @@ $("#ocr-all").addEventListener("click", async () => {
   try { await api("/api/ocr/all", { method: "POST" }); } catch (e) { alert(e.message); return; }
   refreshStatus();
   await waitForSync(before);
-  loadLibrary();
+  loadDocuments();
 });
 $("#ocr-cancel").addEventListener("click", () => api("/api/ocr/cancel", { method: "POST" }));
 
@@ -1020,7 +1021,7 @@ function renderMetadata(m) {
     const who = (w.author || []).slice(0, 3).map((a) => a.family || a.literal).filter(Boolean).join(", ");
     return el("li", {},
       el("div", { class: "info" }, el("div", {}, w.title || "(untitled)"), el("div", { class: "score" }, `${who}${w.author?.length > 3 ? " et al." : ""} · ${w.year ?? "?"} · ${w["container-title"] || ""} · ${w.DOI} · ${Math.round(c.score * 100)}% match`)),
-      el("button", { class: "small primary", onclick: async () => { renderMetadata(await api(`/api/documents/${metaDoc.id}/metadata/resolve`, { method: "POST", body: JSON.stringify({ accept: i }) })); loadLibrary(); } }, "This one"));
+      el("button", { class: "small primary", onclick: async () => { renderMetadata(await api(`/api/documents/${metaDoc.id}/metadata/resolve`, { method: "POST", body: JSON.stringify({ accept: i }) })); loadDocuments(); } }, "This one"));
   }));
   $("#meta-title-input").value = csl.title || "";
   $("#meta-authors").value = (csl.author || []).map((a) => a.literal || [a.family, a.given].filter(Boolean).join(", ")).join("\n");
@@ -1031,7 +1032,7 @@ function renderMetadata(m) {
 }
 $("#meta-reject").addEventListener("click", async () => {
   renderMetadata(await api(`/api/documents/${metaDoc.id}/metadata/resolve`, { method: "POST", body: JSON.stringify({ accept: null }) }));
-  loadLibrary();
+  loadDocuments();
 });
 $("#meta-refresh").addEventListener("click", async () => {
   $("#meta-error").textContent = "Looking up…";
@@ -1039,7 +1040,7 @@ $("#meta-refresh").addEventListener("click", async () => {
     const r = await api(`/api/documents/${metaDoc.id}/metadata/refresh`, { method: "POST" });
     $("#meta-error").textContent = "";
     renderMetadata(r.metadata);
-    loadLibrary();
+    loadDocuments();
   } catch (e) { $("#meta-error").textContent = e.message; }
 });
 $("#meta-save").addEventListener("click", async () => {
@@ -1054,7 +1055,7 @@ $("#meta-save").addEventListener("click", async () => {
   };
   try {
     renderMetadata(await api(`/api/documents/${metaDoc.id}`.concat("/metadata"), { method: "PATCH", body: JSON.stringify(body) }));
-    loadLibrary();
+    loadDocuments();
   } catch (e) { $("#meta-error").textContent = e.message; }
 });
 

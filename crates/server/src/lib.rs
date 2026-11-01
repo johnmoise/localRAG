@@ -117,6 +117,11 @@ impl AppState {
         Workspace::open(&root)
     }
 
+    /// Whether the active workspace's corpus/ is being watched (changes sync on their own).
+    pub fn is_watching(&self) -> bool {
+        self.watcher.lock().expect("watcher").is_some()
+    }
+
     /// Makes `root` the one active workspace, remembers it, and syncs it.
     pub fn activate(&self, root: &Path) -> anyhow::Result<Workspace> {
         let ws = Workspace::open(root)?;

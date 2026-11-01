@@ -260,3 +260,39 @@ async fn files_dropped_into_corpus_trigger_a_sync() {
     std::fs::write(dir.path().join("corpus/new note.md"), "# Note\nDropped in from Finder.\n").unwrap();
     assert!(wait_runs(before + 1).await > before);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_are_indexed_by_one_watcher_sync() {
+    isolate_config();
+    let dir = tempfile::tempdir().unwrap();
+    Workspace::init(dir.path()).unwrap();
+    let s = AppState::new(None, PORT, TOKEN.into());
+    s.activate(dir.path()).unwrap();
+    assert!(s.is_watching());
+    let settle = || {
+        let s = s.clone();
+        async move {
+            for _ in 0..200 {
+                let st = s.sync.lock().unwrap().clone();
+                if !st.running {
+                    return st.runs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("sync never finished");
+        }
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let before = settle().await;
+    for name in ["a.md", "b.md", "c.md"] {
+        let r = authed("POST", &format!("/api/documents/upload?name={name}")).body(Body::from("# Note\nSome text.\n")).unwrap();
+        assert_eq!(send(&s, r).await.0, StatusCode::OK);
+    }
+    // The watcher settles after 1.5 s of quiet, then syncs once for all three files.
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    let after = settle().await;
+    assert_eq!(after, before + 1, "three uploads → exactly one sync (no extra sync from the upload itself)");
+    let ws = Workspace::open(dir.path()).unwrap();
+    let n: i64 = db::open(&ws.db_path()).unwrap().query_row("SELECT count(*) FROM documents", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 3);
+}

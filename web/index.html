@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>localrag</title>
+  <title>localRAG</title>
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/vendor/marked.min.js"></script>
   <script src="/assets/vendor/purify.min.js"></script>
@@ -11,10 +11,10 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">localrag</div>
+    <div class="brand">localRAG</div>
     <div class="menu">
-      <button id="file-btn" class="menu-btn" aria-haspopup="true" aria-expanded="false">File</button>
-      <div id="file-menu" class="menu-list" role="menu" hidden>
+      <button id="ws-btn" class="menu-btn ws-menu-btn" aria-haspopup="true" aria-expanded="false" title="Workspace menu"><span id="ws-btn-name">No workspace</span> <span class="caret">▾</span></button>
+      <div id="ws-menu" class="menu-list" role="menu" aria-label="Workspace menu" hidden>
         <button role="menuitem" id="menu-new">New workspace…</button>
         <button role="menuitem" id="menu-open">Open workspace…</button>
         <div class="menu-sep"></div>
@@ -22,11 +22,10 @@
         <div id="menu-recent"></div>
       </div>
     </div>
-    <span id="ws-name" class="ws-name"></span>
     <nav class="tabs" role="tablist">
-      <button role="tab" data-tab="ask" class="active">Ask</button>
       <button role="tab" data-tab="search">Search</button>
-      <button role="tab" data-tab="library">Library</button>
+      <button role="tab" data-tab="ask" class="active">Ask</button>
+      <button role="tab" data-tab="documents">Documents</button>
     </nav>
     <div id="status" class="status" title=""></div>
     <button id="settings-btn" class="icon settings-btn" aria-label="Settings" title="Settings">⚙︎</button>
@@ -69,7 +68,7 @@
       <ol id="search-results" class="results"></ol>
     </section>
 
-    <section id="tab-library" class="tab">
+    <section id="tab-documents" class="tab">
       <div class="toolbar">
         <button id="add-docs" class="primary small">Add documents…</button>
         <input id="add-docs-input" type="file" multiple accept=".pdf,.md,.markdown,.txt,application/pdf,text/markdown,text/plain" hidden>
@@ -130,7 +129,7 @@
   <div id="email-dialog" class="modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="email-title">
       <h2 id="email-title">Faster citation lookups</h2>
-      <p class="muted">localrag looks up authors, years and page numbers for your documents on <strong>Crossref</strong>. With an email address, Crossref puts the requests in its <em>polite pool</em> (up to 10 lookups a second instead of 5, and 3 title searches instead of 1). Crossref only uses it to contact you if your requests cause problems.</p>
+      <p class="muted">localRAG looks up authors, years and page numbers for your documents on <strong>Crossref</strong>. With an email address, Crossref puts the requests in its <em>polite pool</em> (up to 10 lookups a second instead of 5, and 3 title searches instead of 1). Crossref only uses it to contact you if your requests cause problems.</p>
       <p class="muted small-text">Stored on this Mac only (in <code>~/.config/localrag</code>, private to your user), never in a workspace, and sent only to Crossref. You can change it later in Settings.</p>
       <label class="field">Email <input id="email-input" type="email" placeholder="you@university.edu" autocomplete="email"></label>
       <div class="row end"><span id="email-error" class="error" role="alert"></span><button id="email-skip" class="small">Skip (use the public pool)</button><button id="email-save" class="primary">Save</button></div>
@@ -148,7 +147,7 @@
       <label class="field">Context size (num_ctx) for that model <input id="set-numctx" type="number" min="2048" max="262144" step="1024"></label>
       <label class="field">OCR for scanned pages
         <select id="set-ocr">
-          <option value="ask">Ask: a Run OCR button in the Library</option>
+          <option value="ask">Ask: a Run OCR button on the Documents tab</option>
           <option value="auto">Automatic: OCR after every sync</option>
           <option value="off">Off</option>
         </select>

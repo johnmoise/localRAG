@@ -71,7 +71,7 @@ pub fn process_pending(conn: &Connection, client: &Crossref, on: &mut dyn FnMut(
     Ok(report)
 }
 
-/// Re-queries Crossref for one document, bypassing the cache (Library → Refresh metadata).
+/// Re-queries Crossref for one document, bypassing the cache (Documents → Refresh metadata).
 pub fn refresh(conn: &Connection, client: &Crossref, doc_id: i64) -> anyhow::Result<MetadataEvent> {
     let doc: Pending = conn
         .query_row("SELECT id, path, kind, doi, csl_json FROM documents WHERE id = ?1", [doc_id], |r| {
@@ -125,7 +125,7 @@ fn lookup(conn: &Connection, client: &Crossref, doc: &Pending, refresh: bool) ->
                 .map(|(sc, w)| json!({ "score": sc, "work": w }))
                 .collect();
             set_status(conn, doc.id, "proposed", Some(&Value::Array(list).to_string()))?;
-            Ok(event("proposed", format!("possible match ({:.0}%); confirm it in the Library", s * 100.0)))
+            Ok(event("proposed", format!("possible match ({:.0}%); confirm it on the Documents tab", s * 100.0)))
         }
         _ => {
             set_status(conn, doc.id, "unmatched", None)?;
@@ -231,7 +231,7 @@ pub fn apply_match(conn: &Connection, doc_id: i64, work: &Work, source: &str) ->
     apply_page_offset(conn, doc_id)
 }
 
-/// The user's choice in the Library: accept candidate `index` of a proposed match, or reject.
+/// The user's choice on the Documents tab: accept candidate `index` of a proposed match, or reject.
 pub fn resolve_proposal(conn: &Connection, doc_id: i64, accept: Option<usize>) -> anyhow::Result<()> {
     let candidates: Option<String> = conn.query_row("SELECT metadata_candidates FROM documents WHERE id = ?1", [doc_id], |r| r.get(0))?;
     match accept {
@@ -245,7 +245,7 @@ pub fn resolve_proposal(conn: &Connection, doc_id: i64, accept: Option<usize>) -
     assign_labels(conn)
 }
 
-/// Manual metadata from the Library's edit form. Never overwritten by later lookups.
+/// Manual metadata from the Documents tab's edit form. Never overwritten by later lookups.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManualMetadata {
     pub title: Option<String>,
@@ -358,7 +358,7 @@ pub fn assign_labels(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What the Library shows about a document's metadata.
+/// What the Documents tab shows about a document's metadata.
 pub fn summary(conn: &Connection, doc_id: i64) -> anyhow::Result<Value> {
     type Row = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
     let row: Option<Row> = conn

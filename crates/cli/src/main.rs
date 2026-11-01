@@ -237,7 +237,7 @@ fn index_cmd(metadata: bool) -> anyhow::Result<()> {
         );
     }
     if report.needs_ocr > 0 {
-        println!("{} document(s) have scanned pages that need OCR: `localrag ocr` or Run OCR in the Library.", report.needs_ocr);
+        println!("{} document(s) have scanned pages that need OCR: `localrag ocr` or Run OCR on the Documents tab.", report.needs_ocr);
     }
     if metadata {
         lookup_metadata(&ws, &conn, false)?;
@@ -299,7 +299,7 @@ fn lookup_metadata(ws: &Workspace, conn: &rusqlite::Connection, refresh: bool) -
         let mark = match e.status.as_str() { "matched" => "✓", "proposed" => "?", _ => "·" };
         println!("{mark} {}  ({})", e.path, e.detail);
     })?;
-    println!("{} matched, {} need confirming (Library), {} without a match", r.matched, r.proposed, r.unmatched);
+    println!("{} matched, {} need confirming (Documents tab), {} without a match", r.matched, r.proposed, r.unmatched);
     for e in &r.errors {
         eprintln!("warning: {e} (will retry next time)");
     }

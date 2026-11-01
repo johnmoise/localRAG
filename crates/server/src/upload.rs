@@ -1,8 +1,8 @@
-//! Adding documents to the active workspace's corpus from the Library tab.
+//! Adding documents to the active workspace's corpus from the Documents tab.
 //!
 //! The file is parsed exactly as indexing will parse it *before* it's written to corpus/, so
 //! unsupported or broken files are refused with a specific reason instead of landing in the
-//! Library as `failed`.
+//! Documents tab as `failed`.
 
 use axum::Json;
 use axum::body::Bytes;
@@ -73,7 +73,12 @@ pub async fn upload(State(state): State<AppState>, Query(q): Query<UploadQuery>,
         };
         let target = unique_path(&corpus, &name);
         std::fs::rename(&tmp, &target).map_err(anyhow::Error::from)?;
-        state.start_sync();
+        // The rename into corpus/ is seen by the folder watcher, which syncs once the folder
+        // settles (several uploads in a row become one sync). Starting a sync here as well
+        // would index twice; only do it if the watcher isn't running.
+        if !state.is_watching() {
+            state.start_sync();
+        }
 
         let saved_as = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(name.clone());
         Ok(Json(json!({ "saved_as": saved_as, "renamed": saved_as != name, "check": check })))
