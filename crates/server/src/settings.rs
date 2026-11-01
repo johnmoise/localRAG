@@ -22,6 +22,7 @@ pub async fn get(State(state): State<AppState>) -> ApiResult {
             "crossref_email": g.crossref_email,
             "crossref_email_prompted": g.crossref_email_prompted,
             "pool": if g.crossref_email.is_some() { "polite" } else { "public" },
+            "cache_refresh_interval_days": g.cache_refresh_interval_days,
             "workspace": ws.as_ref().map(|w| json!({
                 "chat_model": w.config.chat_model,
                 "num_ctx": w.config.num_ctx,
@@ -41,6 +42,7 @@ pub struct Update {
     #[serde(default, deserialize_with = "some_or_null")]
     crossref_email: Option<Option<String>>,
     crossref_email_prompted: Option<bool>,
+    cache_refresh_interval_days: Option<u32>,
     chat_model: Option<String>,
     num_ctx: Option<BTreeMap<String, u32>>,
     ocr: Option<OcrMode>,
@@ -57,20 +59,23 @@ fn some_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<
 pub async fn put(State(state): State<AppState>, Json(u): Json<Update>) -> ApiResult {
     blocking(move || {
         let bad = |m: String| ApiError::new(StatusCode::BAD_REQUEST, "invalid", m);
-        if u.crossref_email.is_some() || u.crossref_email_prompted.is_some() {
+        if u.crossref_email.is_some() || u.crossref_email_prompted.is_some() || u.cache_refresh_interval_days.is_some() {
             let mut g = config::load_global()?;
+            if let Some(d) = u.cache_refresh_interval_days {
+                g.cache_refresh_interval_days = config::validate_cache_days(&d.to_string()).map_err(|e| bad(e.to_string()))?;
+            }
             if let Some(email) = u.crossref_email {
                 g.crossref_email = match email.as_deref().map(str::trim) {
                     None | Some("") => None,
                     Some(e) => Some(config::validate_email(e).map_err(|e| bad(e.to_string()))?),
                 };
                 g.crossref_email_prompted = true;
-                localrag_core::metadata::crossref::shared().set_email(g.crossref_email.as_deref());
             }
             if let Some(p) = u.crossref_email_prompted {
                 g.crossref_email_prompted = p;
             }
             config::save_global(&g)?;
+            localrag_core::metadata::crossref::configured(&g);
         }
         if u.chat_model.is_some() || u.num_ctx.is_some() || u.ocr.is_some() || u.think.is_some() || u.repair_quotes.is_some() || u.strict.is_some() {
             let mut ws = state.workspace()?;

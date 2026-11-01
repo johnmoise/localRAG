@@ -17,6 +17,9 @@ pub struct GlobalConfig {
     pub pdfium_lib: Option<PathBuf>,
     /// The UI asked for the Crossref email once (set or skipped); don't ask again.
     pub crossref_email_prompted: bool,
+    /// Cached Crossref responses younger than this many days are reused instead of asking
+    /// Crossref again (§7). 0 always asks.
+    pub cache_refresh_interval_days: u32,
 }
 
 impl Default for GlobalConfig {
@@ -26,6 +29,7 @@ impl Default for GlobalConfig {
             crossref_email: None,
             pdfium_lib: None,
             crossref_email_prompted: false,
+            cache_refresh_interval_days: crate::metadata::crossref::DEFAULT_REFRESH_DAYS,
         }
     }
 }
@@ -122,6 +126,16 @@ pub fn validate_email(s: &str) -> anyhow::Result<String> {
         anyhow::bail!("“{e}” doesn't look like an email address");
     }
     Ok(e.to_string())
+}
+
+/// Upper bound for `cache_refresh_interval_days` (ten years).
+pub const MAX_CACHE_REFRESH_DAYS: u32 = 3650;
+
+pub fn validate_cache_days(s: &str) -> anyhow::Result<u32> {
+    match s.trim().parse::<u32>() {
+        Ok(d) if d <= MAX_CACHE_REFRESH_DAYS => Ok(d),
+        _ => anyhow::bail!("cache_refresh_interval_days must be a whole number of days from 0 to {MAX_CACHE_REFRESH_DAYS}"),
+    }
 }
 
 /// `$LOCALRAG_CONFIG_DIR`, else `~/.config/localrag`.

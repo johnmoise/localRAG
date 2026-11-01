@@ -62,7 +62,8 @@ fn mock(behaviour: fn(&str, usize) -> Reply) -> (String, Arc<Mutex<Vec<Seen>>>) 
 fn work_json(doi: &str, title: &str) -> String {
     serde_json::json!({ "message": {
         "DOI": doi, "title": [title], "author": [{ "family": "Parry", "given": "Carla" }],
-        "issued": { "date-parts": [[2011, 10]] }, "container-title": ["Biomarkers &amp; Prevention"], "page": "1996-2005", "type": "journal-article", "is-referenced-by-count": 42
+        "issued": { "date-parts": [[2011, 10]] }, "container-title": ["Biomarkers &amp; Prevention"], "page": "1996-2005", "type": "journal-article", "is-referenced-by-count": 42,
+        "abstract": "<jats:title>Abstract</jats:title><jats:p>Survivors are a <jats:italic>growing</jats:italic> group.</jats:p><jats:p>Second &amp; last.</jats:p>"
     }})
     .to_string()
 }
@@ -144,7 +145,7 @@ fn references_are_enriched_by_doi_or_citation_search_else_kept_as_stubs() {
     let (base, _seen) = mock(|target, _| {
         if target.starts_with("/works/10.1000%2Fknown") {
             (200, vec![], work_json("10.1000/known", "A Known Work"))
-        } else if target.contains("query.bibliographic=Parry") {
+        } else if target.to_lowercase().contains("query.bibliographic=parry") {
             (200, vec![], serde_json::json!({ "message": { "items": [serde_json::from_str::<serde_json::Value>(&work_json("10.1158/x", "Cancer Survivors: A Booming Population")).unwrap()["message"]] } }).to_string())
         } else {
             (200, vec![], serde_json::json!({ "message": { "items": [] } }).to_string())
@@ -168,5 +169,86 @@ fn references_are_enriched_by_doi_or_citation_search_else_kept_as_stubs() {
     assert_eq!(rows[0].0, "matched");
     assert_eq!((rows[1].0.as_str(), rows[1].1.as_deref()), ("matched", Some("10.1158/x")));
     assert_eq!(rows[1].2, Some(42), "Crossref's is-referenced-by-count");
+    let abs: Option<String> = conn.query_row("SELECT abstract FROM doc_references WHERE ord = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(abs.as_deref(), Some("Survivors are a growing group.\n\nSecond & last."), "JATS turned into plain text");
     assert_eq!(rows[2].0, "stub");
+}
+
+/// Rewrites the timestamp of every cache entry to `days` days ago.
+fn age_cache(dir: &std::path::Path, days: u64) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        v["fetched_at"] = (now - days * 86_400).into();
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+}
+
+#[test]
+fn cached_responses_are_reused_until_the_refresh_interval_passes() {
+    let (base, seen) = mock(|_, _| (200, vec![], work_json("10.1/x", "T")));
+    let (c, cache) = client(&base);
+    c.set_refresh_interval(Duration::from_secs(14 * 86_400));
+    c.work("10.1/x", false).unwrap();
+    c.search("Parry Cancer survivors", 3, false).unwrap();
+    c.work("10.1/x", false).unwrap();
+    c.search("parry  cancer survivors", 3, false).unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 2, "the same request is answered from the cache");
+
+    // Each entry holds the request, a timestamp and the response.
+    let entry: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(std::fs::read_dir(cache.path()).unwrap().next().unwrap().unwrap().path()).unwrap()).unwrap();
+    assert!(entry["request"].as_str().unwrap().starts_with("GET /works"), "{entry}");
+    assert!(entry["fetched_at"].as_u64().unwrap() > 0);
+    assert!(entry["response"]["message"].is_object());
+    assert!(!entry.to_string().contains("mailto"), "the email isn't part of the key");
+
+    age_cache(cache.path(), 13);
+    c.work("10.1/x", false).unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 2, "13 days old: still fresh");
+    age_cache(cache.path(), 15);
+    c.work("10.1/x", false).unwrap();
+    c.work("10.1/x", false).unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 3, "15 days old: fetched again once, and the entry renewed");
+
+    c.set_refresh_interval(Duration::ZERO);
+    c.work("10.1/x", false).unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 4, "an interval of 0 always asks");
+}
+
+#[test]
+fn identical_concurrent_requests_reach_crossref_once() {
+    let (base, seen) = mock(|_, _| {
+        std::thread::sleep(Duration::from_millis(300));
+        (200, vec![], work_json("10.1/same", "T"))
+    });
+    let (c, _cache) = client(&base);
+    let c = Arc::new(c);
+    let threads: Vec<_> = (0..4).map(|_| { let c = c.clone(); std::thread::spawn(move || c.work("10.1/same", false).unwrap().unwrap()) }).collect();
+    for t in threads {
+        assert_eq!(t.join().unwrap().doi, "10.1/same");
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn expired_entries_are_used_when_crossref_is_down_and_old_cache_files_still_count() {
+    let (base, seen) = mock(|_, n| if n == 1 { (200, vec![], work_json("10.1/x", "T")) } else { (503, vec![], "{}".into()) });
+    let (c, cache) = client(&base);
+    c.work("10.1/x", false).unwrap();
+    age_cache(cache.path(), 30);
+    let w = c.work("10.1/x", false).unwrap();
+    assert!(w.is_some(), "Crossref failing: the expired response is better than nothing");
+    assert!(seen.lock().unwrap().len() > 1, "it did try Crossref first");
+
+    // A cache file from before entries had timestamps: the bare response under the old key.
+    let (base2, seen2) = mock(|_, _| (200, vec![], work_json("10.2/old", "T")));
+    let (c2, cache2) = client(&base2);
+    let old_name = format!("{}.json", &localrag_core::scan::sha256_str("doi:10.2/old")[..32]);
+    std::fs::write(cache2.path().join(&old_name), work_json("10.2/old", "Cached long ago")).unwrap();
+    assert_eq!(c2.work("10.2/old", false).unwrap().unwrap().title.as_deref(), Some("Cached long ago"));
+    assert_eq!(seen2.lock().unwrap().len(), 0, "answered from the old cache file");
+    assert!(!cache2.path().join(&old_name).exists(), "rewritten in the current format");
+    c2.work("10.2/old", false).unwrap();
+    assert_eq!(seen2.lock().unwrap().len(), 0);
 }

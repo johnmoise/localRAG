@@ -150,6 +150,8 @@
       <h3>Crossref</h3>
       <label class="field">Email for the polite pool <input id="set-email" type="email" placeholder="Not set: public pool"></label>
       <p id="set-pool" class="muted small-text"></p>
+      <label class="field">Reuse cached Crossref responses for (days) <input id="set-cache-days" type="number" min="0" max="3650" step="1"></label>
+      <p class="muted small-text">Lookups already answered within this many days are read from the cache on this Mac instead of asking Crossref again. 0 always asks.</p>
       <h3>This workspace</h3>
       <label class="field">Default chat model <select id="set-model"></select></label>
       <label class="field">Context size (num_ctx) for that model <input id="set-numctx" type="number" min="2048" max="262144" step="1024"></label>

@@ -248,7 +248,7 @@ fn search_filters_by_document_and_year() {
     let only = SearchOptions { filter: Filter { doc_ids: Some(vec![birds]), ..Filter::default() }, ..SearchOptions::default() };
     assert_eq!(docs(&retrieval::search(&f.conn, &WordEmbedder, q, &only).unwrap()), ["birds.txt".to_string()].into());
 
-    let work = Work { doi: "10.1/b".into(), title: Some("Terns".into()), year: Some(2015), author: vec![Author { family: Some("Avis".into()), given: None, literal: None }], container: None, page: None, kind: None, cited_by: None };
+    let work = Work { doi: "10.1/b".into(), title: Some("Terns".into()), year: Some(2015), author: vec![Author { family: Some("Avis".into()), given: None, literal: None }], container: None, page: None, kind: None, cited_by: None, abstract_text: None };
     metadata::apply_match(&f.conn, birds, &work, "crossref_doi").unwrap();
     let years = |from, to| SearchOptions { filter: Filter { year_from: from, year_to: to, ..Filter::default() }, ..SearchOptions::default() };
     assert_eq!(docs(&retrieval::search(&f.conn, &WordEmbedder, q, &years(Some(2010), Some(2020))).unwrap()), ["birds.txt".to_string()].into());
@@ -322,4 +322,59 @@ fn suggested_references_come_only_from_the_bibliography_list() {
     assert_eq!(a.suggested_references[0].reference.label, "Egevang 2010");
     assert_eq!(a.suggested_references[0].reference.cited_in, ["birds"]);
     assert_eq!(a.suggestions, ["arctic tern migration routes"]);
+}
+
+#[test]
+fn suggested_references_are_ranked_by_their_embedded_citation_and_abstract() {
+    let f = Fixture::new();
+    let birds = index::find_document(&f.conn, "birds.txt").unwrap().unwrap();
+    // Neither title shares a word with the question; only the first abstract is about it.
+    f.conn.execute_batch(&format!(
+        "UPDATE documents SET reference_count = 3 WHERE id = {birds};
+         INSERT INTO doc_references (doc_id, ord, raw, title, year, status, csl_json, abstract) VALUES
+           ({birds}, 0, 'Egevang C. Seabird tracking with geolocators. PNAS. 2010.', 'Seabird tracking with geolocators', 2010, 'matched',
+            '{{\"title\":\"Seabird tracking with geolocators\",\"author\":[{{\"family\":\"Egevang\",\"given\":\"Carsten\"}}],\"issued\":{{\"date-parts\":[[2010]]}},\"container-title\":\"PNAS\"}}',
+            'Arctic terns migrate farther each year than any other animal: about 70,000 km.'),
+           ({birds}, 1, 'Other A. Soil chemistry of fields. Soil J. 2001.', 'Soil chemistry of fields', 2001, 'stub', NULL, NULL),
+           ({birds}, 2, 'Egevang C. Seabird tracking with geolocators. PNAS. 2010.', 'Seabird tracking with geolocators', 2010, 'matched',
+            '{{\"title\":\"Seabird tracking with geolocators\",\"author\":[{{\"family\":\"Egevang\",\"given\":\"Carsten\"}}],\"issued\":{{\"date-parts\":[[2010]]}},\"container-title\":\"PNAS\"}}',
+            'Arctic terns migrate farther each year than any other animal: about 70,000 km.');"
+    )).unwrap();
+    let r = localrag_core::references::embed_pending(&f.conn, &WordEmbedder).unwrap();
+    assert_eq!((r.embedded, r.reused), (2, 1), "the same work cited twice is embedded once");
+    assert_eq!(localrag_core::references::embed_pending(&f.conn, &WordEmbedder).unwrap().embedded, 0, "nothing changed, nothing re-embedded");
+
+    let found = localrag_core::references::missing_for_question(&f.conn, Some(&WordEmbedder), "How far do Arctic terns migrate each year?", 15).unwrap();
+    assert_eq!(found.len(), 1, "the soil reference is below the similarity floor: {found:?}");
+    assert_eq!(found[0].label, "Egevang 2010");
+    assert!(found[0].similarity.unwrap() >= localrag_core::references::MIN_REFERENCE_SIMILARITY);
+    assert!(found[0].abstract_text.as_deref().unwrap().contains("70,000"));
+    // Without embeddings the title-only fallback finds nothing: it was the abstract that matched.
+    assert!(localrag_core::references::missing_for_question(&f.conn, None, "How far do Arctic terns migrate each year?", 15).unwrap().is_empty());
+
+    struct Picky;
+    impl Llm for Picky {
+        fn chat(&self, req: &ChatRequest, on: &mut dyn FnMut(Delta)) -> anyhow::Result<ChatResponse> {
+            let content = if req.messages[0].content.contains("NOT in the collection") {
+                assert!(req.messages[1].content.contains("R1 Egevang 2010"), "{}", req.messages[1].content);
+                assert!(req.messages[1].content.contains("Abstract: Arctic terns migrate"), "{}", req.messages[1].content);
+                r#"{"references":[{"id":"R1","reason":"measures tern migration"},{"id":"R2","reason":"not in the list"}],"topics":[]}"#.to_string()
+            } else {
+                "INSUFFICIENT: the sources don't cover migration distances.".to_string()
+            };
+            on(Delta::Content(&content));
+            Ok(ChatResponse { content, ..ChatResponse::default() })
+        }
+        fn model_info(&self, model: &str) -> anyhow::Result<ModelInfo> {
+            Ok(ModelInfo { name: model.into(), capabilities: vec!["completion".into()], ..ModelInfo::default() })
+        }
+    }
+    let a = f.engine(&Picky).ask("How far do Arctic terns migrate each year?", "m", 16_384, &[], &mut |_| {}).unwrap();
+    assert_eq!(a.suggested_references.len(), 1, "R2 isn't in the list of one");
+    assert_eq!(a.suggested_references[0].reference.cited_in, ["birds"]);
+
+    // Re-parsing the document replaces its references; their vectors go with them.
+    localrag_core::references::store(&f.conn, birds, None).unwrap();
+    let left: i64 = f.conn.query_row("SELECT count(*) FROM reference_vec", [], |r| r.get(0)).unwrap();
+    assert_eq!(left, 0);
 }

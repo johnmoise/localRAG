@@ -195,8 +195,7 @@ impl AppState {
                 })?;
                 // Then citation metadata for new documents (network; never fails the sync).
                 set_phase("metadata");
-                let client = localrag_core::metadata::crossref::shared();
-                client.set_email(ws.global.crossref_email.as_deref());
+                let client = localrag_core::metadata::crossref::configured(&ws.global);
                 let meta = localrag_core::metadata::process_pending(&conn, client, &mut |e| {
                     let mut s = state.sync.lock().expect("sync state");
                     if s.root.as_ref() == Some(&root) {
@@ -220,6 +219,21 @@ impl AppState {
                 if refs.is_err() {
                     localrag_core::references::link(&conn)?;
                 }
+                // Abstracts for references matched before they were kept, then one embedded
+                // chunk per reference (for suggesting additions; never an answer source).
+                let _ = localrag_core::references::backfill_details(&conn, client, &mut |done, total| {
+                    let mut s = state.sync.lock().expect("sync state");
+                    if s.root.as_ref() == Some(&root) {
+                        s.current = Some(format!("abstracts: {done} of {total} references"));
+                    }
+                });
+                {
+                    let mut s = state.sync.lock().expect("sync state");
+                    if s.root.as_ref() == Some(&root) {
+                        s.current = Some("embedding references".into());
+                    }
+                }
+                localrag_core::references::embed_pending(&conn, &embedder)?;
                 // OCR runs on its own only when the workspace asks for it (ocr = "auto").
                 if ws.config.ocr == localrag_core::config::OcrMode::Auto {
                     let waiting: Vec<i64> = index::needing_ocr(&conn)?.into_iter().map(|d| d.0).collect();

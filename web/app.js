@@ -241,7 +241,8 @@ function answerBlock({ placeholderMd, text, citations, supported, notFound, sour
       el("ul", { class: "sugg-refs" }, suggestedRefs.map((r) => el("li", {},
         el("strong", {}, r.label), r.title ? ` — ${r.title}` : ` — ${r.raw}`, r.container ? el("span", { class: "muted" }, ` (${r.container})`) : null,
         r.doi ? el("span", {}, " · ", el("a", { href: `https://doi.org/${encodeURIComponent(r.doi).replace(/%2F/g, "/")}`, target: "_blank", rel: "noopener noreferrer" }, "DOI")) : null,
-        el("div", { class: "why" }, `${r.reason}${r.reason ? " · " : ""}cited by ${r.cited_in.join(", ")}`))))));
+        el("div", { class: "why" }, `${r.reason}${r.reason ? " · " : ""}cited by ${r.cited_in.join(", ")}`),
+        r.abstract ? el("details", { class: "abstract" }, el("summary", {}, "Abstract"), el("p", {}, r.abstract)) : null)))));
   }
   if (suggestions?.length) {
     wrap.append(el("div", { class: "suggestions" },
@@ -1035,6 +1036,7 @@ async function openSettings() {
   const s = await api("/api/settings");
   $("#settings-error").textContent = "";
   $("#set-email").value = s.crossref_email || "";
+  $("#set-cache-days").value = s.cache_refresh_interval_days ?? 14;
   $("#set-pool").textContent = s.crossref_email
     ? "Polite pool: up to 10 DOI lookups and 3 title searches per second. Clear the field to stop sending it."
     : "Public pool: 5 DOI lookups and 1 title search per second. Stored only on this Mac and sent only to Crossref.";
@@ -1056,6 +1058,12 @@ async function openSettings() {
 }
 $("#settings-save").addEventListener("click", async () => {
   const body = { crossref_email: $("#set-email").value };
+  const days = Number($("#set-cache-days").value);
+  if (!Number.isInteger(days) || days < 0 || days > 3650) {
+    $("#settings-error").textContent = "Cache days must be a whole number from 0 to 3650.";
+    return;
+  }
+  body.cache_refresh_interval_days = days;
   if (!$("#set-model").disabled) {
     body.chat_model = $("#set-model").value;
     body.ocr = $("#set-ocr").value;

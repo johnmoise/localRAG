@@ -1,9 +1,10 @@
-//! References from each document's bibliography (docs/ARCHITECTURE.md §5, §7): stored per
+//! References from each document's bibliography (docs/ARCHITECTURE.md §7.1): stored per
 //! document, enriched from Crossref (DOI lookup, else a bibliographic search on the citation
-//! string), kept as stubs when Crossref has nothing, and linked to the corpus document they
-//! refer to when it's in `corpus/`.
+//! string) including the abstract, kept as stubs when Crossref has nothing, linked to the
+//! corpus document they refer to when it's in `corpus/`, and each embedded as its own chunk
+//! (in `reference_vec`, apart from the corpus chunks) for suggesting additions.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -11,7 +12,9 @@ use serde_json::{Value, json};
 
 use crate::bibliography::Bibliography;
 use crate::db;
+use crate::embed::Embedder;
 use crate::metadata::crossref::{Crossref, Work};
+use crate::scan::sha256_str;
 
 /// Replaces a document's references with those of its (re)parsed bibliography.
 /// `None` means no bibliography was found: `reference_count` becomes NULL ("N/A").
@@ -70,11 +73,7 @@ pub fn enrich_pending(conn: &Connection, client: &Crossref, progress: &mut dyn F
         })();
         match found {
             Ok(Some(w)) => {
-                conn.execute(
-                    "UPDATE doc_references SET status = 'matched', csl_json = ?2, doi = ?3, title = COALESCE(?4, title), year = COALESCE(?5, year),
-                       cited_by = ?6, checked_at = ?7 WHERE id = ?1",
-                    params![id, w.to_csl().to_string(), w.doi, w.title, w.year, w.cited_by, db::now_rfc3339()],
-                )?;
+                save_work(conn, id, &w)?;
                 report.matched += 1;
             }
             Ok(None) => {
@@ -89,6 +88,144 @@ pub fn enrich_pending(conn: &Connection, client: &Crossref, progress: &mut dyn F
     }
     progress(total, total);
     link(conn)?;
+    Ok(report)
+}
+
+/// What a matched reference's stored Crossref data includes: 1 = abstract, 2 = titles
+/// without markup. Older rows are re-read (from the cache) by `backfill_details`.
+pub const DETAILS_VERSION: i64 = 2;
+
+fn save_work(conn: &Connection, id: i64, w: &Work) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE doc_references SET status = 'matched', csl_json = ?2, doi = ?3, title = COALESCE(?4, title), year = COALESCE(?5, year),
+           cited_by = ?6, abstract = ?7, details_version = ?9, checked_at = ?8 WHERE id = ?1",
+        params![id, w.to_csl().to_string(), w.doi, w.title, w.year, w.cited_by, w.abstract_text, db::now_rfc3339(), DETAILS_VERSION],
+    )?;
+    Ok(())
+}
+
+/// Re-reads the full record (with abstract) for references matched before the current
+/// `DETAILS_VERSION`. DOI lookups are usually answered from the cache. Stops at the first network error.
+pub fn backfill_details(conn: &Connection, client: &Crossref, progress: &mut dyn FnMut(usize, usize)) -> anyhow::Result<usize> {
+    let todo: Vec<(i64, String)> = conn
+        .prepare("SELECT id, doi FROM doc_references WHERE status = 'matched' AND details_version < ?1 AND doi IS NOT NULL")?
+        .query_map([DETAILS_VERSION], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let total = todo.len();
+    for (i, (id, doi)) in todo.into_iter().enumerate() {
+        progress(i, total);
+        match client.work(&doi, false)? {
+            Some(w) => save_work(conn, id, &w)?,
+            None => {
+                conn.execute("UPDATE doc_references SET details_version = ?2 WHERE id = ?1", [id, DETAILS_VERSION])?;
+            }
+        }
+    }
+    progress(total, total);
+    Ok(total)
+}
+
+/// The text a reference is embedded as: its enriched citation (title, authors, year, venue)
+/// and abstract, or for a stub the citation string itself.
+pub fn chunk_text(title: Option<&str>, raw: &str, csl: Option<&str>, abstract_text: Option<&str>) -> String {
+    const MAX_CHARS: usize = 6000;
+    let v = csl.and_then(|c| serde_json::from_str::<Value>(c).ok());
+    let mut out = match (&v, title) {
+        (Some(v), Some(t)) => {
+            let authors: Vec<String> = v["author"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(6)
+                .filter_map(|a| match (a["given"].as_str(), a["family"].as_str(), a["literal"].as_str()) {
+                    (Some(g), Some(f), _) => Some(format!("{g} {f}")),
+                    (None, Some(f), _) => Some(f.to_string()),
+                    (_, _, Some(l)) => Some(l.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let year = v["issued"]["date-parts"][0][0].as_i64().map(|y| format!(" ({y})")).unwrap_or_default();
+            let venue = v["container-title"].as_str().map(|c| format!(" {c}.")).unwrap_or_default();
+            format!("{t}\n{}{year}.{venue}", authors.join(", "))
+        }
+        _ => raw.to_string(),
+    };
+    if let Some(a) = abstract_text.filter(|a| !a.trim().is_empty()) {
+        out.push_str("\n\n");
+        out.push_str(a.trim());
+    }
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect();
+    }
+    out
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EmbedReport {
+    pub embedded: usize,
+    pub reused: usize,
+}
+
+/// Embeds every looked-up reference whose chunk text changed since it was last embedded
+/// (new, enriched, or re-parsed). Identical texts (the same work cited by several documents)
+/// are embedded once.
+pub fn embed_pending(conn: &Connection, embedder: &dyn Embedder) -> anyhow::Result<EmbedReport> {
+    let rows: Vec<ChunkRow> = conn
+        .prepare(
+            "SELECT r.id, r.title, r.raw, r.csl_json, r.abstract, r.embed_text_sha FROM doc_references r JOIN documents d ON d.id = r.doc_id
+             WHERE r.status IN ('matched', 'stub') AND d.status IN ('indexed', 'needs_ocr')",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut todo: Vec<(i64, String, String)> = Vec::new();
+    for (id, title, raw, csl, abs, done) in rows {
+        let status_title = if csl.is_some() { title.as_deref() } else { None };
+        let text = chunk_text(status_title, &raw, csl.as_deref(), abs.as_deref());
+        let sha = sha256_str(&text);
+        if done.as_deref() != Some(sha.as_str()) {
+            todo.push((id, text, sha));
+        }
+    }
+    let mut report = EmbedReport::default();
+    if todo.is_empty() {
+        return Ok(report);
+    }
+    // Vectors already stored for the same text (another document citing the same work).
+    let mut known: HashMap<String, Vec<u8>> = HashMap::new();
+    if db::has_table(conn, "reference_vec")? {
+        let mut q = conn.prepare("SELECT v.embedding FROM doc_references r JOIN reference_vec v ON v.rowid = r.id WHERE r.embed_text_sha = ?1 LIMIT 1")?;
+        for (_, _, sha) in &todo {
+            if !known.contains_key(sha)
+                && let Some(b) = q.query_row([sha], |r| r.get::<_, Vec<u8>>(0)).optional()?
+            {
+                known.insert(sha.clone(), b);
+            }
+        }
+    }
+    let mut texts: Vec<String> = Vec::new();
+    let mut shas: Vec<String> = Vec::new();
+    for (_, text, sha) in &todo {
+        if !known.contains_key(sha) && !shas.contains(sha) {
+            shas.push(sha.clone());
+            texts.push(text.clone());
+        }
+    }
+    if !texts.is_empty() {
+        let vectors = embedder.embed_documents(&texts)?;
+        db::ensure_reference_vec(conn, vectors[0].len())?;
+        for (sha, v) in shas.iter().zip(&vectors) {
+            known.insert(sha.clone(), db::vec_to_blob(v));
+        }
+        report.embedded = texts.len();
+    }
+    let tx = conn.unchecked_transaction()?;
+    for (id, _, sha) in &todo {
+        tx.execute("DELETE FROM reference_vec WHERE rowid = ?1", [id])?;
+        tx.execute("INSERT INTO reference_vec(rowid, embedding) VALUES (?1, ?2)", params![id, known[sha]])?;
+        tx.execute("UPDATE doc_references SET embed_text_sha = ?2 WHERE id = ?1", params![id, sha])?;
+    }
+    tx.commit()?;
+    report.reused = todo.len() - report.embedded.min(todo.len());
     Ok(report)
 }
 
@@ -124,10 +261,12 @@ pub fn guess_title(raw: &str) -> Option<String> {
 
 /// (id, doi, title, year) of a corpus document.
 type DocKey = (i64, Option<String>, Option<String>, Option<i64>);
+/// (id, title, raw, csl, abstract, embedded text sha) of a reference to embed.
+type ChunkRow = (i64, Option<String>, String, Option<String>, Option<String>, Option<String>);
 /// (id, citing doc, doi, title, year, raw) of a reference.
 type RefKey = (i64, i64, Option<String>, Option<String>, Option<i64>, String);
-/// (doi, title, year, raw, csl, cited_by, citing label) of a reference not in corpus/.
-type MissingRow = (Option<String>, Option<String>, Option<i64>, String, Option<String>, Option<i64>, Option<String>);
+/// (id, doi, title, year, raw, csl, cited_by, abstract, citing label) of a reference not in corpus/.
+type MissingRow = (i64, Option<String>, Option<String>, Option<i64>, String, Option<String>, Option<i64>, Option<String>, Option<String>);
 
 /// Sets `in_corpus_doc_id` for every reference: the corpus document with the same DOI, or
 /// with (nearly) the same title and year. Run after syncs and metadata changes.
@@ -255,38 +394,68 @@ pub struct MissingReference {
     pub cited_by: Option<i64>,
     /// The citation string (for stubs, the only information there is).
     pub raw: String,
+    /// From Crossref, when the publisher deposited one.
+    #[serde(default, rename = "abstract")]
+    pub abstract_text: Option<String>,
+    /// Cosine similarity of its embedded reference chunk to the question (None: ranked by
+    /// shared words because no reference embeddings exist yet).
+    #[serde(default)]
+    pub similarity: Option<f32>,
 }
 
 /// The same, as stored with an answer.
 pub type MissingReferenceOwned = MissingReference;
 
-/// References not in corpus/ whose title (or citation) shares words with `question`, best
-/// first. Deduplicated across citing documents (by DOI, else normalized title or citation).
-/// Ranking is lexical: the bibliography is deliberately never embedded.
-pub fn missing_for_question(conn: &Connection, question: &str, n: usize) -> anyhow::Result<Vec<MissingReference>> {
-    let stop: HashSet<&str> = ["what", "which", "how", "does", "the", "and", "for", "are", "with", "from", "that", "this", "into", "between", "about", "there", "their", "were", "was", "many", "much", "after", "before"].into_iter().collect();
-    let q: Vec<String> = tokens(question).into_iter().filter(|w| w.chars().count() > 3 && !stop.contains(w.as_str())).collect();
-    if q.is_empty() {
-        return Ok(Vec::new());
+/// Reference chunks less similar to the question than this aren't offered to the model.
+pub const MIN_REFERENCE_SIMILARITY: f32 = 0.35;
+
+/// References not in corpus/ that are closest to `question`, best first, deduplicated across
+/// citing documents (by DOI, else normalized title or citation). Ranked by the similarity of
+/// each reference's embedded chunk (citation + abstract) to the question; when nothing is
+/// embedded yet (or no embedder is given), by words shared with the title and venue.
+pub fn missing_for_question(conn: &Connection, embedder: Option<&dyn Embedder>, question: &str, n: usize) -> anyhow::Result<Vec<MissingReference>> {
+    let has_vectors = db::has_table(conn, "reference_vec")? && conn.query_row("SELECT count(*) FROM reference_vec", [], |r| r.get::<_, i64>(0))? > 0;
+    let scores: HashMap<i64, f32> = match embedder {
+        Some(e) if has_vectors => {
+            let q = e.embed_query(question)?;
+            conn.prepare("SELECT rowid, distance FROM reference_vec WHERE embedding MATCH ?1 AND k = 400")?
+                .query_map([db::vec_to_blob(&q)], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?
+                .map(|r| r.map(|(id, d)| (id, (1.0 - d * d / 2.0) as f32)))
+                .filter(|r| r.as_ref().map_or(true, |(_, s)| *s >= MIN_REFERENCE_SIMILARITY))
+                .collect::<Result<_, _>>()?
+        }
+        _ => return missing_lexical(conn, question, n),
+    };
+    let mut ranked: Vec<(MissingReference, f32)> = group(load_missing(conn)?.into_iter().filter_map(|row| scores.get(&row.0).map(|s| (row, *s))));
+    for (r, s) in &mut ranked {
+        r.similarity = Some(*s);
     }
-    let rows: Vec<MissingRow> = conn
+    // Closest first; works cited by more corpus documents break ties.
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cited_in.len().cmp(&a.0.cited_in.len())));
+    Ok(ranked.into_iter().take(n).map(|(r, _)| r).collect())
+}
+
+fn load_missing(conn: &Connection) -> anyhow::Result<Vec<MissingRow>> {
+    Ok(conn
         .prepare(
-            "SELECT lower(r.doi), r.title, r.year, r.raw, r.csl_json, r.cited_by, d.cite_label
+            "SELECT r.id, lower(r.doi), r.title, r.year, r.raw, r.csl_json, r.cited_by, r.abstract, d.cite_label
              FROM doc_references r JOIN documents d ON d.id = r.doc_id
              WHERE r.in_corpus_doc_id IS NULL AND d.status IN ('indexed', 'needs_ocr')",
         )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
-        .collect::<Result<_, _>>()?;
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?
+        .collect::<Result<_, _>>()?)
+}
+
+fn container_of(csl: Option<&str>) -> Option<String> {
+    csl.and_then(|c| serde_json::from_str::<Value>(c).ok()).and_then(|v| v["container-title"].as_str().map(str::to_string))
+}
+
+/// One entry per work (by DOI, else normalized title or citation), keeping its best score and
+/// every corpus document that cites it.
+fn group(rows: impl Iterator<Item = (MissingRow, f32)>) -> Vec<(MissingReference, f32)> {
     let mut groups: BTreeMap<String, (MissingReference, f32)> = BTreeMap::new();
-    for (doi, title, year, raw, csl, cited_by, citing) in rows {
+    for ((_, doi, title, year, raw, csl, cited_by, abstract_text, citing), score) in rows {
         let key = doi.clone().or_else(|| title.as_deref().map(normalized)).unwrap_or_else(|| normalized(&raw));
-        let container = csl.as_deref().and_then(|c| serde_json::from_str::<Value>(c).ok()).and_then(|v| v["container-title"].as_str().map(str::to_string));
-        let text = format!("{} {}", title.clone().unwrap_or_else(|| raw.clone()), container.clone().unwrap_or_default()).to_lowercase();
-        let hits = q.iter().filter(|w| text.contains(w.as_str())).count();
-        if hits == 0 {
-            continue;
-        }
-        let score = hits as f32 / q.len() as f32;
         let entry = groups.entry(key).or_insert_with(|| {
             (
                 MissingReference {
@@ -294,22 +463,39 @@ pub fn missing_for_question(conn: &Connection, question: &str, n: usize) -> anyh
                     title: title.clone(),
                     year,
                     doi: doi.clone(),
-                    container: container.clone(),
+                    container: container_of(csl.as_deref()),
                     cited_in: Vec::new(),
                     cited_by,
                     raw: raw.clone(),
+                    abstract_text: abstract_text.clone(),
+                    similarity: None,
                 },
                 score,
             )
         });
+        entry.1 = entry.1.max(score);
         if let Some(c) = citing
             && !entry.0.cited_in.contains(&c)
         {
             entry.0.cited_in.push(c);
         }
     }
-    let mut all: Vec<(MissingReference, f32)> = groups.into_values().collect();
-    // Relevance first; works cited by more corpus documents break ties.
+    groups.into_values().collect()
+}
+
+/// The fallback ranking: share of the question's content words found in title and venue.
+fn missing_lexical(conn: &Connection, question: &str, n: usize) -> anyhow::Result<Vec<MissingReference>> {
+    let stop: HashSet<&str> = ["what", "which", "how", "does", "the", "and", "for", "are", "with", "from", "that", "this", "into", "between", "about", "there", "their", "were", "was", "many", "much", "after", "before"].into_iter().collect();
+    let q: Vec<String> = tokens(question).into_iter().filter(|w| w.chars().count() > 3 && !stop.contains(w.as_str())).collect();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scored = load_missing(conn)?.into_iter().filter_map(|row| {
+        let text = format!("{} {}", row.2.clone().unwrap_or_else(|| row.4.clone()), container_of(row.5.as_deref()).unwrap_or_default()).to_lowercase();
+        let hits = q.iter().filter(|w| text.contains(w.as_str())).count();
+        (hits > 0).then(|| (row, hits as f32 / q.len() as f32))
+    });
+    let mut all = group(scored);
     all.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cited_in.len().cmp(&a.0.cited_in.len())));
     Ok(all.into_iter().take(n).map(|(r, _)| r).collect())
 }

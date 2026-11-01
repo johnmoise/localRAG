@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -80,6 +80,9 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 5 {
             conn.execute_batch(SCHEMA_V5).context("migrating to schema v5")?;
+        }
+        if version < 6 {
+            conn.execute_batch(SCHEMA_V6).context("migrating to schema v6")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -167,8 +170,8 @@ ALTER TABLE messages ADD COLUMN extra_json TEXT;
 ";
 
 /// Bibliographies (§5): each document's references, enriched from Crossref or kept as stubs,
-/// and linked to the corpus document they refer to when it's in `corpus/`. Never chunked or
-/// embedded. `reference_count` is NULL when no bibliography was found.
+/// and linked to the corpus document they refer to when it's in `corpus/`. Not part of the
+/// document's chunks (v6 embeds each reference separately). `reference_count` is NULL when no bibliography was found.
 const SCHEMA_V5: &str = "
 CREATE TABLE doc_references (
   id INTEGER PRIMARY KEY,
@@ -190,6 +193,33 @@ ALTER TABLE documents ADD COLUMN reference_count INTEGER;
 ALTER TABLE documents ADD COLUMN cited_by INTEGER;
 ";
 
+/// Reference abstracts and embeddings (§7.1). Each reference's enriched citation (title,
+/// authors, venue, abstract) is embedded as its own chunk in `reference_vec` (created with
+/// the embedding dimension, rowid = doc_references.id), kept apart from `chunks_vec` so
+/// references are never answer sources, only candidates for suggested additions.
+/// `details_version`: see `references::DETAILS_VERSION`; `embed_text_sha` = what was embedded.
+const SCHEMA_V6: &str = "
+ALTER TABLE doc_references ADD COLUMN abstract TEXT;
+ALTER TABLE doc_references ADD COLUMN details_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE doc_references ADD COLUMN embed_text_sha TEXT;
+";
+
+/// Creates `reference_vec` for `dim` dimensions if it doesn't exist, with the trigger that
+/// drops a reference's vector when the reference is deleted.
+pub fn ensure_reference_vec(conn: &Connection, dim: usize) -> anyhow::Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS reference_vec USING vec0(embedding float[{dim}]);
+         CREATE TRIGGER IF NOT EXISTS doc_references_ad AFTER DELETE ON doc_references BEGIN
+           DELETE FROM reference_vec WHERE rowid = old.id;
+         END;"
+    ))?;
+    Ok(())
+}
+
+pub fn has_table(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+    Ok(conn.query_row("SELECT count(*) FROM sqlite_master WHERE name = ?1", [name], |r| r.get::<_, i64>(0))? > 0)
+}
+
 /// (Re)creates `chunks_vec` for `dim` dimensions together with the trigger that keeps it
 /// and `chunks_fts` in sync on delete. Dropping it discards all vectors.
 pub fn recreate_vec_table(conn: &Connection, dim: usize) -> anyhow::Result<()> {
@@ -200,7 +230,11 @@ pub fn recreate_vec_table(conn: &Connection, dim: usize) -> anyhow::Result<()> {
          CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
            INSERT INTO chunks_fts(chunks_fts, rowid, text, section) VALUES ('delete', old.id, old.text, old.section);
            DELETE FROM chunks_vec WHERE rowid = old.id;
-         END;"
+         END;
+         -- Reference vectors are from the same model: drop them too; they're re-embedded.
+         DROP TRIGGER IF EXISTS doc_references_ad;
+         DROP TABLE IF EXISTS reference_vec;
+         UPDATE doc_references SET embed_text_sha = NULL;"
     ))?;
     set_meta(conn, "embed_dim", &dim.to_string())
 }

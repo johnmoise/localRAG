@@ -45,7 +45,7 @@ pub fn rewrite_request(history: &[(String, String)], question: &str) -> String {
 
 pub const SUGGEST_SYSTEM: &str = "A researcher's document collection does not answer their question. Suggest 3 to 5 specific kinds of material, topics or search keywords they could add to their collection to answer it. Do not invent paper titles, authors or DOIs. Reply with a bulleted list only, one suggestion per line starting with \"- \".";
 
-pub const SUGGEST_REFS_SYSTEM: &str = "A researcher's document collection does not answer their question. You are given works that documents in the collection cite but that are NOT in the collection, numbered R1, R2, and so on. Choose up to 3 of them that would most likely help answer the question, each with a one-sentence reason based only on the citation shown. Choose only from the numbered list; never name any other work. If none of them would help, choose none. Also give 2 to 4 topics or search keywords worth looking for (not paper titles).";
+pub const SUGGEST_REFS_SYSTEM: &str = "A researcher's document collection does not answer their question. You are given works that documents in the collection cite but that are NOT in the collection, numbered R1, R2, and so on, most similar to the question first, some with an excerpt of their abstract. Choose up to 3 of them that would most likely help answer the question, each with a one-sentence reason based only on the citation and abstract shown. Choose only from the numbered list; never name any other work. If none of them would help, choose none. Also give 2 to 4 topics or search keywords worth looking for (not paper titles).";
 
 pub fn suggest_refs_request(question: &str, candidates: &[crate::references::MissingReference]) -> String {
     let mut s = format!("Question: {question}\n\nCited by the collection but not in it:\n");
@@ -56,6 +56,9 @@ pub fn suggest_refs_request(question: &str, candidates: &[crate::references::Mis
             _ => truncate(&c.raw, 220),
         };
         s.push_str(&format!("R{} {}: {what} (cited by {} document(s) in the collection)\n", i + 1, c.label, c.cited_in.len()));
+        if let Some(a) = &c.abstract_text {
+            s.push_str(&format!("   Abstract: {}\n", truncate(a, 400)));
+        }
     }
     s
 }

@@ -139,7 +139,7 @@ enum Command {
 enum ConfigAction {
     /// Print all settings
     Get,
-    /// Set a setting: crossref_email, ollama_host
+    /// Set a setting: crossref_email, ollama_host, cache_refresh_interval_days
     Set { key: String, value: String },
     /// Clear a setting
     Unset { key: String },
@@ -280,15 +280,14 @@ fn metadata_cmd(refresh: bool) -> anyhow::Result<()> {
 }
 
 fn lookup_metadata(ws: &Workspace, conn: &rusqlite::Connection, refresh: bool) -> anyhow::Result<()> {
-    let client = metadata::crossref::shared();
-    client.set_email(ws.global.crossref_email.as_deref());
+    let client = metadata::crossref::configured(&ws.global);
     if refresh {
         conn.execute("UPDATE documents SET metadata_status = 'pending' WHERE metadata_source IS NOT 'manual'", [])?;
     }
     let pending: i64 = conn.query_row(
         "SELECT count(*) FROM documents WHERE metadata_status = 'pending' AND status IN ('indexed', 'needs_ocr')", [], |r| r.get(0))?;
     if pending == 0 {
-        return lookup_references(conn, client);
+        return lookup_references(ws, conn, client);
     }
     let pool = match client.pool() {
         metadata::crossref::Pool::Polite => "polite pool",
@@ -303,15 +302,27 @@ fn lookup_metadata(ws: &Workspace, conn: &rusqlite::Connection, refresh: bool) -
     for e in &r.errors {
         eprintln!("warning: {e} (will retry next time)");
     }
-    lookup_references(conn, client)
+    lookup_references(ws, conn, client)
 }
 
-fn lookup_references(conn: &rusqlite::Connection, client: &metadata::crossref::Crossref) -> anyhow::Result<()> {
+fn lookup_references(ws: &Workspace, conn: &rusqlite::Connection, client: &metadata::crossref::Crossref) -> anyhow::Result<()> {
     let _ = localrag_core::references::backfill_cited_by(conn, client);
     let pending: i64 = conn.query_row("SELECT count(*) FROM doc_references WHERE status = 'pending'", [], |r| r.get(0))?;
-    if pending == 0 {
-        return Ok(());
+    if pending > 0 {
+        enrich_references(conn, client, pending)?;
     }
+    if let Err(e) = localrag_core::references::backfill_details(conn, client, &mut |_, _| {}) {
+        eprintln!("warning: {e:#} (abstracts will be fetched next time)");
+    }
+    let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
+    let r = localrag_core::references::embed_pending(conn, &embedder)?;
+    if r.embedded + r.reused > 0 {
+        println!("  {} reference chunk(s) embedded, {} reused", r.embedded, r.reused);
+    }
+    Ok(())
+}
+
+fn enrich_references(conn: &rusqlite::Connection, client: &metadata::crossref::Crossref, pending: i64) -> anyhow::Result<()> {
     println!("Looking up {pending} bibliography reference(s) on Crossref…");
     let mut last = usize::MAX;
     let r = localrag_core::references::enrich_pending(conn, client, &mut |done, total| {
@@ -334,16 +345,19 @@ fn config_cmd(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::Get => {
             println!("crossref_email = {}", g.crossref_email.as_deref().unwrap_or("(not set: Crossref public pool)"));
             println!("ollama_host    = {}", g.ollama_host);
+            println!("cache_refresh_interval_days = {} (Crossref responses are reused for this long)", g.cache_refresh_interval_days);
             println!("(stored in {}, private to your user)", localrag_core::config::global_config_dir().join("config.toml").display());
             return Ok(());
         }
         ConfigAction::Set { key, value } => match key.as_str() {
             "crossref_email" => g.crossref_email = Some(localrag_core::config::validate_email(&value)?),
             "ollama_host" => g.ollama_host = value,
-            _ => anyhow::bail!("unknown setting {key:?}; known: crossref_email, ollama_host"),
+            "cache_refresh_interval_days" => g.cache_refresh_interval_days = localrag_core::config::validate_cache_days(&value)?,
+            _ => anyhow::bail!("unknown setting {key:?}; known: crossref_email, ollama_host, cache_refresh_interval_days"),
         },
         ConfigAction::Unset { key } => match key.as_str() {
             "crossref_email" => g.crossref_email = None,
+            "cache_refresh_interval_days" => g.cache_refresh_interval_days = localrag_core::metadata::crossref::DEFAULT_REFRESH_DAYS,
             _ => anyhow::bail!("{key:?} can't be unset"),
         },
     }

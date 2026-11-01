@@ -440,7 +440,7 @@ fn metadata_labels_get_suffixes_and_page_ranges_become_printed_pages() {
     let id = |p: &str| index::find_document(&f.conn, p).unwrap().unwrap();
     let work = |title: &str, page: Option<&str>| Work {
         doi: format!("10.1/{title}"), title: Some(title.into()), year: Some(2021), container: None, kind: None,
-        page: page.map(str::to_string), cited_by: None, author: vec![Author { family: Some("Smith".into()), given: Some("A".into()), literal: None }],
+        page: page.map(str::to_string), cited_by: None, abstract_text: None, author: vec![Author { family: Some("Smith".into()), given: Some("A".into()), literal: None }],
     };
     metadata::apply_match(&f.conn, id("a.txt"), &work("Alpha study", None), "crossref_doi").unwrap();
     metadata::apply_match(&f.conn, id("b.txt"), &work("Beta study", None), "crossref_doi").unwrap();
@@ -497,7 +497,7 @@ fn bibliographies_are_split_off_counted_and_linked_to_the_corpus() {
     assert!(refs[1].in_corpus.is_none());
     assert_eq!(refs[1].label, "Utada 2014");
 
-    let missing = localrag_core::references::missing_for_question(&f.conn, "What is the interval between first and second primary cancers?", 10).unwrap();
+    let missing = localrag_core::references::missing_for_question(&f.conn, None, "What is the interval between first and second primary cancers?", 10).unwrap();
     assert_eq!(missing[0].label, "Utada 2014", "ranked by overlap with the question");
     assert!(missing.iter().all(|m| !m.raw.contains("zebrafinches")), "works already in corpus/ aren't suggested");
 }

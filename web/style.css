@@ -274,3 +274,5 @@ td.num, th.num { text-align: right; }
 .ref-pop .tag.stub { color: var(--muted); }
 .sugg-refs li { margin: 6px 0; }
 .sugg-refs .why { color: var(--muted); font-size: 13px; }
+.sugg-refs .abstract summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.sugg-refs .abstract p { margin: 4px 0 0; font-size: 13px; white-space: pre-line; }

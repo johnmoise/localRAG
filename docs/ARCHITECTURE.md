@@ -262,8 +262,19 @@ Metadata comes from Crossref's REST API (`api.crossref.org`), which needs no key
 - **Backoff:** on `429` or `5xx`, honor `Retry-After`, otherwise use exponential backoff with
   jitter, then retry on a later sync. Lookups run in a background queue and never block
   indexing; citation labels update when they finish.
-- **Cache:** responses are cached in `~/.cache/localrag/crossref/`, keyed by DOI or normalized
-  query. They're refreshed only by **Refresh metadata**.
+- **Cache:** every response is cached in `~/.cache/localrag/crossref/` (machine-wide, shared
+  by all workspaces). Each entry holds the request (`GET /works?query.bibliographic=…&rows=3`,
+  parameters sorted, email left out), `fetched_at`, and the response (`null` for a 404).
+  - **Before any request** the cache is checked. An entry younger than
+    `cache_refresh_interval_days` (global config, default **14**, 0 = always ask; Settings and
+    `localrag config set cache_refresh_interval_days N`) is used as is. An older one means
+    Crossref is asked again and the entry replaced.
+  - **Identical requests in flight** wait for the first one, then read what it cached, so
+    concurrent lookups of the same DOI reach Crossref once.
+  - **Crossref down or failing:** an expired entry is used rather than nothing.
+  - **Refresh metadata** bypasses the cache for that document.
+  - Entries from the older cache format (bare response, no timestamp) still count, dated by
+    file mtime, and are rewritten in the new format on first use.
 
 **Email**
 - **First load:** a dialog explains the polite pool and asks for an email, with **Skip (use
@@ -275,8 +286,9 @@ Metadata comes from Crossref's REST API (`api.crossref.org`), which needs no key
 ### 7.1 Bibliographies and references
 
 Each document's bibliography is split from its body when it's indexed (`bibliography.rs`).
-The body is chunked and embedded as usual. The bibliography isn't chunked or embedded, so
-reference entries never show up in search or answers. Its entries go to `doc_references`.
+The body is chunked and embedded as usual. The bibliography text isn't part of the body's
+chunks, so reference entries never show up in search or answers. Its entries go to
+`doc_references`. Each one is embedded separately for suggestions (see *Reference chunks*).
 
 **Detection**
 - **Start:** a heading (References, Bibliography, Literature cited, Works cited, …, with an
@@ -300,6 +312,20 @@ reference entries never show up in search or answers. Its entries go to `doc_ref
 3. **Otherwise** → a **stub**: guessed title (the segment after the authors) and year from the
    entry text, marked *citation only*.
 
+**Abstracts.** The full record of every matched reference is kept, including its abstract
+when the publisher deposited one with Crossref (JATS markup turned into plain text). Titles
+lose their markup too (`<scp>DNA</scp>` → `DNA`). References matched before abstracts were
+kept are re-read once (`references::DETAILS_VERSION`), usually from the cache.
+
+**Reference chunks.** Each looked-up reference is embedded as one chunk of its own: title,
+authors, year and venue, then the abstract (for a stub, the citation string). The chunks live
+in `reference_vec`, apart from `chunks_vec`. So they're never search results or answer
+sources, only candidates for suggestions.
+- A chunk is re-embedded only when its text changes (enrichment, a re-parsed bibliography).
+- The same work cited by several documents is embedded once.
+- Deleting a reference deletes its vector (trigger).
+- Changing the embedding model drops them all; they're re-embedded with the new one.
+
 **Linking to the corpus** (after every sync and enrichment): a reference is *in corpus* when
 its DOI matches a document's, or its title matches with similarity ≥ 0.85 and the same year,
 or a corpus title of 4+ words appears word for word in the entry text.
@@ -312,14 +338,18 @@ or a corpus title of 4+ words appears word for word in the entry text.
 - Status, Chunks, Pages, References and Cited-By sort on click (again to reverse); N/A
   always sorts last.
 
-**Suggesting additions.** When an answer is "I don't know" (or has gaps), the references
-*not* in the corpus are ranked lexically against the question, deduplicated across documents,
-and up to 15 are given to the model as `R1`…`Rn`, each with how many corpus documents cite it.
+**Suggesting additions.** When an answer is "I don't know" (or has gaps), the question is
+embedded and compared with the reference chunks of works *not* in the corpus.
+- Those at cosine similarity ≥ 0.35 are deduplicated across documents and ranked.
+- Up to 15 go to the model as `R1`…`Rn`, closest first. Each comes with an abstract excerpt
+  (400 characters) and how many corpus documents cite it.
+- If no reference is embedded yet, they're ranked by words shared with title and venue.
 The model answers with a JSON schema (`{references: [{id, reason}], topics: [...]}`).
 - Only ids from that list are kept (at most 3, no duplicates), and the shown reference is
   taken from the database, never from the model's text. So a suggested work always exists in
   some corpus document's bibliography.
 - Free-text topics are still allowed and are labelled as unverified.
+- The answer shows each pick's abstract, collapsed.
 - With no candidates, or if the JSON doesn't parse, it falls back to the earlier bullet
   suggestions.
 
@@ -361,8 +391,11 @@ CREATE TABLE doc_references (
   ord INTEGER, number INTEGER, raw TEXT, doi TEXT, year INTEGER,
   status TEXT DEFAULT 'pending',          -- pending|matched|stub
   csl_json TEXT, title TEXT, cited_by INTEGER,
-  in_corpus_doc_id INTEGER, checked_at TEXT
+  in_corpus_doc_id INTEGER, checked_at TEXT,
+  abstract TEXT, details_version INTEGER,  -- v6
+  embed_text_sha TEXT                     -- v6: the reference chunk last embedded
 );
+CREATE VIRTUAL TABLE reference_vec USING vec0(embedding float[1024]);  -- v6, rowid = doc_references.id
 
 CREATE VIRTUAL TABLE chunks_fts USING fts5(text, section, content='chunks', content_rowid='id');
 CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[1024]);    -- rowid = chunks.id
@@ -1217,6 +1250,18 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   - **Bug fixed:** the Documents tab lost its column layout after the Library → Documents
     rename (a stale `#tab-library` selector).
   - 77 tests pass.
+
+- **Done (2026-11-01): Crossref cache, abstracts, reference chunks** (§7, §7.1)
+  - On the three test papers, 26 of the 82 matched references have an abstract on Crossref;
+    the rest don't (publishers deposit them for only some journals). All 104 references are
+    embedded, which took about 30 s including the abstract lookups.
+  - A second `localrag metadata` made no Crossref requests (18 ms).
+  - "How does ctDNA compare with CEA as a marker of colorectal cancer recurrence?" is
+    correctly unanswerable from the corpus. It now suggests van't Erve 2021, Baumgartner 2018
+    and Reinert 2019 (similarity 0.58–0.65), all cited by Niemann 2024 and all on topic.
+    Reinert 2019 is the closest fit.
+  - 82 tests pass. `uploads_are_indexed_by_one_watcher_sync` failed once under a full
+    parallel run right after a rebuild and passed every time since (timing).
 
 **Phase 6: packaging** (§19)
 - Tauri app, bundled PDFium, first-run checks, ad-hoc signing, `.dmg` + README.

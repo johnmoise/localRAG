@@ -466,7 +466,7 @@ impl RagEngine<'_> {
     /// contain, the model picks from that numbered list (picks outside it are dropped);
     /// otherwise it only suggests topics.
     fn suggestions(&self, model: &str, num_ctx: u32, question: &str, closest: &[ChunkRef]) -> anyhow::Result<(Vec<String>, Vec<SuggestedReference>)> {
-        let candidates = crate::references::missing_for_question(self.conn, question, 15)?;
+        let candidates = crate::references::missing_for_question(self.conn, Some(self.embedder), question, 15)?;
         if candidates.is_empty() {
             let req = ChatRequest {
                 model: model.to_string(),

@@ -419,8 +419,7 @@ async fn metadata_refresh(State(state): State<AppState>, Path(id): Path<i64>) ->
     blocking(move || {
         let ws = state.workspace()?;
         let conn = db::open(&ws.db_path())?;
-        let client = localrag_core::metadata::crossref::shared();
-        client.set_email(ws.global.crossref_email.as_deref());
+        let client = localrag_core::metadata::crossref::configured(&ws.global);
         let event = localrag_core::metadata::refresh(&conn, client, id)
             .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "crossref", format!("{e:#}")))?;
         Ok(Json(json!({ "event": event, "metadata": localrag_core::metadata::summary(&conn, id)? })))
