@@ -247,3 +247,9 @@ table.library { border-collapse: collapse; width: 100%; font-size: 14px; }
 .meta-badge.unmatched, .meta-badge.pending { background: var(--line); color: var(--muted); }
 .cite-cell .title { font-size: 12px; color: var(--muted); }
 .ocr-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; padding: 0 5px; border-radius: 4px; border: 1px solid currentColor; margin-left: 4px; opacity: 0.8; }
+
+.search-filters { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.search-filters select { max-width: 320px; padding: 4px 6px; }
+.search-filters input { width: 80px; padding: 4px 6px; }
+.check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--text); margin: 8px 0; }
+.check input { margin-top: 3px; }

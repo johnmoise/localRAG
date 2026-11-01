@@ -85,6 +85,11 @@ pub struct WorkspaceConfig {
     pub retrieval: RetrievalConfig,
     /// Pass `think` to thinking-capable models when answering.
     pub think: bool,
+    /// When a quote isn't in its source, ask the model once to copy the supporting words
+    /// exactly, then verify those (§10).
+    pub repair_quotes: bool,
+    /// Strict mode: a second pass checks that each cited passage supports its sentence.
+    pub strict: bool,
     /// Context size per chat model (§11); filled in on first use.
     pub num_ctx: BTreeMap<String, u32>,
 }
@@ -99,6 +104,8 @@ impl Default for WorkspaceConfig {
             chunking: ChunkingConfig::default(),
             retrieval: RetrievalConfig::default(),
             think: false,
+            repair_quotes: true,
+            strict: false,
             num_ctx: BTreeMap::new(),
         }
     }
@@ -161,7 +168,11 @@ pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
 pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
+    // A unique temp name: concurrent writers of the same file must not rename each other's.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
     let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
     f.write_all(bytes)?;

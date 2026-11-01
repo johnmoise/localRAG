@@ -388,6 +388,7 @@ fn search(query: &str, k: usize) -> anyhow::Result<()> {
         candidates: ws.config.retrieval.candidates,
         limit: k,
         per_doc_cap: ws.config.retrieval.per_doc_cap,
+        ..retrieval::SearchOptions::default()
     };
     let hits = retrieval::search(&conn, &embedder, query, &opts)?;
     if hits.is_empty() {
@@ -482,13 +483,20 @@ fn print_answer(a: &Answer, streamed: bool) {
         println!("Citations:");
         for c in &a.citations {
             let mark = match c.span_source {
+                SpanSource::Quote if c.quote_repaired => "✓ quote re-selected from the source",
                 SpanSource::Quote => "✓ quote found",
                 SpanSource::Similar if c.quote.is_some() => "✗ quote NOT in source; closest sentence shown",
                 SpanSource::Similar => "– no quote; closest sentence shown",
                 SpanSource::None => "✗ no supporting text found",
             };
             let span = c.span.map(|(a, b)| c.chunk.text.chars().skip(a).take(b - a).collect::<String>()).unwrap_or_default();
-            println!("  [S{}] {}  {mark}", c.marker, c.chunk.citation());
+            let support = match c.support {
+                Some(localrag_core::answer::Support::No) => "  ✗ strict check: passage does NOT support the sentence",
+                Some(localrag_core::answer::Support::Partial) => "  ~ strict check: partial support",
+                Some(localrag_core::answer::Support::Yes) => "  ✓ strict check: supported",
+                None => "",
+            };
+            println!("  [S{}] {}  {mark}{support}", c.marker, c.chunk.citation());
             if !span.is_empty() {
                 println!("        \"{}\"", snippet(&span, 200));
             }
@@ -608,8 +616,8 @@ fn eval_cmd(retrieval_only: bool, model: Option<String>) -> anyhow::Result<()> {
                 (false, true) => "ANSWERED (should refuse)",
             };
             println!(
-                "  {:>2}. {verdict:<24} cites {} (verified {}, on doc {}) uncited {}  {}",
-                i + 1, r.citations, r.verified, r.on_expected_doc, r.uncited_sentences, r.question
+                "  {:>2}. {verdict:<24} cites {} (verified {}, re-selected {}, on doc {}) uncited {}  {}",
+                i + 1, r.citations, r.verified, r.repaired, r.on_expected_doc, r.uncited_sentences, r.question
             );
         })?;
         model_name = Some(model);
@@ -627,7 +635,10 @@ fn eval_cmd(retrieval_only: bool, model: Option<String>) -> anyhow::Result<()> {
     );
     if !retrieval_only {
         println!("  answerable supported {}  ·  unanswerable refused {}", pct(summary.supported_rate), pct(summary.refusal_rate));
-        println!("  quote verification {}  ·  citation precision {}", pct(summary.quote_verification_rate), pct(summary.citation_precision));
+        println!(
+            "  quote verification {} (re-selected {})  ·  citation precision {}  ·  rejected by strict check {}",
+            pct(summary.quote_verification_rate), pct(summary.repaired_rate), pct(summary.citation_precision), pct(summary.rejected_by_check_rate)
+        );
     }
     let out = ws.state_dir().join("logs").join(format!("eval-{}.json", db::now_rfc3339().replace(':', "")));
     std::fs::write(&out, serde_json::to_string_pretty(&serde_json::json!({

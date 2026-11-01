@@ -17,11 +17,58 @@ pub struct SearchOptions {
     /// Hits returned after fusion and the per-document cap.
     pub limit: usize,
     pub per_doc_cap: usize,
+    pub filter: Filter,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        SearchOptions { candidates: 30, limit: 12, per_doc_cap: 3 }
+        SearchOptions { candidates: 30, limit: 12, per_doc_cap: 3, filter: Filter::default() }
+    }
+}
+
+/// Restricts a search to some documents and/or publication years (from their metadata).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Filter {
+    pub doc_ids: Option<Vec<i64>>,
+    pub year_from: Option<i32>,
+    pub year_to: Option<i32>,
+}
+
+impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.doc_ids.as_ref().is_none_or(|d| d.is_empty()) && self.year_from.is_none() && self.year_to.is_none()
+    }
+
+    /// Documents that pass, or None for "all".
+    fn allowed(&self, conn: &Connection) -> anyhow::Result<Option<std::collections::HashSet<i64>>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let rows: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT id, csl_json FROM documents")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut ok = std::collections::HashSet::new();
+        for (id, csl) in rows {
+            if let Some(ids) = self.doc_ids.as_ref().filter(|d| !d.is_empty())
+                && !ids.contains(&id)
+            {
+                continue;
+            }
+            if self.year_from.is_some() || self.year_to.is_some() {
+                let year = csl
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .and_then(|v| v["issued"]["date-parts"][0][0].as_i64())
+                    .map(|y| y as i32);
+                // Documents without a known year are excluded once a year range is set.
+                let Some(y) = year else { continue };
+                if self.year_from.is_some_and(|f| y < f) || self.year_to.is_some_and(|t| y > t) {
+                    continue;
+                }
+            }
+            ok.insert(id);
+        }
+        Ok(Some(ok))
     }
 }
 
@@ -75,9 +122,16 @@ struct Fused {
 const SEARCHABLE: &str = "('indexed', 'needs_ocr')";
 
 pub fn search(conn: &Connection, embedder: &dyn Embedder, query: &str, opts: &SearchOptions) -> anyhow::Result<Vec<Hit>> {
-    let bm25 = bm25(conn, query, opts.candidates)?;
+    let allowed = opts.filter.allowed(conn)?;
+    if allowed.as_ref().is_some_and(|a| a.is_empty()) {
+        return Ok(Vec::new());
+    }
+    // With a filter, draw from a much larger pool so enough candidates survive it.
+    let pool = if allowed.is_some() { opts.candidates * 10 } else { opts.candidates };
+    let keep = |id: &i64| allowed.as_ref().is_none_or(|a| doc_of(conn, *id).is_some_and(|d| a.contains(&d)));
+    let bm25: Vec<i64> = bm25(conn, query, pool)?.into_iter().filter(|id| keep(id)).take(opts.candidates).collect();
     let query_vec = embedder.embed_query(query)?;
-    let vector = knn(conn, &query_vec, opts.candidates)?;
+    let vector: Vec<(i64, f32)> = knn(conn, &query_vec, pool)?.into_iter().filter(|(id, _)| keep(id)).take(opts.candidates).collect();
 
     let mut fused: HashMap<i64, Fused> = HashMap::new();
     for (rank, id) in bm25.iter().enumerate() {
@@ -109,6 +163,10 @@ pub fn search(conn: &Connection, embedder: &dyn Embedder, query: &str, opts: &Se
     hits.extend(overflow);
     hits.truncate(opts.limit);
     Ok(hits)
+}
+
+fn doc_of(conn: &Connection, chunk_id: i64) -> Option<i64> {
+    conn.query_row("SELECT doc_id FROM chunks WHERE id = ?1", [chunk_id], |r| r.get(0)).ok()
 }
 
 /// Neighbouring chunks (`ord ± 1`) of the same document, for context expansion.

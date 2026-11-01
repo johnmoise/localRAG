@@ -10,6 +10,7 @@ mod ocr_jobs;
 mod routes;
 mod settings;
 mod upload;
+mod watch;
 mod workspaces;
 
 use std::net::SocketAddr;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub port: u16,
     active: Arc<RwLock<Option<PathBuf>>>,
     pub sync: Arc<Mutex<SyncState>>,
+    /// Watches the active workspace's corpus/; replaced on every switch.
+    watcher: Arc<Mutex<Option<watch::Watcher>>>,
 }
 
 /// No workspace is open yet: the UI shows the workspace picker.
@@ -101,7 +104,7 @@ impl From<&SyncReport> for SyncSummary {
 
 impl AppState {
     pub fn new(root: Option<&Path>, port: u16, token: String) -> Self {
-        AppState { token, port, active: Arc::new(RwLock::new(root.map(Path::to_path_buf))), sync: Arc::default() }
+        AppState { token, port, active: Arc::new(RwLock::new(root.map(Path::to_path_buf))), sync: Arc::default(), watcher: Arc::default() }
     }
 
     pub fn root(&self) -> Option<PathBuf> {
@@ -125,6 +128,8 @@ impl AppState {
             // result is dropped because it no longer matches `root`.
             *s = SyncState { root: Some(ws.root.clone()), ..SyncState::default() };
         }
+        // Dropping the old watcher stops it; a failure to watch only costs auto-sync.
+        *self.watcher.lock().expect("watcher") = watch::start(self, &ws.corpus_dir()).ok();
         self.start_sync();
         Ok(ws)
     }

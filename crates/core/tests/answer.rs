@@ -39,12 +39,16 @@ fn bag(text: &str) -> Vec<f32> {
 /// Replies with `answer` to the main request and a fixed list to suggestion/rewrite prompts.
 struct ScriptedLlm {
     answer: String,
+    /// Reply to quote-repair requests.
+    repair: String,
+    /// Reply to strict-mode support checks.
+    support: String,
     requests: RefCell<Vec<ChatRequest>>,
 }
 
 impl ScriptedLlm {
     fn new(answer: &str) -> Self {
-        ScriptedLlm { answer: answer.into(), requests: RefCell::new(Vec::new()) }
+        ScriptedLlm { answer: answer.into(), repair: "NONE".into(), support: "{}".into(), requests: RefCell::new(Vec::new()) }
     }
 }
 
@@ -56,6 +60,10 @@ impl Llm for ScriptedLlm {
             "- Registry studies of second primary cancers\n- Survival statistics by country".to_string()
         } else if system.contains("standalone search query") {
             "quadratic attention cost".to_string()
+        } else if system.contains("Copy, word for word") {
+            self.repair.clone()
+        } else if system.contains("decide whether the passage supports") {
+            self.support.clone()
         } else {
             self.answer.clone()
         };
@@ -149,6 +157,13 @@ fn off_topic_questions_skip_generation() {
     let reqs = llm.requests.borrow();
     assert_eq!(reqs.len(), 1, "only the suggestions call");
     assert!(reqs[0].messages[0].content.contains("Suggest 3 to 5"));
+
+    // Reopened later, the answer still shows its suggestions and "not found" state.
+    let session = history::create_session(&f.conn, "q", "m").unwrap();
+    let id = history::record(&f.conn, session, "q", &a).unwrap();
+    let m = history::message(&f.conn, id).unwrap();
+    assert_eq!(m.extra["not_found"], true);
+    assert_eq!(m.extra["suggestions"].as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -217,4 +232,58 @@ fn history_citations_resolve_then_track_removal_and_forgetting() {
     let r = refs::check_history(&f.conn).unwrap();
     assert_eq!(r.broken.len(), 1);
     assert!(!r.ok());
+}
+
+#[test]
+fn search_filters_by_document_and_year() {
+    use localrag_core::metadata::{self, crossref::{Author, Work}};
+    use localrag_core::retrieval::{self, Filter, SearchOptions};
+    let f = Fixture::new();
+    let q = "attention migrate polar regions";
+    let all = retrieval::search(&f.conn, &WordEmbedder, q, &SearchOptions::default()).unwrap();
+    let docs = |hits: &[retrieval::Hit]| hits.iter().map(|h| h.chunk.doc_path.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(docs(&all).len(), 2);
+
+    let birds = index::find_document(&f.conn, "birds.txt").unwrap().unwrap();
+    let only = SearchOptions { filter: Filter { doc_ids: Some(vec![birds]), ..Filter::default() }, ..SearchOptions::default() };
+    assert_eq!(docs(&retrieval::search(&f.conn, &WordEmbedder, q, &only).unwrap()), ["birds.txt".to_string()].into());
+
+    let work = Work { doi: "10.1/b".into(), title: Some("Terns".into()), year: Some(2015), author: vec![Author { family: Some("Avis".into()), given: None, literal: None }], container: None, page: None, kind: None };
+    metadata::apply_match(&f.conn, birds, &work, "crossref_doi").unwrap();
+    let years = |from, to| SearchOptions { filter: Filter { year_from: from, year_to: to, ..Filter::default() }, ..SearchOptions::default() };
+    assert_eq!(docs(&retrieval::search(&f.conn, &WordEmbedder, q, &years(Some(2010), Some(2020))).unwrap()), ["birds.txt".to_string()].into());
+    assert!(retrieval::search(&f.conn, &WordEmbedder, q, &years(Some(2016), None)).unwrap().is_empty(), "no year → excluded; 2015 < 2016");
+}
+
+#[test]
+fn unverified_quotes_are_repaired_from_the_source_when_possible() {
+    let f = Fixture::new();
+    let mut llm = ScriptedLlm::new("Attention is quadratic [S1 \"attention needs quadratic compute\"].");
+    llm.repair = "\"takes quadratic time in the sequence length\"".into();
+    let a = f.engine(&llm).ask(Q, "m", 16_384, &[], &mut |_| {}).unwrap();
+    let c = &a.citations[0];
+    assert!(c.quote_verified && c.quote_repaired, "{c:?}");
+    assert_eq!(c.quote.as_deref(), Some("takes quadratic time in the sequence length"));
+    assert!(a.supported);
+
+    // A "repair" that isn't actually in the passage changes nothing.
+    let mut llm = ScriptedLlm::new("Attention is quadratic [S1 \"attention needs quadratic compute\"].");
+    llm.repair = "attention needs quadratic compute".into();
+    let a = f.engine(&llm).ask(Q, "m", 16_384, &[], &mut |_| {}).unwrap();
+    assert!(!a.citations[0].quote_verified && !a.citations[0].quote_repaired);
+    assert!(!a.supported);
+}
+
+#[test]
+fn strict_mode_rejects_citations_whose_passage_does_not_support_the_claim() {
+    let mut f = Fixture::new();
+    f.ws.config.strict = true;
+    let mut llm = ScriptedLlm::new("Attention is linear [S1 \"takes quadratic time\"].");
+    llm.support = r#"{"verdicts":[{"item":0,"verdict":"no"}]}"#.into();
+    let a = f.engine(&llm).ask(Q, "m", 16_384, &[], &mut |_| {}).unwrap();
+    assert!(a.citations[0].quote_verified, "the quote exists…");
+    assert_eq!(a.citations[0].support, Some(localrag_core::answer::Support::No), "…but doesn't support the claim");
+    assert!(!a.supported);
+    let req = llm.requests.borrow().iter().find(|r| r.format.is_some()).cloned().expect("structured request");
+    assert!(req.messages[1].content.contains("Claim: Attention is linear"));
 }

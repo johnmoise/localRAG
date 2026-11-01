@@ -231,3 +231,32 @@ async fn uploads_are_validated_before_joining_the_corpus() {
 fn urlencode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_dropped_into_corpus_trigger_a_sync() {
+    isolate_config();
+    let dir = tempfile::tempdir().unwrap();
+    Workspace::init(dir.path()).unwrap();
+    let s = AppState::new(None, PORT, TOKEN.into());
+    s.activate(dir.path()).unwrap();
+    // Let the activation sync finish.
+    let wait_runs = |n: u64| {
+        let s = s.clone();
+        async move {
+            for _ in 0..200 {
+                let st = s.sync.lock().unwrap().clone();
+                if !st.running && st.runs >= n {
+                    return st.runs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("no sync reached run {n}");
+        }
+    };
+    let before = wait_runs(1).await;
+    std::fs::write(dir.path().join("corpus/.hidden-temp"), "ignored").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert_eq!(s.sync.lock().unwrap().runs, before, "hidden files don't trigger a sync");
+    std::fs::write(dir.path().join("corpus/new note.md"), "# Note\nDropped in from Finder.\n").unwrap();
+    assert!(wait_runs(before + 1).await > before);
+}

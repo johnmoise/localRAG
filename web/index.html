@@ -61,6 +61,11 @@
         <input id="search-q" type="search" placeholder="Search passages (no model involved)…" required>
         <button class="primary" type="submit">Search</button>
       </form>
+      <div class="search-filters">
+        <label>Document <select id="search-doc"><option value="">All documents</option></select></label>
+        <label>Years <input id="search-from" type="number" min="1000" max="2100" placeholder="from"> – <input id="search-to" type="number" min="1000" max="2100" placeholder="to"></label>
+        <span class="muted small-text">Year filters use citation metadata; documents without a year are left out.</span>
+      </div>
       <ol id="search-results" class="results"></ol>
     </section>
 
@@ -148,6 +153,9 @@
           <option value="off">Off</option>
         </select>
       </label>
+      <h3>Citation checks</h3>
+      <label class="check"><input id="set-repair" type="checkbox"> When a quote isn't in its source, ask the model once to copy the exact supporting words (then verify them)</label>
+      <label class="check"><input id="set-strict" type="checkbox"> Strict mode (slower): also check that each cited passage really supports its sentence</label>
       <div class="row end"><span id="settings-error" class="error" role="alert"></span><button id="settings-save" class="primary">Save</button></div>
     </div>
   </div>

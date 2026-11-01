@@ -31,6 +31,14 @@ pub struct CitationSnapshot {
     /// When the user promoted it to Verified Paraphrase.
     #[serde(default)]
     pub paraphrase_at: Option<String>,
+    /// The quote was re-selected from the passage after the answer (§10).
+    #[serde(default)]
+    pub quote_repaired: bool,
+    /// Strict mode's verdict.
+    #[serde(default)]
+    pub support: Option<crate::answer::Support>,
+    #[serde(default)]
+    pub claim: Option<String>,
 }
 
 impl CitationSnapshot {
@@ -60,6 +68,8 @@ pub struct MessageView {
     pub supported: Option<bool>,
     pub model: Option<String>,
     pub created_at: String,
+    /// {suggestions, unsupported_sentences, invalid_markers, not_found, closest} (schema v4+).
+    pub extra: serde_json::Value,
 }
 
 pub fn create_session(conn: &Connection, title: &str, model: &str) -> anyhow::Result<i64> {
@@ -99,7 +109,7 @@ pub fn delete_session(conn: &Connection, id: i64) -> anyhow::Result<()> {
 pub fn messages(conn: &Connection, session: i64) -> anyhow::Result<Vec<MessageView>> {
     let rows = conn
         .prepare(
-            "SELECT id, role, content, citations_json, warnings_json, supported, model, created_at
+            "SELECT id, role, content, citations_json, warnings_json, supported, model, created_at, extra_json
              FROM messages WHERE session_id = ?1 ORDER BY id",
         )?
         .query_map([session], message_from_row)?
@@ -116,6 +126,7 @@ fn message_from_row(r: &rusqlite::Row) -> rusqlite::Result<anyhow::Result<Messag
     let supported: Option<bool> = r.get(5)?;
     let model: Option<String> = r.get(6)?;
     let created_at: String = r.get(7)?;
+    let extra: Option<String> = r.get(8)?;
     Ok((|| {
         let mut snaps: Vec<CitationSnapshot> = citations.map(|c| serde_json::from_str(&c)).transpose()?.unwrap_or_default();
         backfill_ordinals(&content, &mut snaps);
@@ -129,6 +140,7 @@ fn message_from_row(r: &rusqlite::Row) -> rusqlite::Result<anyhow::Result<Messag
             supported,
             model,
             created_at,
+            extra: extra.map(|e| serde_json::from_str(&e)).transpose()?.unwrap_or(serde_json::Value::Null),
         })
     })())
 }
@@ -152,7 +164,7 @@ fn backfill_ordinals(content: &str, snaps: &mut [CitationSnapshot]) {
 
 pub fn message(conn: &Connection, id: i64) -> anyhow::Result<MessageView> {
     conn.query_row(
-        "SELECT id, role, content, citations_json, warnings_json, supported, model, created_at FROM messages WHERE id = ?1",
+        "SELECT id, role, content, citations_json, warnings_json, supported, model, created_at, extra_json FROM messages WHERE id = ?1",
         [id],
         message_from_row,
     )
@@ -196,6 +208,9 @@ pub fn record(conn: &Connection, session: i64, question: &str, answer: &Answer) 
             status: Some(c.status),
             span: c.span.filter(|_| c.quote_verified),
             paraphrase_at: None,
+            quote_repaired: c.quote_repaired,
+            support: c.support,
+            claim: Some(c.claim.clone()),
         })
         .collect();
     let now = db::now_rfc3339();
@@ -204,8 +219,8 @@ pub fn record(conn: &Connection, session: i64, question: &str, answer: &Answer) 
         params![session, question, now],
     )?;
     conn.execute(
-        "INSERT INTO messages (session_id, role, content, citations_json, warnings_json, supported, model, created_at)
-         VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages (session_id, role, content, citations_json, warnings_json, supported, model, created_at, extra_json)
+         VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             session,
             answer.text,
@@ -213,7 +228,18 @@ pub fn record(conn: &Connection, session: i64, question: &str, answer: &Answer) 
             serde_json::to_string(&answer.warnings)?,
             answer.supported,
             answer.model,
-            now
+            now,
+            serde_json::json!({
+                "suggestions": answer.suggestions,
+                "unsupported_sentences": answer.unsupported_sentences,
+                "invalid_markers": answer.invalid_markers,
+                "not_found": answer.not_found,
+                // For "I don't know" answers: what was closest, as label + text.
+                "closest": if answer.supported { Vec::new() } else {
+                    answer.sources.iter().take(3).map(|c| serde_json::json!({ "label": c.citation(), "doc_label": c.doc_label, "locator": c.locator, "text": c.text, "id": c.id, "doc_id": c.doc_id, "pdf_page_start": c.pdf_page_start, "doc_path": c.doc_path })).collect()
+                },
+            })
+            .to_string(),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -238,7 +264,7 @@ pub fn set_paraphrase(conn: &Connection, message_id: i64, ordinal: usize, on: bo
         (CitationStatus::Verified, _) => bail!("citation {ordinal} is already verified by its quote"),
         (s, _) => bail!("citation {ordinal} is {s:?}; nothing to change"),
     }
-    let supported = msg.citations.iter().any(|c| c.status().counts_as_support());
+    let supported = msg.citations.iter().any(|c| c.status().counts_as_support() && c.support != Some(crate::answer::Support::No));
     conn.execute(
         "UPDATE messages SET citations_json = ?2, supported = ?3 WHERE id = ?1",
         params![message_id, serde_json::to_string(&msg.citations)?, supported],

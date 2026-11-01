@@ -183,6 +183,8 @@ struct SearchBody {
     query: String,
     #[serde(default = "ten")]
     k: usize,
+    #[serde(default)]
+    filter: retrieval::Filter,
 }
 
 fn ten() -> usize {
@@ -194,7 +196,7 @@ async fn search(State(state): State<AppState>, Json(body): Json<SearchBody>) -> 
         let ws = state.workspace()?;
         let conn = db::open(&ws.db_path())?;
         let embedder = OllamaEmbedder::new(&ws.global.ollama_host, &ws.config.embed_model)?;
-        let opts = SearchOptions { candidates: ws.config.retrieval.candidates, limit: body.k.clamp(1, 50), per_doc_cap: ws.config.retrieval.per_doc_cap };
+        let opts = SearchOptions { candidates: ws.config.retrieval.candidates, limit: body.k.clamp(1, 50), per_doc_cap: ws.config.retrieval.per_doc_cap, filter: body.filter };
         let hits = retrieval::search(&conn, &embedder, &body.query, &opts)?;
         Ok(Json(json!({ "hits": hits })))
     })

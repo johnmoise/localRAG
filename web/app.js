@@ -48,6 +48,7 @@ document.querySelectorAll(".tabs button").forEach((b) =>
     document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
     document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.id === `tab-${b.dataset.tab}`));
     if (b.dataset.tab === "library") loadLibrary();
+    if (b.dataset.tab === "search") loadSearchDocs();
   }),
 );
 
@@ -180,7 +181,7 @@ function userMsg(text) {
 function liveCitation(c) {
   return {
     ordinal: c.ordinal, status: c.status, ocr: c.chunk.ocr, label: c.chunk.locator ? `${c.chunk.doc_label}, ${c.chunk.locator}` : c.chunk.doc_label,
-    quote: c.quote, span: c.quote_verified ? c.span : null,
+    quote: c.quote, span: c.quote_verified ? c.span : null, quote_repaired: c.quote_repaired, support: c.support,
     chunk_id: c.chunk.id, doc_sha256: c.chunk.doc_sha256, chunk_text_sha: c.chunk.text_sha,
   };
 }
@@ -188,6 +189,7 @@ function snapshotCitation(c) {
   return {
     ordinal: c.ordinal, status: c.status || (c.quote_verified ? "verified" : "unverified"), label: c.label,
     quote: c.quote, span: c.span, chunk_id: c.chunk_id, doc_sha256: c.doc_sha256, chunk_text_sha: c.chunk_text_sha,
+    quote_repaired: c.quote_repaired, support: c.support,
   };
 }
 
@@ -198,7 +200,9 @@ function renderMarkdownWithChips(placeholderMd, citations, messageId) {
     const c = byOrd.get(Number(n));
     if (!c) return `<span class="chip invalid" title="This citation names a source that wasn't provided">invalid</span>`;
     const ocr = c.ocr ? `<span class="ocr-badge" title="From OCR of a scanned page">OCR</span>` : "";
-    return `<button class="chip ${esc(c.status)}" data-msg="${esc(messageId ?? "")}" data-ord="${c.ordinal}" title="${esc(STATUS_TEXT[c.status])}">${esc(c.label)} ${STATUS_ICON[c.status] || ""}${ocr}</button>`;
+    const rejected = c.support === "no";
+    const title = rejected ? "Strict check: the passage does not support this sentence" : STATUS_TEXT[c.status];
+    return `<button class="chip ${esc(rejected ? "unverified" : c.status)}" data-msg="${esc(messageId ?? "")}" data-ord="${c.ordinal}" title="${esc(title)}">${esc(c.label)} ${rejected ? "✗" : STATUS_ICON[c.status] || ""}${ocr}</button>`;
   });
 }
 
@@ -253,12 +257,17 @@ function describeWarning(w) {
 }
 
 function assistantFromHistory(m) {
+  const x = m.extra || {};
   return answerBlock({
     placeholderMd: m.placeholder_markdown,
     text: m.content,
     citations: (m.citations || []).map(snapshotCitation),
     supported: m.supported,
-    notFound: m.content.startsWith("The indexed literature doesn't contain"),
+    notFound: x.not_found ?? m.content.startsWith("The indexed literature doesn't contain"),
+    suggestions: x.suggestions,
+    unsupported: x.unsupported_sentences,
+    invalid: x.invalid_markers,
+    sources: x.closest,
     warnings: Array.isArray(m.warnings) ? m.warnings.map((w) => ({ ...w, message: warningText(w) })) : [],
     model: m.model,
     messageId: m.id,
@@ -444,6 +453,11 @@ async function inspectCitation(citation, messageId, chipEl) {
   }
   const mode = c.status === "verified" ? "quote" : c.status === "verified_paraphrase" ? "para" : "whole";
   renderChunkText(chunk.text, c.span, mode);
+  if (c.quote_repaired) showNote("The model's first quote wasn't in the source, so the exact supporting words were re-selected from this passage afterwards and verified.");
+  if (c.support) {
+    const text = { yes: "Strict check: the passage supports this sentence.", partial: "Strict check: the passage supports only part of this sentence.", no: "Strict check: the passage does NOT support this sentence." }[c.support];
+    $("#insp-status").append(" ", el("span", { class: `chip ${c.support === "yes" ? "verified" : "unverified"}` }, text));
+  }
   if (chunk.ocr) $("#insp-label").append(el("span", { class: "ocr-badge", title: "Text recognized from a scanned page; small recognition errors are possible" }, "OCR"));
   if (mode !== "quote") {
     showNote(c.status === "unverified"
@@ -601,7 +615,10 @@ $("#search-form").addEventListener("submit", async (e) => {
   const list = $("#search-results");
   list.replaceChildren(el("li", { class: "muted" }, "Searching…"));
   try {
-    const { hits } = await api("/api/search", { method: "POST", body: JSON.stringify({ query: $("#search-q").value, k: 15 }) });
+    const doc = $("#search-doc").value;
+    const yf = parseInt($("#search-from").value, 10), yt = parseInt($("#search-to").value, 10);
+    const filter = { doc_ids: doc ? [Number(doc)] : null, year_from: Number.isFinite(yf) ? yf : null, year_to: Number.isFinite(yt) ? yt : null };
+    const { hits } = await api("/api/search", { method: "POST", body: JSON.stringify({ query: $("#search-q").value, k: 15, filter }) });
     if (!hits.length) { list.replaceChildren(el("li", { class: "muted" }, "No matches.")); return; }
     list.replaceChildren(...hits.map((h) => {
       const c = h.chunk;
@@ -614,6 +631,15 @@ $("#search-form").addEventListener("submit", async (e) => {
     list.replaceChildren(el("li", { class: "error" }, err.message));
   }
 });
+
+async function loadSearchDocs() {
+  const sel = $("#search-doc");
+  const keep = sel.value;
+  const { documents } = await api("/api/documents");
+  sel.replaceChildren(el("option", { value: "" }, "All documents"),
+    ...documents.filter((d) => d.status === "indexed" || d.status === "needs_ocr").map((d) => el("option", { value: d.id }, d.label)));
+  sel.value = documents.some((d) => String(d.id) === keep) ? keep : "";
+}
 
 // ---------------------------------------------------------------- library
 
@@ -936,7 +962,7 @@ async function openSettings() {
     ? "Polite pool: up to 10 DOI lookups and 3 title searches per second. Clear the field to stop sending it."
     : "Public pool: 5 DOI lookups and 1 title search per second. Stored only on this Mac and sent only to Crossref.";
   const ws = s.workspace;
-  for (const id of ["#set-model", "#set-numctx", "#set-ocr"]) $(id).disabled = !ws;
+  for (const id of ["#set-model", "#set-numctx", "#set-ocr", "#set-repair", "#set-strict"]) $(id).disabled = !ws;
   if (ws) {
     const { models } = await api("/api/models").catch(() => ({ models: [] }));
     $("#set-model").replaceChildren(...models.map((m) => el("option", { value: m.name }, m.name)));
@@ -946,6 +972,8 @@ async function openSettings() {
     fill();
     $("#set-numctx").placeholder = "chosen from this Mac's memory on first use";
     $("#set-ocr").value = ws.ocr;
+    $("#set-repair").checked = ws.repair_quotes;
+    $("#set-strict").checked = ws.strict;
   }
   $("#settings-dialog").hidden = false;
 }
@@ -954,6 +982,8 @@ $("#settings-save").addEventListener("click", async () => {
   if (!$("#set-model").disabled) {
     body.chat_model = $("#set-model").value;
     body.ocr = $("#set-ocr").value;
+    body.repair_quotes = $("#set-repair").checked;
+    body.strict = $("#set-strict").checked;
     const n = parseInt($("#set-numctx").value, 10);
     if (n) body.num_ctx = { [body.chat_model]: n };
   }

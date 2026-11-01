@@ -61,6 +61,21 @@ pub struct Citation {
     /// Char range in `chunk.text` to highlight.
     pub span: Option<(usize, usize)>,
     pub span_source: SpanSource,
+    /// The sentence this citation supports.
+    pub claim: String,
+    /// The model's quote wasn't in the source; the verified quote was re-selected from the
+    /// passage in a follow-up request.
+    pub quote_repaired: bool,
+    /// Strict mode's verdict on whether the passage supports the claim.
+    pub support: Option<Support>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Support {
+    Yes,
+    Partial,
+    No,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,7 +188,7 @@ impl RagEngine<'_> {
             on(Event::Query(&answer.query));
         }
 
-        let opts = SearchOptions { candidates: cfg.retrieval.candidates, limit: cfg.retrieval.max_sources * 2, per_doc_cap: cfg.retrieval.per_doc_cap };
+        let opts = SearchOptions { candidates: cfg.retrieval.candidates, limit: cfg.retrieval.max_sources * 2, per_doc_cap: cfg.retrieval.per_doc_cap, ..SearchOptions::default() };
         let hits = retrieval::search(self.conn, self.embedder, &answer.query, &opts)?;
         let min_sim = cfg.retrieval.min_similarity;
         let best = hits.iter().filter_map(|h| h.similarity).fold(f32::MIN, f32::max);
@@ -258,7 +273,7 @@ impl RagEngine<'_> {
         messages.push(Message::user(prompts::question_with_sources(question, &answer.sources)));
         let sent: usize = messages.iter().map(|m| counter.count(&m.content) + PER_MESSAGE_OVERHEAD).sum();
 
-        let req = ChatRequest { model: model.to_string(), messages: messages.clone(), num_ctx, temperature: 0.2, think, num_predict: None };
+        let req = ChatRequest { model: model.to_string(), messages: messages.clone(), num_ctx, temperature: 0.2, think, num_predict: None, format: None };
         let resp = self.llm.chat(&req, &mut |d| match d {
             Delta::Thinking(t) => on(Event::Thinking(t)),
             Delta::Content(t) => on(Event::Token(t)),
@@ -283,8 +298,14 @@ impl RagEngine<'_> {
         }
         let markers = citations::parse_markers(&answer.text);
         self.resolve_citations(&mut answer, &markers);
+        if cfg.repair_quotes {
+            self.repair_quotes(&mut answer, model, num_ctx)?;
+        }
+        if cfg.strict {
+            self.check_support(&mut answer, model, num_ctx)?;
+        }
         answer.unsupported_sentences = citations::uncited_sentences(&answer.text, &markers);
-        answer.supported = answer.citations.iter().any(|c| c.status.counts_as_support());
+        answer.supported = answer.citations.iter().any(|c| c.status.counts_as_support() && c.support != Some(Support::No));
         Ok(answer)
     }
 
@@ -307,6 +328,9 @@ impl RagEngine<'_> {
                     },
                 };
                 answer.citations.push(Citation {
+                    claim: claim.clone(),
+                    quote_repaired: false,
+                    support: None,
                     ordinal: ordinal - 1,
                     status: if span_source == SpanSource::Quote { CitationStatus::Verified } else { CitationStatus::Unverified },
                     marker: item.source,
@@ -318,6 +342,90 @@ impl RagEngine<'_> {
                 });
             }
         }
+    }
+
+    /// For citations whose quote isn't in the source: ask once for the exact supporting words
+    /// and verify those like any quote. At most a handful per answer.
+    fn repair_quotes(&self, answer: &mut Answer, model: &str, num_ctx: u32) -> anyhow::Result<()> {
+        const MAX_REPAIRS: usize = 6;
+        let todo: Vec<usize> = (0..answer.citations.len()).filter(|&i| answer.citations[i].status == CitationStatus::Unverified).take(MAX_REPAIRS).collect();
+        for i in todo {
+            let c = &answer.citations[i];
+            let req = ChatRequest {
+                model: model.to_string(),
+                messages: vec![Message::system(prompts::REPAIR_SYSTEM), Message::user(prompts::repair_request(&c.claim, &c.chunk.text))],
+                num_ctx,
+                temperature: 0.0,
+                think: false,
+                num_predict: Some(60),
+                format: None,
+            };
+            let reply = self.llm.chat(&req, &mut |_| {})?.content;
+            let phrase = reply.trim().trim_matches(['"', '“', '”', '\'']).trim();
+            if phrase.is_empty() || phrase.eq_ignore_ascii_case("none") || phrase.split_whitespace().count() < 3 {
+                continue;
+            }
+            if let Some(r) = citations::verify_quote(phrase, &c.chunk.text, c.chunk.ocr) {
+                let c = &mut answer.citations[i];
+                c.quote = Some(phrase.to_string());
+                c.quote_verified = true;
+                c.quote_repaired = true;
+                c.span = Some((r.start, r.end));
+                c.span_source = SpanSource::Quote;
+                c.status = CitationStatus::Verified;
+            }
+        }
+        Ok(())
+    }
+
+    /// Strict mode: one structured request judging every citation's passage against its claim.
+    fn check_support(&self, answer: &mut Answer, model: &str, num_ctx: u32) -> anyhow::Result<()> {
+        if answer.citations.is_empty() {
+            return Ok(());
+        }
+        let items: Vec<(String, String)> = answer
+            .citations
+            .iter()
+            .map(|c| {
+                let passage = match (c.status, c.span) {
+                    (CitationStatus::Verified, Some((a, b))) => c.chunk.text.chars().skip(a.saturating_sub(200)).take(b - a.saturating_sub(200) + 200).collect(),
+                    _ => c.chunk.text.clone(),
+                };
+                (c.claim.clone(), passage)
+            })
+            .collect();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "verdicts": { "type": "array", "items": {
+                "type": "object",
+                "properties": { "item": { "type": "integer" }, "verdict": { "type": "string", "enum": ["yes", "partial", "no"] } },
+                "required": ["item", "verdict"]
+            } } },
+            "required": ["verdicts"]
+        });
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: vec![Message::system(prompts::SUPPORT_SYSTEM), Message::user(prompts::support_request(&items))],
+            num_ctx,
+            temperature: 0.0,
+            think: false,
+            num_predict: Some(40 * items.len() as i64 + 50),
+            format: Some(schema),
+        };
+        let reply = self.llm.chat(&req, &mut |_| {})?.content;
+        let parsed: serde_json::Value = serde_json::from_str(reply.trim()).unwrap_or_default();
+        for v in parsed["verdicts"].as_array().into_iter().flatten() {
+            let (Some(i), Some(verdict)) = (v["item"].as_u64(), v["verdict"].as_str()) else { continue };
+            if let Some(c) = answer.citations.get_mut(i as usize) {
+                c.support = match verdict {
+                    "yes" => Some(Support::Yes),
+                    "partial" => Some(Support::Partial),
+                    "no" => Some(Support::No),
+                    _ => None,
+                };
+            }
+        }
+        Ok(())
     }
 
     fn warn(&self, answer: &mut Answer, on: &mut dyn FnMut(Event), w: ContextWarning) {
@@ -334,6 +442,7 @@ impl RagEngine<'_> {
             temperature: 0.0,
             think: false,
             num_predict: Some(80),
+            format: None,
         };
         let resp = self.llm.chat(&req, &mut |_| {})?;
         let q = resp.content.lines().find(|l| !l.trim().is_empty()).unwrap_or(question).trim().trim_matches('"');
@@ -348,6 +457,7 @@ impl RagEngine<'_> {
             temperature: 0.3,
             think: false,
             num_predict: Some(300),
+            format: None,
         };
         let resp = self.llm.chat(&req, &mut |_| {})?;
         Ok(resp
@@ -361,19 +471,31 @@ impl RagEngine<'_> {
     }
 }
 
-/// The sentence a marker at byte `pos` supports: text since the previous sentence end, or
-/// the sentence before when the marker follows a full stop.
+/// The sentence a marker at byte `pos` supports: the sentence the marker sits in, or the one
+/// before when the marker follows a full stop. Uses Unicode sentence boundaries, so decimals
+/// ("65.2 years") and abbreviations ("U.S.") don't end a sentence.
 fn claim_before(text: &str, pos: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
     let before = &text[..pos];
-    let ends = |s: &str| s.rfind(['.', '!', '?', '\n']);
-    match ends(before) {
-        Some(i) if before[i + 1..].trim().is_empty() => {
-            let prev = &before[..i];
-            prev[ends(prev).map_or(0, |j| j + 1)..].trim().to_string()
-        }
-        Some(i) => before[i + 1..].trim().to_string(),
-        None => before.trim().to_string(),
+    let sentences: Vec<&str> = before.split_sentence_bounds().collect();
+    let mut tail = sentences.iter().rev().map(|s| s.trim());
+    let last = tail.next().unwrap_or("");
+    // Only markers/whitespace since the last sentence ended: the claim is that sentence.
+    let claim = if last.chars().any(char::is_alphanumeric) { last } else { tail.find(|s| !s.is_empty()).unwrap_or("") };
+    strip_trailing_markers(claim)
+}
+
+/// Drops earlier citation markers at the end of a claim ("… length [S1] and [S2" → "… length").
+fn strip_trailing_markers(s: &str) -> String {
+    let markers = citations::parse_markers(s);
+    let mut out = String::new();
+    let mut i = 0;
+    for m in &markers {
+        out.push_str(&s[i..m.range.start]);
+        i = m.range.end;
     }
+    out.push_str(&s[i..]);
+    out.split_whitespace().collect::<Vec<_>>().join(" ").trim_end_matches(['.', ' ']).to_string()
 }
 
 #[cfg(test)]
@@ -385,5 +507,10 @@ mod tests {
         let t = "First fact here. Second fact [S1]. Third fact. [S2]";
         assert_eq!(claim_before(t, t.find("[S1]").unwrap()), "Second fact");
         assert_eq!(claim_before(t, t.find("[S2]").unwrap()), "Third fact");
+        let t = "Intro. The mean age was 65.2 years [S1 \"q\"]. In the U.S. population, SEER is more urban [S2].";
+        assert_eq!(claim_before(t, t.find("[S1").unwrap()), "The mean age was 65.2 years");
+        assert_eq!(claim_before(t, t.find("[S2]").unwrap()), "In the U.S. population, SEER is more urban");
+        let t = "Joinpoint was 120.5 days [S1] and bladder 250.1 days [S2].";
+        assert_eq!(claim_before(t, t.find("[S2]").unwrap()), "Joinpoint was 120.5 days and bladder 250.1 days");
     }
 }

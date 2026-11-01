@@ -62,3 +62,19 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
     format!("{}…", s.chars().take(max_chars).collect::<String>())
 }
+
+pub const REPAIR_SYSTEM: &str = "You are given a claim and a source passage. Copy, word for word, the shortest phrase (3 to 15 words) from the passage that supports the claim. Reply with that phrase only, exactly as it appears in the passage. If nothing in the passage supports the claim, reply NONE.";
+
+pub fn repair_request(claim: &str, passage: &str) -> String {
+    format!("Claim: {claim}\n\nPassage:\n{passage}")
+}
+
+pub const SUPPORT_SYSTEM: &str = "For each numbered item, decide whether the passage supports the claim: \"yes\" if it states it, \"partial\" if it supports only part of it, \"no\" if it does not support it. Judge only from the passage.";
+
+pub fn support_request(items: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (i, (claim, passage)) in items.iter().enumerate() {
+        s.push_str(&format!("Item {i}\nClaim: {claim}\nPassage: {passage}\n\n"));
+    }
+    s
+}

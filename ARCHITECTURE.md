@@ -1075,12 +1075,65 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     Phase 5); bibliography export (later).
 
 **Phase 5: quality & polish**
-- Follow-up rewriting, file watcher, strict mode.
+- File watcher, strict mode, quote repair, search filters (follow-up rewriting shipped in
+  Phase 2).
 - Tune the gate, k and chunk size against the eval.
-- **Batch embeddings across files.** Phase 1 sends one `/api/embed` request per file, so a
-  corpus of many small files indexes slowly (~7.7 chunks/s: 375 chunks in 49 s). Queue chunks
-  from several files into full batches, and keep one transaction per file by writing each
-  file once all its vectors are back.
+- **Batch embeddings across files: measured, not worth it (2026-10-31).** Cross-file batching
+  was built and benchmarked on the 3 PDFs + 300 notes: 50 s, versus 49 s without.
+  - Tracing showed that the 300 tiny notes take ~1 s per 32. Almost all the time is the
+    ~75 PDF chunks (~480 tokens each).
+  - Direct `/api/embed` measurements on real chunks: 32 at once, 4×8, 8×4 and 32×1 all take
+    ~15 s for ~18,700 tokens. So `qwen3-embedding:0.6b` under Ollama on the M2 is
+    **compute-bound at ~1,250 tokens/s**, and round trips don't matter. The change was
+    reverted.
+  - **What this means:** the first index of a large corpus takes a while. Each ~500-token
+    chunk costs ~0.4 s, so 100 papers × 60 chunks is about 40 minutes; after that, syncs are
+    incremental. A faster embedding model (e.g. `embeddinggemma`, `nomic-embed-text`) trades
+    retrieval quality for speed. Measure with `localrag eval` before switching, since
+    switching re-embeds everything.
+
+- **Done (2026-11-01):**
+  - **File watcher:** `corpus/` of the active workspace is watched (FSEvents, 1.5 s
+    debounce). A file added in Finder was indexed within seconds. Hidden files are ignored,
+    judged *relative to corpus/*: a first version checked the whole path and silently ignored
+    every event for a workspace inside a hidden folder.
+  - **Chat history keeps everything an answer showed** (schema v4): suggestions, uncited
+    sentences, invalid citations, not-found state, closest material.
+  - **Search filters:** a document and a year range (from metadata; documents without a year
+    are excluded once a range is set).
+  - **Quote repair (on by default):**
+    - For a citation whose quote isn't in its source, one short request asks the model to
+      copy the supporting words exactly from that passage. The phrase is verified like any
+      quote; if it isn't in the passage, nothing changes.
+    - The UI and CLI mark such quotes as *re-selected*.
+  - **Strict mode (off by default, Settings):** one structured-output request (JSON schema
+    via Ollama `format`) judges each cited passage yes / partial / no against its sentence.
+    A "no" shows as ✗ and doesn't count towards "supported".
+  - **Bug found by the eval:** citation claims were cut at any ".", so "…was 65.2 years [S1]"
+    yielded the claim "2 years" (also with "120.5", "U.S."). That wrecked strict-mode
+    verdicts and weakened quote repair. Claims now use Unicode sentence boundaries.
+  - **Eval set grown to 33 questions** (26 answerable, 7 unanswerable, including table
+    lookups). Results with `qwen3.5:4b`:
+
+    | Setting | Supported | Refused (unanswerable) | Quotes verified | Re-selected | Rejected by strict |
+    |---------|-----------|------------------------|-----------------|-------------|--------------------|
+    | No repair | 96% | 100% | 80% | — | — |
+    | **Repair (default)** | **100%** | 100% | **97%** | 10% | — |
+    | Repair + strict | 92% | 100% | 94% | 12% | 9% |
+
+    Citation precision was 100% throughout. Strict mode's rejections after the fix were mostly
+    real: a hedged "not enough information" answer that still cited a source, and a
+    percentage attributed to the wrong population. It costs one extra request per answer, so
+    it stays opt-in.
+  - **Chunk size:** 350 / 500 / 700 tokens gave page recall@5 of 88% / **92%** / 88% (@10:
+    100% / 100% / 92%), so 500 stays.
+  - **Similarity gate:** stays at 0.45; it only separates off-topic questions. The new
+    on-topic unanswerables score up to 0.75, above the lowest answerable (0.58), so refusals
+    rest on the model's `INSUFFICIENT:`, which held at 100%.
+  - **Cross-file embedding batching:** measured and reverted (see above).
+  - **Seen, for later:** reference-list chunks ("12. Conroy, T.; …") rank fairly high in
+    search. Detecting References sections and down-weighting them would clean up results.
+  - 67 tests pass.
 
 **Phase 6: packaging** (§19)
 - Tauri app, bundled PDFium, first-run checks, ad-hoc signing, `.dmg` + README.

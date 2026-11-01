@@ -27,6 +27,8 @@ pub async fn get(State(state): State<AppState>) -> ApiResult {
                 "num_ctx": w.config.num_ctx,
                 "ocr": w.config.ocr,
                 "think": w.config.think,
+                "repair_quotes": w.config.repair_quotes,
+                "strict": w.config.strict,
             })),
         })))
     })
@@ -43,6 +45,8 @@ pub struct Update {
     num_ctx: Option<BTreeMap<String, u32>>,
     ocr: Option<OcrMode>,
     think: Option<bool>,
+    repair_quotes: Option<bool>,
+    strict: Option<bool>,
 }
 
 /// Distinguishes a missing field (leave as is) from `null` (clear).
@@ -68,7 +72,7 @@ pub async fn put(State(state): State<AppState>, Json(u): Json<Update>) -> ApiRes
             }
             config::save_global(&g)?;
         }
-        if u.chat_model.is_some() || u.num_ctx.is_some() || u.ocr.is_some() || u.think.is_some() {
+        if u.chat_model.is_some() || u.num_ctx.is_some() || u.ocr.is_some() || u.think.is_some() || u.repair_quotes.is_some() || u.strict.is_some() {
             let mut ws = state.workspace()?;
             if let Some(m) = u.chat_model.filter(|m| !m.trim().is_empty()) {
                 ws.config.chat_model = m;
@@ -86,6 +90,12 @@ pub async fn put(State(state): State<AppState>, Json(u): Json<Update>) -> ApiRes
             }
             if let Some(t) = u.think {
                 ws.config.think = t;
+            }
+            if let Some(r) = u.repair_quotes {
+                ws.config.repair_quotes = r;
+            }
+            if let Some(st) = u.strict {
+                ws.config.strict = st;
             }
             ws.save_config()?;
         }

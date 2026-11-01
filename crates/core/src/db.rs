@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -74,6 +74,9 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 3 {
             conn.execute_batch(SCHEMA_V3).context("migrating to schema v3")?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4).context("migrating to schema v4")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -152,6 +155,12 @@ ALTER TABLE documents ADD COLUMN metadata_candidates TEXT;
 ALTER TABLE documents ADD COLUMN metadata_error TEXT;
 ALTER TABLE documents ADD COLUMN metadata_checked_at TEXT;
 ALTER TABLE chunks ADD COLUMN page_label_offset_applied INTEGER NOT NULL DEFAULT 0;
+";
+
+/// What else an answer showed, so reopened chats show it too: suggestions, uncited sentences,
+/// invalid citations, whether it was "not found", and the closest material.
+const SCHEMA_V4: &str = "
+ALTER TABLE messages ADD COLUMN extra_json TEXT;
 ";
 
 /// (Re)creates `chunks_vec` for `dim` dimensions together with the trigger that keeps it

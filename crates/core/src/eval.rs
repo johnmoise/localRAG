@@ -103,6 +103,10 @@ pub struct AnswerResult {
     pub not_found: bool,
     pub citations: usize,
     pub verified: usize,
+    /// Verified only after the quote was re-selected from the source.
+    pub repaired: usize,
+    /// Strict mode said the passage doesn't support the sentence.
+    pub rejected_by_check: usize,
     /// Citations pointing into the expected document.
     pub on_expected_doc: usize,
     pub invalid_markers: usize,
@@ -120,6 +124,8 @@ pub fn answer_result(item: &EvalItem, a: &Answer) -> AnswerResult {
         not_found: a.not_found,
         citations: a.citations.len(),
         verified: a.citations.iter().filter(|c| c.quote_verified).count(),
+        repaired: a.citations.iter().filter(|c| c.quote_repaired).count(),
+        rejected_by_check: a.citations.iter().filter(|c| c.support == Some(crate::answer::Support::No)).count(),
         on_expected_doc: want.map_or(0, |w| a.citations.iter().filter(|c| c.chunk.doc_path.to_lowercase().contains(&w)).count()),
         invalid_markers: a.invalid_markers.len(),
         uncited_sentences: a.unsupported_sentences.len(),
@@ -154,6 +160,9 @@ pub struct Summary {
     pub unanswerable: usize,
     pub refusal_rate: Option<f32>,
     pub quote_verification_rate: Option<f32>,
+    /// Share of citations verified only thanks to quote repair.
+    pub repaired_rate: Option<f32>,
+    pub rejected_by_check_rate: Option<f32>,
     pub citation_precision: Option<f32>,
 }
 
@@ -186,6 +195,8 @@ pub fn summarize(items: &[EvalItem], retrieval: &[RetrievalResult], answers: &[A
         unanswerable: unanswerable.len(),
         refusal_rate: rate(unanswerable.iter().filter(|a| !a.supported).count(), unanswerable.len()),
         quote_verification_rate: rate(answerable.iter().map(|a| a.verified).sum(), cites),
+        repaired_rate: rate(answerable.iter().map(|a| a.repaired).sum(), cites),
+        rejected_by_check_rate: rate(answerable.iter().map(|a| a.rejected_by_check).sum(), cites),
         citation_precision: rate(answerable.iter().map(|a| a.on_expected_doc).sum(), cites),
     }
 }

@@ -32,6 +32,8 @@ pub struct ChatRequest {
     pub temperature: f32,
     pub think: bool,
     pub num_predict: Option<i64>,
+    /// Ollama structured output: a JSON schema the reply must follow.
+    pub format: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,7 +118,13 @@ impl Llm for Ollama {
         let resp = self
             .client
             .post(format!("{}/api/chat", self.host))
-            .json(&json!({ "model": req.model, "messages": req.messages, "stream": true, "think": req.think, "options": options }))
+            .json(&{
+                let mut body = json!({ "model": req.model, "messages": req.messages, "stream": true, "think": req.think, "options": options });
+                if let Some(f) = &req.format {
+                    body["format"] = f.clone();
+                }
+                body
+            })
             .send()
             .with_context(|| format!("no response from Ollama at {}; is it running?", self.host))?;
         if !resp.status().is_success() {
