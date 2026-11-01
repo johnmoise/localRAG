@@ -25,6 +25,14 @@ const ACCEPTED: &str = "PDF (.pdf), Markdown (.md, .markdown) and plain text (.t
 #[derive(Deserialize)]
 pub struct UploadQuery {
     name: String,
+    /// `false` leaves indexing to a later request (the UI uploads a batch, then starts one
+    /// sync for all of it). Default: index now.
+    #[serde(default = "yes")]
+    sync: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub async fn upload(State(state): State<AppState>, Query(q): Query<UploadQuery>, body: Bytes) -> ApiResult {
@@ -73,10 +81,8 @@ pub async fn upload(State(state): State<AppState>, Query(q): Query<UploadQuery>,
         };
         let target = unique_path(&corpus, &name);
         std::fs::rename(&tmp, &target).map_err(anyhow::Error::from)?;
-        // The rename into corpus/ is seen by the folder watcher, which syncs once the folder
-        // settles (several uploads in a row become one sync). Starting a sync here as well
-        // would index twice; only do it if the watcher isn't running.
-        if !state.is_watching() {
+        // Indexing is manual: an upload (or Reindex) is what starts it.
+        if q.sync {
             state.start_sync();
         }
 

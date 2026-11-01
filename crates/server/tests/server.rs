@@ -232,75 +232,68 @@ fn urlencode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn files_dropped_into_corpus_trigger_a_sync() {
-    isolate_config();
-    let dir = tempfile::tempdir().unwrap();
-    Workspace::init(dir.path()).unwrap();
-    let s = AppState::new(None, PORT, TOKEN.into());
-    s.activate(dir.path()).unwrap();
-    // Let the activation sync finish.
-    let wait_runs = |n: u64| {
-        let s = s.clone();
-        async move {
-            for _ in 0..200 {
-                let st = s.sync.lock().unwrap().clone();
-                if !st.running && st.runs >= n {
-                    return st.runs;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            panic!("no sync reached run {n}");
-        }
-    };
-    let before = wait_runs(1).await;
-    std::fs::write(dir.path().join("corpus/.hidden-temp"), "ignored").unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-    assert_eq!(s.sync.lock().unwrap().runs, before, "hidden files don't trigger a sync");
-    std::fs::write(dir.path().join("corpus/new note.md"), "# Note\nDropped in from Finder.\n").unwrap();
-    assert!(wait_runs(before + 1).await > before);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn uploads_are_indexed_by_one_watcher_sync() {
-    isolate_config();
-    let dir = tempfile::tempdir().unwrap();
-    Workspace::init(dir.path()).unwrap();
-    let s = AppState::new(None, PORT, TOKEN.into());
-    s.activate(dir.path()).unwrap();
-    assert!(s.is_watching());
-    let settle = || {
-        let s = s.clone();
-        async move {
-            for _ in 0..200 {
-                let st = s.sync.lock().unwrap().clone();
-                if !st.running {
-                    return st.runs;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            panic!("sync never finished");
-        }
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let before = settle().await;
-    for name in ["a.md", "b.md", "c.md"] {
-        let r = authed("POST", &format!("/api/documents/upload?name={name}")).body(Body::from("# Note\nSome text.\n")).unwrap();
-        assert_eq!(send(&s, r).await.0, StatusCode::OK);
-    }
-    // The watcher settles after 1.5 s of quiet, then syncs once for all three files. Wait for
-    // that sync (slow on a loaded machine), then long enough for any second one to show up.
-    for _ in 0..100 {
-        if s.sync.lock().unwrap().runs > before {
-            break;
+/// Completed syncs once none is running (waits up to 20 s for a running one).
+async fn settled_runs(s: &AppState) -> u64 {
+    for _ in 0..200 {
+        let st = s.sync.lock().unwrap().clone();
+        if !st.running {
+            return st.runs;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    settle().await;
+    panic!("sync never finished");
+}
+
+fn document_count(dir: &std::path::Path) -> i64 {
+    let ws = Workspace::open(dir).unwrap();
+    db::open(&ws.db_path()).unwrap().query_row("SELECT count(*) FROM documents", [], |r| r.get(0)).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn indexing_is_manual_opening_or_changing_corpus_does_not_sync() {
+    isolate_config();
+    let dir = tempfile::tempdir().unwrap();
+    Workspace::init(dir.path()).unwrap();
+    std::fs::write(dir.path().join("corpus/already here.md"), "# Note\nThere before opening.\n").unwrap();
+    let s = AppState::new(None, PORT, TOKEN.into());
+    s.activate(dir.path()).unwrap();
+    std::fs::write(dir.path().join("corpus/new note.md"), "# Note\nDropped in from Finder.\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-    let after = settle().await;
-    assert_eq!(after, before + 1, "three uploads → exactly one sync (no extra sync from the upload itself)");
-    let ws = Workspace::open(dir.path()).unwrap();
-    let n: i64 = db::open(&ws.db_path()).unwrap().query_row("SELECT count(*) FROM documents", [], |r| r.get(0)).unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(settled_runs(&s).await, 0, "neither opening the workspace nor a new file starts a sync");
+    assert_eq!(document_count(dir.path()), 0);
+
+    let r = authed("POST", "/api/reindex").body(Body::empty()).unwrap();
+    assert_eq!(send(&s, r).await.0, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(settled_runs(&s).await, 1);
+    assert_eq!(document_count(dir.path()), 2, "Reindex picks up everything in corpus/");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_indexes_and_a_batch_can_defer_to_one_sync() {
+    isolate_config();
+    let dir = tempfile::tempdir().unwrap();
+    Workspace::init(dir.path()).unwrap();
+    let s = AppState::new(None, PORT, TOKEN.into());
+    s.activate(dir.path()).unwrap();
+
+    // The UI's batch: every file with sync=false, then one Reindex.
+    for name in ["a.md", "b.md", "c.md"] {
+        let r = authed("POST", &format!("/api/documents/upload?name={name}&sync=false")).body(Body::from("# Note\nSome text.\n")).unwrap();
+        assert_eq!(send(&s, r).await.0, StatusCode::OK);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(settled_runs(&s).await, 0, "deferred uploads don't sync");
+    let r = authed("POST", "/api/reindex").body(Body::empty()).unwrap();
+    assert_eq!(send(&s, r).await.0, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(settled_runs(&s).await, 1, "three uploads → exactly one sync");
+    assert_eq!(document_count(dir.path()), 3);
+
+    // A plain upload (the API default) indexes by itself.
+    let r = authed("POST", "/api/documents/upload?name=d.md").body(Body::from("# Note\nMore text.\n")).unwrap();
+    assert_eq!(send(&s, r).await.0, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(settled_runs(&s).await, 2);
+    assert_eq!(document_count(dir.path()), 4);
 }

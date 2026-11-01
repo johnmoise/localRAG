@@ -79,7 +79,7 @@ runs inference over HTTP.
 | Chunking | `text-splitter` |
 | Token counting | `tokenizers` (Hugging Face) |
 | Hashing | `sha2` |
-| Files | `ignore` (gitignore-style rules), `notify` (watching) |
+| Files | `ignore` (gitignore-style rules) |
 | Config | `toml` + `serde` |
 | Logging / errors | `tracing`, `anyhow` / `thiserror` |
 | Frontend | Static HTML/JS/CSS embedded with `rust-embed`; vendored `marked`, `DOMPurify`, PDF.js. No build step, works offline |
@@ -105,8 +105,9 @@ A workspace is a folder with `.localrag/` and `corpus/`.
   refuse while the app runs. Read-only ones (`status`, `search`, `check`, `doctor`) don't need it.
 - **Starting:** plain `serve` starts with no workspace and the UI opens on the picker;
   `serve -C <dir>` opens that workspace directly.
-- **Switching** replaces the active workspace for every route and starts its sync. A sync
-  still running for the previous workspace finishes, and its result is discarded.
+- **Switching** replaces the active workspace for every route; it doesn't start a sync
+  (indexing is manual, §15). A sync still running for the previous workspace finishes, and
+  its result is discarded.
 - **Known workspaces:** `~/.config/localrag/workspaces.json` (0600) stores only paths, names
   and last-opened times. Workspaces whose folder has disappeared are shown as unavailable.
 
@@ -900,9 +901,10 @@ workspace menu, a Settings panel, and first-load dialogs.
       scanned pages. Files over `max_file_mb` are refused too.
     - Accepted files are written atomically (hidden temp name, then rename). Name clashes
       become `name (2).pdf`. The file reports its pages and any scanned pages.
-    - Indexing is left to the folder watcher, which sees the file arrive in `corpus/`:
-      several uploads in a row produce one sync (tested), and the upload starts no sync of its
-      own. It does start one only if the watcher isn't running.
+    - **Indexing is manual:** it starts only from an upload or **Reindex**. Nothing watches
+      `corpus/`, and opening a workspace doesn't sync it, so files added in Finder appear after
+      **Reindex**. The UI uploads a batch with `sync=false` and then starts one sync for all of
+      it (tested); a plain API upload indexes by itself.
   - **Rename** (any document still in `corpus/`):
     - Edits the name inline. The extension is shown as a fixed suffix, because changing the
       type would mean reindexing.
@@ -1193,10 +1195,8 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     switching re-embeds everything.
 
 - **Done (2026-11-01):**
-  - **File watcher:** `corpus/` of the active workspace is watched (FSEvents, 1.5 s
-    debounce). A file added in Finder was indexed within seconds. Hidden files are ignored,
-    judged *relative to corpus/*: a first version checked the whole path and silently ignored
-    every event for a workspace inside a hidden folder.
+  - **File watcher:** `corpus/` of the active workspace was watched (FSEvents, 1.5 s
+    debounce). *Removed later the same day: indexing is manual (§15).*
   - **Chat history keeps everything an answer showed** (schema v4): suggestions, uncited
     sentences, invalid citations, not-found state, closest material.
   - **Search filters:** a document and a year range (from metadata; documents without a year
@@ -1260,15 +1260,19 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     correctly unanswerable from the corpus. It now suggests van't Erve 2021, Baumgartner 2018
     and Reinert 2019 (similarity 0.58–0.65), all cited by Niemann 2024 and all on topic.
     Reinert 2019 is the closest fit.
-  - 82 tests pass. `uploads_are_indexed_by_one_watcher_sync` failed once under a full
-    parallel run right after a rebuild and passed every time since (timing).
+  - 82 tests pass.
+
+- **Done (2026-11-01): manual indexing.** The folder watcher is gone: indexing starts only
+  from an upload or **Reindex** (§15), and opening a workspace doesn't sync. The flaky
+  watcher-timing test went with it.
 
 **Phase 6: packaging** (§19)
-- Tauri app, bundled PDFium, first-run checks, ad-hoc signing, `.dmg` + README.
+- Tauri app, bundled PDFium, first-run checks, ad-hoc signing, `.dmg` + README + licenses.
 
 **Phase 7: reasoning agent & second brain**
 - Brain files, registry, integrity checks (§13), `check` for brains.
 - Second Brain tab with the Proposed Facts sidebar.
+- Main column should be current accepted facts.
 - Tools and agent loop; admission rules; `organize_brain` with undo.
 - *Exit:* an agent run proposes facts; approved facts appear in the right model's brain;
   `organize_brain` restructures without changing any fact line; `check` is clean.
@@ -1315,34 +1319,3 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 ## 21. Open questions
 
 None at the moment. New questions will be added here during implementation.
-
----
-
-## Appendix A: Original notes
-
-I want to build a program that helps the user explore and more efficiently utilize
-literature about that particular topic to conduct research and overall edify their own
-understanding of the material.
-- It should run a basic server that displays a simple web frontend to localhost. This
-  web front end should allow the user to enter questions about the material/literature
-  that is indexed in the RAG, search through the documents, find relevant chunks of
-  material and then have a locally running AI model answer the user's question with
-  these chunks as its context. As a RAG, the model should never provide unsubstantiated
-  answers and should always provide citations to corroborate.
-- The frontend should also allow the user to select from currently installed ollama models
-  for use with the RAG.
-- As a RAG, all answers should be cited from the literature, and if the model is unable
-  to substantiate its answer, it should state that it does not know and make suggestions
-  for material that it should be provided that it might find helpful in forming a
-  correct answer.
-- It should be stateful. (i.e. if the program is rerun, it should check for
-  differences/changes in files, but provided there is no change, it should not reindex.
-- I have a number of different interests and research projects, so I envision that I
-  would likely run this program in different workspaces, each with its own corpus of
-  documents for the local RAG. The indexing and model contexts should remain distinct to
-  the workspace/directory in which the executable is run.
-- Out of scope for now, but I hope to implement a reasoning model component to this
-  program as well. The user can pose a question to the reasoning model, the reasoning
-  model will think and reason about the question and then ask its own questions to the
-  RAG model, whose answers will be used by the reasoning model to substantiate its
-  reasoning and conclusions.

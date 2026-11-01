@@ -956,7 +956,8 @@ $("#add-docs-input").addEventListener("change", async (e) => {
       continue;
     }
     try {
-      const r = await api(`/api/documents/upload?name=${encodeURIComponent(f.name)}`, {
+      // Indexing starts once, after the whole batch (below).
+      const r = await api(`/api/documents/upload?name=${encodeURIComponent(f.name)}&sync=false`, {
         method: "POST", body: f, headers: { "Content-Type": "application/octet-stream" },
       });
       const c = r.check;
@@ -970,7 +971,11 @@ $("#add-docs-input").addEventListener("change", async (e) => {
       row.textContent = err.message;
     }
   }
-  if (list.querySelector("li.ok")) await waitForSync(before);
+  if (list.querySelector("li.ok")) {
+    await api("/api/reindex", { method: "POST" });
+    refreshStatus();
+    await waitForSync(before);
+  }
   for (const row of list.querySelectorAll("li.ok")) row.textContent = row.textContent.replace(/ Indexing…$/, " Indexed.");
   loadDocuments();
 });
