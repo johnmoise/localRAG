@@ -141,7 +141,11 @@ impl Agent<'_> {
     }
 
     pub fn run_mode(&self, mode: Mode, question: &str, on: &mut dyn FnMut(AgentEvent)) -> anyhow::Result<AgentResult> {
-        self.conn.execute("INSERT INTO agent_runs (model, question, status, created_at) VALUES (?1, ?2, 'running', ?3)", params![self.model, question, db::now_rfc3339()])?;
+        let mode_s = serde_json::to_value(mode)?.as_str().unwrap_or("research").to_string();
+        self.conn.execute(
+            "INSERT INTO agent_runs (model, question, status, mode, created_at) VALUES (?1, ?2, 'running', ?3, ?4)",
+            params![self.model, question, mode_s, db::now_rfc3339()],
+        )?;
         let run_id = self.conn.last_insert_rowid();
         let result = self.run_inner(mode, run_id, question, on);
         match &result {
@@ -421,4 +425,54 @@ impl Agent<'_> {
             .to_string();
         (text, sources, invalid)
     }
+}
+
+/// A past run, for the Report tab's list.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunSummary {
+    pub id: i64,
+    pub model: String,
+    pub question: String,
+    pub mode: String,
+    /// running | done | failed
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+const RUN_COLUMNS: &str = "id, model, question, mode, status, error, created_at, finished_at";
+
+fn summary(r: &rusqlite::Row) -> rusqlite::Result<RunSummary> {
+    Ok(RunSummary { id: r.get(0)?, model: r.get(1)?, question: r.get(2)?, mode: r.get(3)?, status: r.get(4)?, error: r.get(5)?, created_at: r.get(6)?, finished_at: r.get(7)? })
+}
+
+/// Runs of `mode`, newest first.
+pub fn runs(conn: &Connection, mode: Mode, limit: usize) -> anyhow::Result<Vec<RunSummary>> {
+    let mode = serde_json::to_value(mode)?.as_str().unwrap_or_default().to_string();
+    Ok(conn
+        .prepare(&format!("SELECT {RUN_COLUMNS} FROM agent_runs WHERE mode = ?1 ORDER BY id DESC LIMIT ?2"))?
+        .query_map(params![mode, limit as i64], summary)?
+        .collect::<Result<_, _>>()?)
+}
+
+/// One run with its stored result (`null` while running or after a failure).
+pub fn run_detail(conn: &Connection, id: i64) -> anyhow::Result<Option<(RunSummary, Value)>> {
+    use rusqlite::OptionalExtension;
+    let row = conn
+        .query_row(&format!("SELECT {RUN_COLUMNS}, result_json FROM agent_runs WHERE id = ?1"), [id], |r| {
+            Ok((summary(r)?, r.get::<_, Option<String>>(8)?))
+        })
+        .optional()?;
+    Ok(row.map(|(s, j)| (s, j.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or(Value::Null))))
+}
+
+pub fn delete_run(conn: &Connection, id: i64) -> anyhow::Result<bool> {
+    Ok(conn.execute("DELETE FROM agent_runs WHERE id = ?1 AND status != 'running'", [id])? > 0)
+}
+
+/// Runs left `running` by a process that stopped (the app quit mid-run) are marked failed.
+pub fn fail_interrupted(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("UPDATE agent_runs SET status = 'failed', error = 'interrupted: localrag stopped during the run' WHERE status = 'running'", [])?;
+    Ok(())
 }

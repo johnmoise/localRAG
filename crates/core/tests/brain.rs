@@ -396,4 +396,15 @@ fn a_report_organizes_first_reads_the_whole_brain_and_proposes_nothing() {
     assert!(brain_text.contains("[FACT] F-0001 | Self-attention takes quadratic time") && !brain_text.contains("<doc:"), "{brain_text}");
     let refused = reqs.iter().flat_map(|q| q.messages.iter()).find(|m| m.tool_name.as_deref() == Some("propose_fact")).unwrap();
     assert!(refused.content.contains("isn't available"), "{}", refused.content);
+    drop(reqs);
+
+    // Reports are listed apart from research runs, newest first, with their stored result.
+    let listed = localrag_core::agent::runs(&f.conn, localrag_core::agent::Mode::Report, 10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].status.as_str(), listed[0].question.as_str()), ("done", "Why is attention expensive, and what helps?"));
+    assert!(localrag_core::agent::runs(&f.conn, localrag_core::agent::Mode::Research, 10).unwrap().is_empty());
+    let (_, result) = localrag_core::agent::run_detail(&f.conn, listed[0].id).unwrap().unwrap();
+    assert_eq!(result["mode"], "report");
+    assert!(result["text"].as_str().unwrap().starts_with("# Attention cost"));
+    assert!(localrag_core::agent::delete_run(&f.conn, listed[0].id).unwrap());
 }

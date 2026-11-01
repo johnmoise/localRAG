@@ -50,6 +50,7 @@ document.querySelectorAll(".tabs button").forEach((b) =>
     if (b.dataset.tab === "documents") loadDocuments();
     if (b.dataset.tab === "search") loadSearchDocs();
     if (b.dataset.tab === "brain") loadBrainModels();
+    if (b.dataset.tab === "report") loadReportTab();
   }),
 );
 
@@ -938,6 +939,8 @@ function onWorkspaceActivated(active) {
   brain.model = null;
   $("#agent-out").replaceChildren();
   if ($("#tab-brain").classList.contains("active")) loadBrainModels();
+  newReport();
+  if ($("#tab-report").classList.contains("active")) loadReportTab();
   maybePromptEmail();
 }
 
@@ -1393,56 +1396,192 @@ function queueCard(q) {
   return card;
 }
 
-$("#agent-form").addEventListener("submit", (e) => { e.preventDefault(); runAgent("research"); });
-$("#report-btn").addEventListener("click", () => ($("#agent-form").reportValidity() ? runAgent("report") : null));
+$("#agent-form").addEventListener("submit", (e) => { e.preventDefault(); runResearch(); });
 
-/// Research: answer and propose facts. Report: organize the brain, read all of it, then
-/// write a cited 4–5 paragraph report (no proposals).
-async function runAgent(mode) {
+/// A step line for a tool call: its name and its main argument.
+function stepItem(name, args) {
+  const arg = args?.question || args?.query || args?.claim || "";
+  return el("li", {}, el("span", { class: "tool" }, name), arg ? ` “${arg}”` : "");
+}
+
+/// The cited result of an agent run (research answer or report), with source chips.
+function agentResult(data, cls) {
+  const ans = el("div", { class: `agent-answer ${cls || ""}` });
+  ans.innerHTML = DOMPurify.sanitize(marked.parse(data.text || "(no answer)"));
+  if (data.invalid_markers?.length) ans.append(el("div", { class: "problem" }, `Citations that don't resolve: ${data.invalid_markers.join(", ")}`));
+  if (data.warnings?.length) ans.append(el("div", { class: "problem" }, data.warnings.join(" ")));
+  if (data.sources?.length) ans.append(el("div", { class: "cites" }, el("span", { class: "muted small-text" }, "Sources: "),
+    [...new Map(data.sources.map((s) => [`${s.chunk_id}|${s.quote}`, s])).values()].map((s) => {
+      const chip = el("button", { class: "chip verified", title: s.quote ? `“${s.quote}” (via ${s.via})` : s.via }, `✓ ${s.label}`);
+      chip.addEventListener("click", () => s.chunk_id && inspectCitation({ label: s.label, status: "verified", quote: s.quote, chunk_id: s.chunk_id, chunk_text_sha: s.chunk_text_sha, doc_sha256: s.doc_sha256 }, null, chip));
+      return chip;
+    })));
+  return ans;
+}
+
+/// Streams an agent run; `ui` gets each event. Resolves when the stream ends.
+async function streamAgent(body, ui) {
+  const res = await fetch("/api/agent/run", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || res.statusText); }
+  for await (const { event, data } of sse(res)) ui(event, data);
+}
+
+/// Research: answer the question and propose facts for the brain.
+async function runResearch() {
   const question = $("#agent-q").value.trim();
   if (!question || !brain.model) return;
-  const buttons = [$("#agent-btn"), $("#report-btn")];
-  buttons.forEach((b) => (b.disabled = true));
+  const btn = $("#agent-btn");
+  btn.disabled = true;
   $("#agent-error").textContent = "";
   const steps = el("ol", { class: "agent-steps" });
   const live = el("div", { class: "agent-answer muted" });
   $("#agent-out").replaceChildren(steps, live);
-  const addStep = (...c) => steps.append(el("li", {}, ...c));
   let thinking = false;
   try {
-    const res = await fetch("/api/agent/run", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question, model: brain.model, mode }) });
-    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || res.statusText); }
-    for await (const { event, data } of sse(res)) {
+    await streamAgent({ question, model: brain.model, mode: "research" }, (event, data) => {
       if (event === "thinking" && !thinking) { thinking = true; live.textContent = "Thinking…"; }
       else if (event === "token") { if (thinking) { live.textContent = ""; thinking = false; } live.textContent += data.text; }
-      else if (event === "tool_call") {
-        thinking = false; live.textContent = "";
-        const arg = data.arguments?.question || data.arguments?.query || data.arguments?.claim || "";
-        addStep(el("span", { class: "tool" }, data.name), arg ? ` “${arg}”` : "");
-      } else if (event === "tool_result") steps.lastChild?.append(` → ${data.result.summary || data.result.error || ""}`);
+      else if (event === "tool_call") { thinking = false; live.textContent = ""; steps.append(stepItem(data.name, data.arguments)); }
+      else if (event === "tool_result") steps.lastChild?.append(` → ${data.result.summary || data.result.error || ""}`);
       else if (event === "brain_update") {
         const a = data.admission;
         steps.lastChild?.append(a.outcome === "dropped" ? ` (dropped: ${a.reason})` : " (sent to Proposed facts)");
         if (a.outcome !== "dropped") loadQueue();
-      } else if (event === "warning") addStep(el("span", { class: "problem" }, data.message));
-      else if (event === "result") {
-        const html = DOMPurify.sanitize(marked.parse(data.text || "(no answer)"));
-        const ans = el("div", { class: `agent-answer${mode === "report" ? " report" : ""}` });
-        ans.innerHTML = html;
-        if (data.invalid_markers.length) ans.append(el("div", { class: "problem" }, `Citations that don't resolve: ${data.invalid_markers.join(", ")}`));
-        if (data.sources.length) ans.append(el("div", { class: "cites" }, el("span", { class: "muted small-text" }, "Sources: "),
-          [...new Map(data.sources.map((s) => [`${s.chunk_id}|${s.quote}`, s])).values()].map((s) => {
-            const chip = el("button", { class: "chip verified", title: s.quote ? `“${s.quote}” (via ${s.via})` : s.via }, `✓ ${s.label}`);
-            chip.addEventListener("click", () => s.chunk_id && inspectCitation({ label: s.label, status: "verified", quote: s.quote, chunk_id: s.chunk_id, chunk_text_sha: s.chunk_text_sha, doc_sha256: s.doc_sha256 }, null, chip));
-            return chip;
-          })));
-        live.replaceWith(ans);
-        loadBrain();
-      } else if (event === "error") { live.textContent = ""; $("#agent-error").textContent = data.message; }
-    }
+      } else if (event === "warning") steps.append(el("li", { class: "problem" }, data.message));
+      else if (event === "result") { live.replaceWith(agentResult(data)); loadBrain(); }
+      else if (event === "error") { live.textContent = ""; $("#agent-error").textContent = data.message; }
+    });
   } catch (err) {
     $("#agent-error").textContent = err.message;
   } finally {
-    buttons.forEach((b) => (b.disabled = false));
+    btn.disabled = false;
   }
 }
+
+// ---------------------------------------------------------------- reports (§12 Reports, §15)
+
+const reports = { selected: null, running: false, pollTimer: null };
+
+async function loadReportTab() {
+  const { models, default: def } = await api("/api/brain/models").catch(() => ({ models: [] }));
+  const sel = $("#report-model");
+  const installed = models.filter((m) => m.installed);
+  sel.replaceChildren(...installed.map((m) => el("option", { value: m.name }, m.name)));
+  $("#report-none").hidden = installed.length > 0;
+  $("#report-btn").disabled = !installed.length || reports.running;
+  const want = brain.model && installed.some((m) => m.name === brain.model) ? brain.model : def;
+  if (want) sel.value = want;
+  loadReports();
+}
+$("#report-model").addEventListener("change", (e) => {
+  brain.model = e.target.value;
+  api("/api/settings", { method: "PUT", body: JSON.stringify({ reasoning_model: brain.model }) }).catch(() => {});
+});
+
+async function loadReports() {
+  clearTimeout(reports.pollTimer);
+  const { runs } = await api("/api/agent/runs?mode=report").catch(() => ({ runs: [] }));
+  const list = $("#report-list");
+  list.replaceChildren(...runs.map((r) => {
+    const li = el("li", { class: r.id === reports.selected ? "active" : "", title: r.question, "data-id": r.id },
+      el("span", { class: "title" }, r.question),
+      el("span", { class: `run-status ${r.status}` }, r.status === "done" ? new Date(r.created_at).toLocaleDateString() : r.status),
+      r.status === "running" ? null : el("button", { class: "del", title: "Delete this report", onclick: async (e) => {
+        e.stopPropagation();
+        if (!confirm("Delete this report?")) return;
+        await api(`/api/agent/runs/${r.id}`, { method: "DELETE" }).catch((err) => alert(err.message));
+        if (reports.selected === r.id) newReport();
+        loadReports();
+      } }, "×"));
+    li.addEventListener("click", () => showReport(r.id));
+    return li;
+  }));
+  if (!runs.length) list.append(el("li", { class: "muted small-text" }, "No reports yet."));
+  // A report started earlier (or in a tab that was closed) is still going: check back.
+  if (runs.some((r) => r.status === "running") && !reports.running) reports.pollTimer = setTimeout(() => { loadReports(); if (reports.selected) showReport(reports.selected, true); }, 10000);
+}
+
+function newReport() {
+  reports.selected = null;
+  $("#report-view").replaceChildren(el("div", { class: "empty" }, el("h2", {}, "Write a report"),
+    el("p", {}, "The model first organizes its brain and reads all of it, then asks your documents what its facts leave open, and writes 4–5 cited paragraphs answering your question.")));
+  document.querySelectorAll("#report-list li.active").forEach((x) => x.classList.remove("active"));
+}
+$("#new-report").addEventListener("click", () => { newReport(); $("#report-q").value = ""; $("#report-q").focus(); });
+
+/// The parts of a report view: question, reasoning, steps, result.
+function reportShell(question, model) {
+  const parts = {
+    steps: el("ol", { class: "agent-steps" }),
+    cot: el("pre", { class: "cot" }),
+    cotBox: null,
+    result: el("div", { class: "report-result" }),
+  };
+  parts.cotBox = el("details", { class: "cot-box", open: true }, el("summary", {}, "Model's reasoning"), parts.cot);
+  $("#report-view").replaceChildren(
+    el("div", { class: "report-question" }, el("span", { class: "muted small-text" }, `Question · ${model}`), el("div", {}, question)),
+    el("div", { class: "report-progress" }, el("h4", {}, "Steps"), parts.steps),
+    parts.cotBox, parts.result);
+  return parts;
+}
+
+async function showReport(id, quiet) {
+  reports.selected = id;
+  loadReportsHighlight();
+  const { run, result } = await api(`/api/agent/runs/${id}`).catch((e) => ({ run: null, error: e }));
+  if (!run) return;
+  if (reports.running && quiet) return;
+  const p = reportShell(run.question, run.model);
+  for (const s of result?.steps || []) {
+    const li = stepItem(s.tool, s.arguments);
+    if (s.summary) li.append(` → ${s.summary}`);
+    p.steps.append(li);
+  }
+  if (result?.thinking) { p.cot.textContent = result.thinking; p.cotBox.open = false; } else p.cotBox.hidden = true;
+  if (run.status === "done" && result) p.result.replaceWith(agentResult(result, "report"));
+  else if (run.status === "failed") p.result.append(el("div", { class: "error" }, run.error || "The run failed."));
+  else p.result.append(el("p", { class: "muted" }, "Still running; this view refreshes every few seconds."));
+}
+
+function loadReportsHighlight() {
+  document.querySelectorAll("#report-list li").forEach((li) => li.classList.toggle("active", Number(li.dataset.id) === reports.selected));
+}
+
+$("#report-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = $("#report-q").value.trim();
+  const model = $("#report-model").value;
+  if (!question || !model) return;
+  const btn = $("#report-btn");
+  btn.disabled = true;
+  reports.running = true;
+  $("#report-error").textContent = "";
+  const p = reportShell(question, model);
+  p.result.append(el("p", { class: "muted" }, "Working…"));
+  let writing = false;
+  try {
+    await streamAgent({ question, model, mode: "report" }, (event, data) => {
+      if (event === "step" && data.step === 1) loadReports();
+      else if (event === "thinking") { p.cot.textContent += data.text; p.cot.scrollTop = p.cot.scrollHeight; }
+      else if (event === "token") {
+        if (!writing) { writing = true; p.result.replaceChildren(el("div", { class: "agent-answer report muted live" })); }
+        p.result.firstChild.textContent += data.text;
+      } else if (event === "tool_call") { writing = false; p.result.replaceChildren(el("p", { class: "muted" }, "Working…")); p.steps.append(stepItem(data.name, data.arguments)); }
+      else if (event === "tool_result") p.steps.lastChild?.append(` → ${data.result.summary || data.result.error || ""}`);
+      else if (event === "warning") p.steps.append(el("li", { class: "problem" }, data.message));
+      else if (event === "result") {
+        reports.selected = data.run_id;
+        loadReportsHighlight();
+        p.cotBox.open = false;
+        if (!p.cot.textContent) p.cotBox.hidden = true;
+        p.result.replaceWith(agentResult(data, "report"));
+      } else if (event === "error") $("#report-error").textContent = data.message;
+    });
+  } catch (err) {
+    $("#report-error").textContent = err.message;
+  } finally {
+    reports.running = false;
+    btn.disabled = false;
+    loadReports();
+  }
+});

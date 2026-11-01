@@ -120,6 +120,11 @@ impl AppState {
     pub fn activate(&self, root: &Path) -> anyhow::Result<Workspace> {
         let ws = Workspace::open(root)?;
         localrag_core::registry::remember(&ws.root)?;
+        // One app instance per machine: a run still marked running was cut off by a restart.
+        // (A run in the workspace being left keeps going and records its own result.)
+        if self.root().as_deref() != Some(ws.root.as_path()) {
+            localrag_core::agent::fail_interrupted(&db::open(&ws.db_path())?)?;
+        }
         *self.active.write().expect("active workspace") = Some(ws.root.clone());
         {
             let mut s = self.sync.lock().expect("sync state");

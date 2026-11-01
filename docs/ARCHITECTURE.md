@@ -646,8 +646,8 @@ On 16 GB, the reasoning model also answers `ask_corpus` by default, to avoid Oll
 models at every step. Reasoning models are installed models with the `thinking` and `tools`
 capabilities.
 
-**Reports** (**Generate Report**, next to **Research**; `localrag agent --report`). The same
-agent, with a different start and a single tool:
+**Reports** (the **Report** tab; `localrag agent --report`). The same agent, with a
+different start, a single tool, and a prompt that puts relevant brain facts first:
 1. The program calls `organize_brain` first. If there are no facts, or the layout fails
    validation, the brain is left as it is and a warning is raised.
 2. It reads the whole brain file into context as Markdown: headings, `[THOUGHT]` lines and
@@ -658,6 +658,18 @@ agent, with a different start and a single tool:
    for up to 14 steps.
 4. It writes a title and 4–5 paragraphs, citing `[C#]` or fact IDs, which resolve to their
    original sources as in a research run. A report proposes no facts.
+- **The prompt asks it to:**
+  - decide what an answer to *this* question needs, and use only the facts and thoughts that
+    bear on it (most of the brain may be irrelevant);
+  - build on those facts first, cited directly as `[F#]`, and not re-ask the corpus for what a
+    fact already establishes;
+  - use `ask_corpus` only for what the facts leave open;
+  - write one connected argument: the direct answer, then the evidence, then the limits, then
+    a conclusion. Not a tour of topics.
+- **Runs are kept** in `agent_runs` with their `mode` (schema v8). The Report tab lists past
+  reports on the left, including running and failed ones. A run whose browser tab was closed
+  keeps going and appears when it's done; a run cut off by quitting the app is marked failed
+  when the workspace next opens.
 
 **Brain files**
 - **One per reasoning model:** `brain/<model>.md` (`deepseek-r1:8b` → `deepseek-r1_8b.md`).
@@ -887,7 +899,7 @@ The server picks a free port and opens the browser on start.
 
 ## 15. User interface
 
-One page with four tabs (in order: Search, Ask, Documents, and later Second Brain), the
+One page with five tabs (in order: Search, Ask, Documents, Research, Report), the
 workspace menu, a Settings panel, and first-load dialogs.
 
 - **First load:**
@@ -940,13 +952,15 @@ workspace menu, a Settings panel, and first-load dialogs.
   - Documents with status and metadata source.
   - Actions: Run OCR, Forget (removed only, confirmed), Forget all removed, edit metadata,
     confirm/reject a Crossref match, refresh metadata, reindex.
-- **Second Brain** (Phase 7):
+- **Report:** a sidebar of past reports (New report, delete); a research question, a
+  reasoning-model picker and **Generate Report**. The steps and the model's reasoning stream
+  live (the reasoning collapses once the report arrives), then the report with source chips.
+- **Research** (called Second Brain until 2026-11-01; Phase 7):
   - **Reasoning model selector** (installed models with `thinking` + `tools`). Models that have
     a brain file but are no longer installed appear read-only.
   - **Main pane:** the selected model's accepted facts, in the brain's current structure. A
-    collapsible **Research a question with this model** box at the top has **Research** (answer
-    and propose facts) and **Generate Report** (§12 *Reports*). Both stream the steps (tool
-    calls, dropped or queued proposals) and the cited result.
+    **Research a question** box at the top, with a **Research** button, runs the agent and
+    streams its steps (tool calls, dropped or queued proposals) and its cited answer.
     - Headings, `[THOUGHT]` lines (styled as interpretation) and facts: the claim, citation
       chips that open the highlighted source, and a status badge (active / stale / broken /
       unresolved).
@@ -1319,6 +1333,12 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
     - The result is a title and 4 paragraphs with 12 Baicry/Niemann citations. None failed
       to resolve, and no facts were proposed.
     - It didn't cite its two facts directly; it re-asked the corpus instead.
+  - **Report tab and revised prompt** (same day): "What does ctDNA add to monitoring treatment
+    response in colorectal cancer?" with the same 2-fact brain.
+    - It opened from F-0002, cited directly as `[F2]`, and asked just one sub-question for what
+      the fact left open.
+    - The unrelated synchronous-cancer fact was left out.
+    - The result is 4 connected paragraphs; every citation resolved.
   - **Tool calling:** Ollama `tools`. `ask_corpus` runs the full grounded pipeline (§10) and
     numbers each answer's citations `C1, C2, …` for the run, showing the quote and whether it
     verified. Only verified citations can support a proposal. The final answer cites `[C#]` or

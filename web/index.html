@@ -26,7 +26,8 @@
       <button role="tab" data-tab="search">Search</button>
       <button role="tab" data-tab="ask" class="active">Ask</button>
       <button role="tab" data-tab="documents">Documents</button>
-      <button role="tab" data-tab="brain">Second Brain</button>
+      <button role="tab" data-tab="brain">Research</button>
+      <button role="tab" data-tab="report">Report</button>
     </nav>
     <div id="status" class="status" title=""></div>
     <button id="settings-btn" class="icon settings-btn" aria-label="Settings" title="Settings">⚙︎</button>
@@ -67,14 +68,15 @@
           <span id="brain-summary" class="muted small-text"></span>
         </div>
         <p id="brain-none" class="muted" hidden>No installed model can reason with tools. Install one with Ollama's <em>thinking</em> and <em>tools</em> capabilities (for example <code>ollama pull qwen3.5:9b</code>).</p>
-        <details id="brain-research" class="brain-research">
-          <summary>Research a question with this model</summary>
+        <div id="brain-research" class="brain-research">
+          <h3>Research a question</h3>
+          <p class="muted small-text">The model reads its brain, asks your documents sub-questions, answers with citations, and proposes facts for you to review on the right.</p>
           <form id="agent-form">
             <textarea id="agent-q" rows="2" placeholder="A question for the reasoning model: it reads its brain, asks your documents sub-questions, and proposes facts for you to review…" required></textarea>
-            <div class="composer-row"><span id="agent-error" class="error" role="alert"></span><button id="agent-btn" class="primary" type="submit">Research</button><button id="report-btn" class="primary" type="button" title="Organize the brain, read all of it, then research and write a 4–5 paragraph cited report (proposes no facts)">Generate Report</button></div>
+            <div class="composer-row"><span id="agent-error" class="error" role="alert"></span><button id="agent-btn" class="primary" type="submit">Research</button></div>
           </form>
           <div id="agent-out" class="agent-out"></div>
-        </details>
+        </div>
         <div id="brain-problems" class="brain-problems" hidden></div>
         <pre id="brain-diff-view" class="brain-diff" hidden></pre>
         <div id="brain-lines" class="brain-lines"></div>
@@ -84,6 +86,25 @@
         <p class="muted small-text">Facts the model proposed. Only approved facts enter its brain.</p>
         <div id="queue-list"></div>
       </aside>
+    </section>
+
+    <section id="tab-report" class="tab">
+      <aside class="sessions report-runs">
+        <button id="new-report" class="primary small">New report</button>
+        <ul id="report-list"></ul>
+      </aside>
+      <div class="report-main">
+        <form id="report-form" class="report-form">
+          <textarea id="report-q" rows="3" placeholder="A research question for the report…" required></textarea>
+          <div class="composer-row">
+            <label class="model">Reasoning model <select id="report-model"></select></label>
+            <span id="report-error" class="error" role="alert"></span>
+            <button id="report-btn" class="primary" type="submit">Generate Report</button>
+          </div>
+          <p id="report-none" class="muted small-text" hidden>No installed model can reason with tools (Ollama's <em>thinking</em> and <em>tools</em> capabilities).</p>
+        </form>
+        <div id="report-view" class="report-view"></div>
+      </div>
     </section>
 
     <section id="tab-search" class="tab">

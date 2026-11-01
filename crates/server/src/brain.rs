@@ -37,6 +37,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/brain/{model}/queue", get(queue_list))
         .route("/api/brain/{model}/queue/{id}/{action}", post(queue_action))
         .route("/api/agent/run", post(run))
+        .route("/api/agent/runs", get(runs))
+        .route("/api/agent/runs/{id}", get(run_detail).delete(delete_run))
 }
 
 fn unprocessable(e: anyhow::Error) -> ApiError {
@@ -283,6 +285,43 @@ async fn queue_action(State(state): State<AppState>, Path((model, id, action)): 
             _ => return Err(not_found("no such queue action")),
         };
         Ok(Json(json!({ "fact_id": fact, "brain": brain_json(&c.ws, &c.conn, &model)? })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RunsQuery {
+    #[serde(default)]
+    mode: Mode,
+}
+
+async fn runs(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<RunsQuery>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        Ok(Json(json!({ "runs": localrag_core::agent::runs(&conn, q.mode, 200)? })))
+    })
+    .await
+}
+
+async fn run_detail(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        let (summary, result) = localrag_core::agent::run_detail(&conn, id)?.ok_or_else(|| not_found("no such run"))?;
+        Ok(Json(json!({ "run": summary, "result": result })))
+    })
+    .await
+}
+
+async fn delete_run(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult {
+    blocking(move || {
+        let ws = state.workspace()?;
+        let conn = db::open(&ws.db_path())?;
+        if !localrag_core::agent::delete_run(&conn, id)? {
+            return Err(ApiError::new(StatusCode::CONFLICT, "running", "That run is still going (or doesn't exist)."));
+        }
+        Ok(Json(json!({ "deleted": id })))
     })
     .await
 }

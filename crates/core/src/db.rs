@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, ffi, params};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Registers sqlite-vec for every connection opened afterwards in this process.
 pub fn register_sqlite_vec() {
@@ -86,6 +86,9 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         }
         if version < 7 {
             conn.execute_batch(SCHEMA_V7).context("migrating to schema v7")?;
+        }
+        if version < 8 {
+            conn.execute_batch(SCHEMA_V8).context("migrating to schema v8")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -266,6 +269,14 @@ CREATE TABLE agent_runs (
   status TEXT NOT NULL,                   -- running|done|failed
   result_json TEXT, error TEXT, created_at TEXT NOT NULL, finished_at TEXT
 );
+";
+
+/// Agent runs remember what they were (research or report), so the Report tab can list
+/// past reports, including ones still running or failed.
+const SCHEMA_V8: &str = "
+ALTER TABLE agent_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'research';
+UPDATE agent_runs SET mode = json_extract(result_json, '$.mode') WHERE json_extract(result_json, '$.mode') IN ('research', 'report');
+CREATE INDEX agent_runs_mode ON agent_runs(mode, id);
 ";
 
 /// Creates `brain_vec` for `dim` dimensions if it doesn't exist.
