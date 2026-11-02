@@ -1,0 +1,34 @@
+[package]
+name = "localrag-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+humantime = "2.4.0"
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2.191"
+objc2 = "0.6.5"
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+objc2-foundation = "0.3.2"
+objc2-vision = "0.3.2"
+pdfium-render = "0.9.4"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+sqlite-vec = "0.1.9"
+tokenizers = "0.23.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+toml = "1.1.8"
+unicode-segmentation = "1.13.3"
+
+[dev-dependencies]
+filetime = "0.2.29"
+pdfium-render = "0.9.4"
+tempfile = "3.27.0"

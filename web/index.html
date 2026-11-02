@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>localRAG</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/vendor/marked.min.js"></script>
+  <script src="/assets/vendor/purify.min.js"></script>
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">localRAG</div>
+    <div class="menu">
+      <button id="ws-btn" class="menu-btn ws-menu-btn" aria-haspopup="true" aria-expanded="false" title="Workspace menu"><span id="ws-btn-name">No workspace</span> <span class="caret">▾</span></button>
+      <div id="ws-menu" class="menu-list" role="menu" aria-label="Workspace menu" hidden>
+        <button role="menuitem" id="menu-new">New workspace…</button>
+        <button role="menuitem" id="menu-open">Open workspace…</button>
+        <div class="menu-sep"></div>
+        <div class="menu-label">Recent</div>
+        <div id="menu-recent"></div>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="search">Search</button>
+      <button role="tab" data-tab="ask" class="active">Ask</button>
+      <button role="tab" data-tab="documents">Documents</button>
+      <button role="tab" data-tab="brain">Research</button>
+      <button role="tab" data-tab="report">Report</button>
+    </nav>
+    <div id="status" class="status" title=""></div>
+    <button id="settings-btn" class="icon settings-btn" aria-label="Settings" title="Settings">⚙︎</button>
+  </header>
+
+  <main>
+    <section id="tab-ask" class="tab active">
+      <aside class="sessions">
+        <button id="new-chat" class="primary small">New chat</button>
+        <ul id="session-list"></ul>
+      </aside>
+      <div class="chat">
+        <div id="thread" class="thread">
+          <div class="empty" id="thread-empty">
+            <h2>Ask your literature</h2>
+            <p>Answers come only from the documents in <code>corpus/</code>, with citations you can check against the source.</p>
+          </div>
+        </div>
+        <form id="composer" class="composer">
+          <textarea id="question" rows="3" placeholder="Ask a question about your documents…" required></textarea>
+          <div class="composer-row">
+            <label class="model">Model <select id="model"></select></label>
+            <span id="ask-error" class="error" role="alert"></span>
+            <button id="ask-btn" class="primary" type="submit">Ask</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="tab-brain" class="tab">
+      <div class="brain-main">
+        <div class="toolbar brain-toolbar">
+          <label class="model">Reasoning model <select id="brain-model"></select></label>
+          <button id="brain-organize" class="small">Organize brain</button>
+          <button id="brain-undo" class="small" hidden>Undo</button>
+          <button id="brain-diff" class="small" hidden>Last change</button>
+          <button id="brain-check" class="small">Re-check</button>
+          <span id="brain-summary" class="muted small-text"></span>
+        </div>
+        <p id="brain-none" class="muted" hidden>No installed model can reason with tools. Install one with Ollama's <em>thinking</em> and <em>tools</em> capabilities (for example <code>ollama pull qwen3.5:9b</code>).</p>
+        <div id="brain-research" class="brain-research">
+          <h3>Research a question</h3>
+          <p class="muted small-text">The model reads its brain, asks your documents sub-questions, answers with citations, and proposes facts for you to review on the right.</p>
+          <form id="agent-form">
+            <textarea id="agent-q" rows="2" placeholder="A question for the reasoning model: it reads its brain, asks your documents sub-questions, and proposes facts for you to review…" required></textarea>
+            <div class="composer-row"><span id="agent-error" class="error" role="alert"></span><button id="agent-btn" class="primary" type="submit">Research</button></div>
+          </form>
+          <div id="agent-out" class="agent-out"></div>
+        </div>
+        <div id="brain-problems" class="brain-problems" hidden></div>
+        <pre id="brain-diff-view" class="brain-diff" hidden></pre>
+        <div id="brain-lines" class="brain-lines"></div>
+      </div>
+      <aside class="brain-queue">
+        <h3>Proposed facts <span id="queue-count" class="muted"></span></h3>
+        <p class="muted small-text">Facts the model proposed. Only approved facts enter its brain.</p>
+        <div id="queue-list"></div>
+      </aside>
+    </section>
+
+    <section id="tab-report" class="tab">
+      <aside class="sessions report-runs">
+        <button id="new-report" class="primary small">New report</button>
+        <ul id="report-list"></ul>
+      </aside>
+      <div class="report-main">
+        <form id="report-form" class="report-form">
+          <textarea id="report-q" rows="3" placeholder="A research question for the report…" required></textarea>
+          <div class="composer-row">
+            <label class="model">Reasoning model <select id="report-model"></select></label>
+            <span id="report-error" class="error" role="alert"></span>
+            <button id="report-btn" class="primary" type="submit">Generate Report</button>
+          </div>
+          <p id="report-none" class="muted small-text" hidden>No installed model can reason with tools (Ollama's <em>thinking</em> and <em>tools</em> capabilities).</p>
+        </form>
+        <div id="report-view" class="report-view"></div>
+      </div>
+    </section>
+
+    <section id="tab-search" class="tab">
+      <form id="search-form" class="searchbar">
+        <input id="search-q" type="search" placeholder="Search passages (no model involved)…" required>
+        <button class="primary" type="submit">Search</button>
+      </form>
+      <div class="search-filters">
+        <label>Document <select id="search-doc"><option value="">All documents</option></select></label>
+        <label>Years <input id="search-from" type="number" min="1000" max="2100" placeholder="from"> – <input id="search-to" type="number" min="1000" max="2100" placeholder="to"></label>
+        <span class="muted small-text">Year filters use citation metadata; documents without a year are left out.</span>
+      </div>
+      <ol id="search-results" class="results"></ol>
+    </section>
+
+    <section id="tab-documents" class="tab">
+      <div class="toolbar">
+        <button id="add-docs" class="primary small">Add documents…</button>
+        <input id="add-docs-input" type="file" multiple accept=".pdf,.md,.markdown,.txt,application/pdf,text/markdown,text/plain" hidden>
+        <button id="reindex" class="small">Reindex</button>
+        <button id="ocr-all" class="small" hidden>Run OCR on all</button>
+        <button id="ocr-cancel" class="small danger" hidden>Cancel OCR</button>
+        <button id="forget-all" class="small danger">Forget all removed</button>
+        <span id="library-summary" class="muted"></span>
+      </div>
+      <ul id="upload-results" class="upload-results"></ul>
+      <table class="library">
+        <thead><tr>
+          <th>Document</th><th>Citation</th>
+          <th class="sortable" data-sort="status">Status</th>
+          <th class="sortable num" data-sort="chunks">Chunks</th>
+          <th class="sortable num" data-sort="pages">Pages</th>
+          <th class="sortable num" data-sort="references" title="Entries in the document's bibliography (hover a count for the list)">References</th>
+          <th class="sortable num" data-sort="cited_by" title="How many works cite this one, according to Crossref">Cited-By</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="library-rows"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <aside id="inspector" class="inspector" hidden>
+    <div class="inspector-head">
+      <div>
+        <div id="insp-label" class="insp-label"></div>
+        <div id="insp-status"></div>
+      </div>
+      <button id="insp-close" class="icon" aria-label="Close">×</button>
+    </div>
+    <div id="insp-note" class="note" hidden></div>
+    <div id="insp-quote" class="insp-quote" hidden></div>
+    <div id="insp-text" class="insp-text"></div>
+    <div class="insp-actions">
+      <button id="insp-open" class="primary small">Open in source</button>
+      <button id="insp-paraphrase" class="small" hidden></button>
+    </div>
+  </aside>
+
+  <div id="ws-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ws-title">
+      <div class="modal-head">
+        <h2 id="ws-title">Choose a workspace</h2>
+        <button id="ws-close" class="icon" aria-label="Close">×</button>
+      </div>
+      <p id="ws-intro" class="muted"></p>
+      <section id="ws-known-section">
+        <ul id="ws-known" class="ws-known"></ul>
+        <button id="ws-open-other" class="small">Open another folder…</button>
+      </section>
+      <section class="ws-create">
+        <h3 id="ws-create-title">New workspace</h3>
+        <p class="muted small-text">A folder is created at this location with <code>corpus/</code> for your documents and <code>.localrag/</code> for the index.</p>
+        <label>Location
+          <span class="row"><input id="ws-parent" type="text" placeholder="Choose a folder…" readonly tabindex="-1"><button id="ws-choose" class="small" type="button">Choose…</button></span>
+        </label>
+        <label>Folder name <input id="ws-name-input" type="text" placeholder="e.g. second-cancers" spellcheck="false"></label>
+        <div class="row end"><span id="ws-error" class="error" role="alert"></span><button id="ws-create" class="primary">Create workspace</button></div>
+      </section>
+    </div>
+  </div>
+
+  <div id="email-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="email-title">
+      <h2 id="email-title">Faster citation lookups</h2>
+      <p class="muted">localRAG looks up authors, years and page numbers for your documents on <strong>Crossref</strong>. With an email address, Crossref puts the requests in its <em>polite pool</em> (up to 10 lookups a second instead of 5, and 3 title searches instead of 1). Crossref only uses it to contact you if your requests cause problems.</p>
+      <p class="muted small-text">Stored on this Mac only (in <code>~/.config/localrag</code>, private to your user), never in a workspace, and sent only to Crossref. You can change it later in Settings.</p>
+      <label class="field">Email <input id="email-input" type="email" placeholder="you@university.edu" autocomplete="email"></label>
+      <div class="row end"><span id="email-error" class="error" role="alert"></span><button id="email-skip" class="small">Skip (use the public pool)</button><button id="email-save" class="primary">Save</button></div>
+    </div>
+  </div>
+
+  <div id="settings-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="modal-head"><h2 id="settings-title">Settings</h2><button id="settings-close" class="icon" aria-label="Close">×</button></div>
+      <h3>Crossref</h3>
+      <label class="field">Email for the polite pool <input id="set-email" type="email" placeholder="Not set: public pool"></label>
+      <p id="set-pool" class="muted small-text"></p>
+      <label class="field">Reuse cached Crossref responses for (days) <input id="set-cache-days" type="number" min="0" max="3650" step="1"></label>
+      <p class="muted small-text">Lookups already answered within this many days are read from the cache on this Mac instead of asking Crossref again. 0 always asks.</p>
+      <h3>This workspace</h3>
+      <label class="field">Default chat model <select id="set-model"></select></label>
+      <label class="field">Context size (num_ctx) for that model <input id="set-numctx" type="number" min="2048" max="262144" step="1024"></label>
+      <label class="field">OCR for scanned pages
+        <select id="set-ocr">
+          <option value="ask">Ask: a Run OCR button on the Documents tab</option>
+          <option value="auto">Automatic: OCR after every sync</option>
+          <option value="off">Off</option>
+        </select>
+      </label>
+      <h3>Citation checks</h3>
+      <label class="check"><input id="set-repair" type="checkbox"> When a quote isn't in its source, ask the model once to copy the exact supporting words (then verify them)</label>
+      <label class="check"><input id="set-strict" type="checkbox"> Strict mode (slower): also check that each cited passage really supports its sentence</label>
+      <div class="row end"><span id="settings-error" class="error" role="alert"></span><button id="settings-save" class="primary">Save</button></div>
+    </div>
+  </div>
+
+  <div id="meta-dialog" class="modal" hidden>
+    <div class="modal-card wide" role="dialog" aria-modal="true" aria-labelledby="meta-title">
+      <div class="modal-head"><h2 id="meta-title">Citation metadata</h2><button id="meta-close" class="icon" aria-label="Close">×</button></div>
+      <p id="meta-file" class="path"></p>
+      <p id="meta-state" class="muted small-text"></p>
+      <section id="meta-candidates-section" hidden>
+        <h3>Possible matches on Crossref</h3>
+        <ul id="meta-candidates" class="candidates"></ul>
+        <button id="meta-reject" class="small">None of these</button>
+      </section>
+      <h3>Details</h3>
+      <div class="meta-form">
+        <label class="field">Title <input id="meta-title-input" type="text"></label>
+        <label class="field">Authors (one per line, "Family, Given") <textarea id="meta-authors" rows="3"></textarea></label>
+        <div class="row">
+          <label class="field">Year <input id="meta-year" type="number" min="1000" max="2100"></label>
+          <label class="field">Printed pages <input id="meta-pages" type="text" placeholder="1996-2005"></label>
+        </div>
+        <label class="field">Journal / container <input id="meta-container" type="text"></label>
+        <label class="field">DOI <input id="meta-doi" type="text" placeholder="10.xxxx/…" spellcheck="false"></label>
+      </div>
+      <div class="row end">
+        <span id="meta-error" class="error" role="alert"></span>
+        <button id="meta-refresh" class="small">Look up again on Crossref</button>
+        <button id="meta-save" class="primary">Save as manual</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="ref-pop" class="ref-pop" hidden></div>
+
+  <div id="viewer" class="viewer" hidden>
+    <div class="viewer-bar">
+      <span id="viewer-title"></span>
+      <span class="spacer"></span>
+      <button id="viewer-prev" class="small">‹ Prev</button>
+      <span id="viewer-page" class="muted"></span>
+      <button id="viewer-next" class="small">Next ›</button>
+      <button id="viewer-close" class="icon" aria-label="Close">×</button>
+    </div>
+    <div id="viewer-body" class="viewer-body"></div>
+  </div>
+</body>
+</html>

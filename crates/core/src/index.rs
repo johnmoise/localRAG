@@ -1,0 +1,699 @@
+//! Incremental sync of `corpus/` into the index (ARCHITECTURE.md §5).
+//!
+//! Each file is written in its own transaction, so an interrupted sync loses at most the
+//! file in progress and the next run picks up where it stopped.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use anyhow::{Context, bail};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::json;
+
+use crate::chunk::{self, CHUNKER_VERSION, Chunk};
+use crate::db;
+use crate::embed::Embedder;
+use crate::parse::{self, DocKind, FileError, ParsedDoc};
+use crate::scan::{self, CorpusFile};
+use crate::workspace::Workspace;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Pending,
+    Indexed,
+    NeedsOcr,
+    Failed,
+    Removed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::Indexed => "indexed",
+            Status::NeedsOcr => "needs_ocr",
+            Status::Failed => "failed",
+            Status::Removed => "removed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "indexed" => Status::Indexed,
+            "needs_ocr" => Status::NeedsOcr,
+            "failed" => Status::Failed,
+            "removed" => Status::Removed,
+            _ => Status::Pending,
+        }
+    }
+}
+
+/// What happened to one file during a sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    New,
+    Changed,
+    /// mtime changed but the content didn't.
+    Touched,
+    Removed,
+    /// A removed document came back, possibly under a new path. No reprocessing.
+    Restored { from: String },
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub path: String,
+    pub change: Change,
+    pub status: Status,
+    pub chunks: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct SyncReport {
+    pub new: usize,
+    pub changed: usize,
+    pub touched: usize,
+    pub unchanged: usize,
+    pub removed: usize,
+    pub restored: usize,
+    pub failed: usize,
+    pub needs_ocr: usize,
+    pub chunks_embedded: usize,
+    pub chunks_reused: usize,
+    /// Chunks re-embedded because the embedding model changed.
+    pub reembedded: usize,
+    pub too_large: Vec<(String, u64)>,
+    pub millis: u128,
+}
+
+impl SyncReport {
+    pub fn changed_any(&self) -> bool {
+        self.new + self.changed + self.touched + self.removed + self.restored + self.failed + self.reembedded > 0
+    }
+}
+
+/// Parses corpus files: Markdown and text in process, PDFs in the sandboxed helper process
+/// (`crate::pdfhelper`), which is located only once a PDF needs parsing.
+pub struct Parsers {
+    pdfium_lib: Option<std::path::PathBuf>,
+    helper: std::sync::OnceLock<crate::pdfhelper::PdfHelper>,
+}
+
+impl Parsers {
+    pub fn new(ws: &Workspace) -> Self {
+        Parsers { pdfium_lib: ws.global.pdfium_lib.clone(), helper: std::sync::OnceLock::new() }
+    }
+
+    pub fn pdf_helper(&self) -> anyhow::Result<&crate::pdfhelper::PdfHelper> {
+        if let Some(h) = self.helper.get() {
+            return Ok(h);
+        }
+        let h = crate::pdfhelper::PdfHelper::locate(self.pdfium_lib.as_deref())?;
+        Ok(self.helper.get_or_init(|| h))
+    }
+
+    /// Parses a file on disk the way indexing does.
+    pub fn parse_path(&self, kind: DocKind, path: &std::path::Path) -> anyhow::Result<Result<ParsedDoc, FileError>> {
+        Ok(match kind {
+            DocKind::Pdf => return self.pdf_helper()?.parse(path),
+            DocKind::Markdown => parse::markdown::parse(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+            DocKind::Text => parse::text::parse(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?),
+        })
+    }
+
+    fn parse(&self, file: &CorpusFile) -> anyhow::Result<Result<ParsedDoc, FileError>> {
+        self.parse_path(file.kind, &file.abs_path)
+    }
+}
+
+struct DocRow {
+    id: i64,
+    path: String,
+    size: i64,
+    mtime_ns: i64,
+    sha256: String,
+    status: Status,
+    kind: String,
+    parser_version: i64,
+    chunker_version: i64,
+    scanned_pages: usize,
+}
+
+pub fn sync(
+    ws: &Workspace,
+    conn: &mut Connection,
+    embedder: &dyn Embedder,
+    parsers: &Parsers,
+    on_event: &mut dyn FnMut(&Event),
+) -> anyhow::Result<SyncReport> {
+    let started = Instant::now();
+    let mut report = SyncReport { reembedded: ensure_embed_model(conn, embedder)?, ..SyncReport::default() };
+
+    let scanned = scan::scan(&ws.corpus_dir(), ws.config.max_file_mb * 1024 * 1024)?;
+    report.too_large = scanned.too_large;
+    let rows = load_docs(conn)?;
+    let mut by_path: HashMap<&str, &DocRow> = rows.iter().map(|r| (r.path.as_str(), r)).collect();
+    let on_disk: HashSet<&str> = scanned.files.iter().map(|f| f.rel_path.as_str()).collect();
+
+    // Documents that disappeared this run, plus ones removed earlier: candidates for restore.
+    let mut restorable: HashMap<String, &DocRow> = HashMap::new();
+    for row in &rows {
+        if row.status == Status::Removed || !on_disk.contains(row.path.as_str()) {
+            restorable.entry(row.sha256.clone()).or_insert(row);
+        }
+    }
+
+    let mut to_process: Vec<(&CorpusFile, Option<&DocRow>, Change, String)> = Vec::new();
+    let mut new_files: Vec<(&CorpusFile, String)> = Vec::new();
+    for file in &scanned.files {
+        match by_path.remove(file.rel_path.as_str()) {
+            Some(row) => {
+                let current = row.kind == file.kind.as_str()
+                    && row.parser_version == file.kind.parser_version()
+                    && row.chunker_version == CHUNKER_VERSION;
+                let same_stat = row.size == file.size as i64 && row.mtime_ns == file.mtime_ns;
+                if same_stat && current && row.status != Status::Removed {
+                    report.unchanged += 1;
+                    continue;
+                }
+                let sha = scan::sha256_file(&file.abs_path)?;
+                if sha == row.sha256 && current {
+                    restorable.retain(|_, r| r.id != row.id);
+                    if row.status == Status::Removed {
+                        restore(conn, row, file)?;
+                        report.restored += 1;
+                        emit(on_event, file, Change::Restored { from: row.path.clone() }, status_for(row.scanned_pages), conn, row.id)?;
+                    } else {
+                        update_stat(conn, row.id, file)?;
+                        report.touched += 1;
+                        emit(on_event, file, Change::Touched, row.status, conn, row.id)?;
+                    }
+                } else {
+                    restorable.retain(|_, r| r.id != row.id);
+                    to_process.push((file, Some(row), Change::Changed, sha));
+                }
+            }
+            None => {
+                let sha = scan::sha256_file(&file.abs_path)?;
+                new_files.push((file, sha));
+            }
+        }
+    }
+
+    // New paths whose content matches a removed or vanished document are renames/returns.
+    for (file, sha) in new_files {
+        match restorable.remove(&sha) {
+            Some(row) if row.kind == file.kind.as_str() => {
+                restore(conn, row, file)?;
+                report.restored += 1;
+                emit(on_event, file, Change::Restored { from: row.path.clone() }, status_for(row.scanned_pages), conn, row.id)?;
+                // Its old path is no longer "vanished".
+                by_path.remove(row.path.as_str());
+                if row.parser_version != file.kind.parser_version() || row.chunker_version != CHUNKER_VERSION {
+                    to_process.push((file, Some(row), Change::Changed, sha));
+                }
+            }
+            _ => to_process.push((file, None, Change::New, sha)),
+        }
+    }
+
+    // Whatever is left in by_path is gone from disk.
+    let mut vanished: Vec<&DocRow> = by_path.into_values().filter(|r| r.status != Status::Removed).collect();
+    vanished.sort_by(|a, b| a.path.cmp(&b.path));
+    for row in vanished {
+        conn.execute(
+            "UPDATE documents SET status = 'removed', removed_at = ?2 WHERE id = ?1",
+            params![row.id, db::now_rfc3339()],
+        )?;
+        report.removed += 1;
+        on_event(&Event { path: row.path.clone(), change: Change::Removed, status: Status::Removed, chunks: 0 });
+    }
+
+    for (file, row, change, sha) in to_process {
+        let mut parsed = parsers.parse(file)?;
+        // Scanned pages that were OCR'd earlier get their recognized text (§6).
+        if let Ok(doc) = parsed.as_mut()
+            && !doc.scanned_pages.is_empty()
+            && let Some(cache) = crate::ocr::load_cache(ws, &sha)
+        {
+            crate::ocr::apply_to(doc, &cache);
+        }
+        // The bibliography is stored as references, not chunked or embedded.
+        let bib = parsed.as_mut().ok().and_then(|doc| {
+            let bib = crate::bibliography::detect(doc);
+            if let Some(b) = &bib {
+                crate::bibliography::remove_from_body(doc, b);
+            }
+            bib
+        });
+        let (status, chunks) = match parsed {
+            Ok(doc) => {
+                let chunks = chunk::chunk(&doc, &ws.config.chunking);
+                let vectors = vectors_for(conn, embedder, &chunks, &mut report)?;
+                let status = if doc.scanned_pages.is_empty() { Status::Indexed } else { Status::NeedsOcr };
+                write_document(conn, file, row.map(|r| r.id), &sha, status, None, Some(&doc), &chunks, &vectors)?;
+                let doc_id = row.map(|r| r.id).map_or_else(|| conn.query_row("SELECT id FROM documents WHERE path = ?1", [&file.rel_path], |r| r.get(0)), Ok)?;
+                crate::references::store(conn, doc_id, bib.as_ref())?;
+                (status, chunks.len())
+            }
+            Err(FileError(msg)) => {
+                write_document(conn, file, row.map(|r| r.id), &sha, Status::Failed, Some(&msg), None, &[], &[])?;
+                report.failed += 1;
+                on_event(&Event { path: file.rel_path.clone(), change: Change::Failed(msg), status: Status::Failed, chunks: 0 });
+                continue;
+            }
+        };
+        match change {
+            Change::New => report.new += 1,
+            _ => report.changed += 1,
+        }
+        if status == Status::NeedsOcr {
+            report.needs_ocr += 1;
+        }
+        on_event(&Event { path: file.rel_path.clone(), change, status, chunks });
+    }
+
+    crate::metadata::assign_labels(conn)?;
+    // A document added or removed can be (or stop being) one that others cite.
+    crate::references::link(conn)?;
+    db::set_meta(conn, "chunker_version", &CHUNKER_VERSION.to_string())?;
+    db::set_meta(conn, "last_sync", &db::now_rfc3339())?;
+    report.millis = started.elapsed().as_millis();
+    Ok(report)
+}
+
+/// Makes the next sync reprocess this document (e.g. after OCR filled in its scanned pages).
+pub fn mark_for_reprocess(conn: &Connection, doc_id: i64) -> anyhow::Result<()> {
+    conn.execute("UPDATE documents SET chunker_version = 0 WHERE id = ?1", [doc_id])?;
+    Ok(())
+}
+
+/// (document id, path, sha256, scanned pages) of a document waiting for OCR.
+pub type OcrTodo = (i64, String, String, Vec<u32>);
+
+/// Documents with scanned pages still waiting for OCR.
+pub fn needing_ocr(conn: &Connection) -> anyhow::Result<Vec<OcrTodo>> {
+    let rows: Vec<(i64, String, String, Option<String>)> = conn
+        .prepare("SELECT id, path, sha256, scanned_pages FROM documents WHERE status = 'needs_ocr' ORDER BY path")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, path, sha, pages)| (id, path, sha, pages.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default()))
+        .collect())
+}
+
+/// Removed documents only: deletes the record, chunks, vectors and OCR cache (§5).
+pub fn forget(ws: &Workspace, conn: &Connection, doc_id: i64) -> anyhow::Result<String> {
+    let (path, status, sha): (String, String, String) = conn
+        .query_row("SELECT path, status, sha256 FROM documents WHERE id = ?1", [doc_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?
+        .with_context(|| format!("no document with id {doc_id}"))?;
+    if Status::parse(&status) != Status::Removed {
+        bail!("{path} is still in corpus/ ({status}); only removed documents can be forgotten. Move it out of corpus/ or add it to .localragignore");
+    }
+    conn.execute("DELETE FROM documents WHERE id = ?1", [doc_id])?;
+    let ocr = ws.ocr_cache_path(&sha);
+    if ocr.exists() {
+        std::fs::remove_file(&ocr).with_context(|| format!("deleting {}", ocr.display()))?;
+    }
+    Ok(path)
+}
+
+/// If the configured embedding model differs from the one the index was built with, swap
+/// the vector table and re-embed every chunk. Returns the number of chunks re-embedded.
+fn ensure_embed_model(conn: &mut Connection, embedder: &dyn Embedder) -> anyhow::Result<usize> {
+    let indexed_with = db::get_meta(conn, "embed_model")?;
+    if indexed_with.as_deref() == Some(embedder.model()) {
+        return Ok(0);
+    }
+    let dim = embedder.embed_documents(&["dimension probe".to_string()])?[0].len();
+    let docs: Vec<i64> = conn.prepare("SELECT DISTINCT doc_id FROM chunks ORDER BY doc_id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    db::recreate_vec_table(conn, dim)?;
+    let mut total = 0;
+    for doc_id in docs {
+        let chunks: Vec<(i64, String)> = conn.prepare("SELECT id, text FROM chunks WHERE doc_id = ?1 ORDER BY ord")?
+            .query_map([doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let texts: Vec<String> = chunks.iter().map(|c| c.1.clone()).collect();
+        let vectors = embedder.embed_documents(&texts)?;
+        let tx = conn.transaction()?;
+        for ((id, _), v) in chunks.iter().zip(&vectors) {
+            tx.execute("INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)", params![id, db::vec_to_blob(v)])?;
+        }
+        tx.commit()?;
+        total += chunks.len();
+    }
+    // Recorded last, so an interrupted re-embed starts over on the next run.
+    db::set_meta(conn, "embed_model", embedder.model())?;
+    Ok(total)
+}
+
+/// Embeddings for `chunks`, reusing stored vectors for chunk texts already in the index.
+fn vectors_for(conn: &Connection, embedder: &dyn Embedder, chunks: &[Chunk], report: &mut SyncReport) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut lookup = conn.prepare(
+        "SELECT v.embedding FROM chunks c JOIN chunks_vec v ON v.rowid = c.id WHERE c.text_sha = ?1 LIMIT 1",
+    )?;
+    let mut blobs: Vec<Option<Vec<u8>>> = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        blobs.push(lookup.query_row([&c.text_sha], |r| r.get(0)).optional()?);
+    }
+    let missing: Vec<usize> = (0..chunks.len()).filter(|&i| blobs[i].is_none()).collect();
+    report.chunks_reused += chunks.len() - missing.len();
+    report.chunks_embedded += missing.len();
+    if !missing.is_empty() {
+        let texts: Vec<String> = missing.iter().map(|&i| chunks[i].text.clone()).collect();
+        let vectors = embedder.embed_documents(&texts)?;
+        for (&i, v) in missing.iter().zip(&vectors) {
+            blobs[i] = Some(db::vec_to_blob(v));
+        }
+    }
+    Ok(blobs.into_iter().map(|b| b.expect("filled above")).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_document(
+    conn: &mut Connection,
+    file: &CorpusFile,
+    existing_id: Option<i64>,
+    sha: &str,
+    status: Status,
+    error: Option<&str>,
+    doc: Option<&ParsedDoc>,
+    chunks: &[Chunk],
+    vectors: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    let scanned = doc.map(|d| json!(d.scanned_pages).to_string());
+    let page_count = doc.map(|d| d.pages.len() as i64);
+    let (csl, doi, meta_source) = match doc {
+        Some(d) if d.meta.source.is_some() => (Some(csl_json(d).to_string()), d.meta.doi.clone(), d.meta.source.as_deref()),
+        _ => (None, doc.and_then(|d| d.meta.doi.clone()), None),
+    };
+    let doc_id = match existing_id {
+        Some(id) => {
+            tx.execute("DELETE FROM chunks WHERE doc_id = ?1", [id])?;
+            tx.execute(
+                "UPDATE documents SET path = ?2, size = ?3, mtime_ns = ?4, sha256 = ?5, status = ?6, kind = ?7,
+                   parser_version = ?8, chunker_version = ?9, page_count = ?10, scanned_pages = ?11, error = ?12,
+                   indexed_at = ?13, removed_at = NULL,
+                   -- Crossref matches and manual edits survive reprocessing; only metadata that
+                   -- came from the file itself is refreshed from the new parse.
+                   csl_json = CASE WHEN metadata_source IN ('manual', 'crossref_doi', 'crossref_query') THEN csl_json ELSE ?14 END,
+                   doi = CASE WHEN metadata_source IN ('manual', 'crossref_doi', 'crossref_query') THEN doi ELSE COALESCE(?15, doi) END,
+                   metadata_source = CASE WHEN metadata_source IN ('manual', 'crossref_doi', 'crossref_query') THEN metadata_source ELSE ?16 END
+                 WHERE id = ?1",
+                params![id, file.rel_path, file.size as i64, file.mtime_ns, sha, status.as_str(), file.kind.as_str(),
+                    file.kind.parser_version(), CHUNKER_VERSION, page_count, scanned, error, db::now_rfc3339(),
+                    csl, doi, meta_source],
+            )?;
+            id
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO documents (path, size, mtime_ns, sha256, status, kind, parser_version, chunker_version,
+                   page_count, scanned_pages, error, indexed_at, csl_json, doi, metadata_source, metadata_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'pending')",
+                params![file.rel_path, file.size as i64, file.mtime_ns, sha, status.as_str(), file.kind.as_str(),
+                    file.kind.parser_version(), CHUNKER_VERSION, page_count, scanned, error, db::now_rfc3339(),
+                    csl, doi, meta_source],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+    if let Some(doc) = doc {
+        let mut insert_chunk = tx.prepare(
+            "INSERT INTO chunks (doc_id, ord, text, text_sha, pdf_page_start, pdf_page_end, page_label_start,
+               page_label_end, line_start, line_end, section, char_start, char_end, n_tokens, ocr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        )?;
+        let mut insert_vec = tx.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)")?;
+        for (c, v) in chunks.iter().zip(vectors) {
+            let (ps, pe) = (&doc.pages[c.page_start], &doc.pages[c.page_end]);
+            insert_chunk.execute(params![
+                doc_id, c.ord as i64, c.text, c.text_sha, ps.pdf_page, pe.pdf_page, ps.label, pe.label,
+                c.lines.map(|l| l.0), c.lines.map(|l| l.1), (!c.section.is_empty()).then_some(&c.section),
+                c.char_start as i64, c.char_end as i64, c.n_tokens as i64, c.ocr,
+            ])?;
+            insert_vec.execute(params![tx.last_insert_rowid(), v])?;
+        }
+    }
+    tx.commit()?;
+    // Reprocessed PDFs lose metadata-derived page numbers with their old chunks; restore them.
+    if doc.is_some() {
+        crate::metadata::apply_page_offset(conn, doc_id)?;
+    }
+    Ok(())
+}
+
+fn csl_json(doc: &ParsedDoc) -> serde_json::Value {
+    let m = &doc.meta;
+    let mut v = json!({ "title": m.title });
+    if !m.authors.is_empty() {
+        v["author"] = json!(m.authors.iter().map(|a| json!({ "literal": a })).collect::<Vec<_>>());
+    }
+    if let Some(y) = m.year {
+        v["issued"] = json!({ "date-parts": [[y]] });
+    }
+    if let Some(d) = &m.doi {
+        v["DOI"] = json!(d);
+    }
+    v
+}
+
+fn restore(conn: &Connection, row: &DocRow, file: &CorpusFile) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE documents SET path = ?2, size = ?3, mtime_ns = ?4, status = ?5, removed_at = NULL WHERE id = ?1",
+        params![row.id, file.rel_path, file.size as i64, file.mtime_ns, status_for(row.scanned_pages).as_str()],
+    )?;
+    Ok(())
+}
+
+fn update_stat(conn: &Connection, id: i64, file: &CorpusFile) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE documents SET size = ?2, mtime_ns = ?3 WHERE id = ?1",
+        params![id, file.size as i64, file.mtime_ns],
+    )?;
+    Ok(())
+}
+
+fn status_for(scanned_pages: usize) -> Status {
+    if scanned_pages > 0 { Status::NeedsOcr } else { Status::Indexed }
+}
+
+fn emit(on_event: &mut dyn FnMut(&Event), file: &CorpusFile, change: Change, status: Status, conn: &Connection, id: i64) -> anyhow::Result<()> {
+    let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks WHERE doc_id = ?1", [id], |r| r.get(0))?;
+    on_event(&Event { path: file.rel_path.clone(), change, status, chunks: chunks as usize });
+    Ok(())
+}
+
+fn load_docs(conn: &Connection) -> anyhow::Result<Vec<DocRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, size, mtime_ns, sha256, status, kind, parser_version, chunker_version, scanned_pages FROM documents",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let scanned: Option<String> = r.get(9)?;
+            Ok(DocRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                size: r.get(2)?,
+                mtime_ns: r.get(3)?,
+                sha256: r.get(4)?,
+                status: Status::parse(&r.get::<_, String>(5)?),
+                kind: r.get(6)?,
+                parser_version: r.get(7)?,
+                chunker_version: r.get(8)?,
+                scanned_pages: scanned
+                    .and_then(|s| serde_json::from_str::<Vec<u32>>(&s).ok())
+                    .map_or(0, |v| v.len()),
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Counts for `localrag status`.
+#[derive(Debug, Default)]
+pub struct IndexStatus {
+    pub by_status: Vec<(String, i64)>,
+    pub chunks: i64,
+    pub vectors: i64,
+    pub embed_model: Option<String>,
+    pub last_sync: Option<String>,
+}
+
+pub fn status(conn: &Connection) -> anyhow::Result<IndexStatus> {
+    let by_status = conn
+        .prepare("SELECT status, count(*) FROM documents GROUP BY status ORDER BY status")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let chunks = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+    let has_vec: bool = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'chunks_vec'", [], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0)?;
+    let vectors = if has_vec { conn.query_row("SELECT count(*) FROM chunks_vec", [], |r| r.get(0))? } else { 0 };
+    Ok(IndexStatus {
+        by_status,
+        chunks,
+        vectors,
+        embed_model: db::get_meta(conn, "embed_model")?,
+        last_sync: db::get_meta(conn, "last_sync")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct DocSummary {
+    pub id: i64,
+    pub path: String,
+    pub status: String,
+    pub chunks: i64,
+    pub error: Option<String>,
+    pub scanned_pages: Option<String>,
+}
+
+pub fn list_documents(conn: &Connection) -> anyhow::Result<Vec<DocSummary>> {
+    let rows = conn
+        .prepare(
+            "SELECT d.id, d.path, d.status, (SELECT count(*) FROM chunks c WHERE c.doc_id = d.id), d.error, d.scanned_pages
+             FROM documents d ORDER BY d.path",
+        )?
+        .query_map([], |r| {
+            Ok(DocSummary { id: r.get(0)?, path: r.get(1)?, status: r.get(2)?, chunks: r.get(3)?, error: r.get(4)?, scanned_pages: r.get(5)? })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenameReport {
+    pub path: String,
+    pub label: String,
+    /// Chat-history citations whose path/label were updated.
+    pub citations_updated: usize,
+    /// eval.jsonl questions whose expected_doc was updated.
+    pub eval_items_updated: usize,
+}
+
+/// Renames a document's file within its corpus folder without reindexing: the content, hash,
+/// chunks and vectors are unchanged, so only references to the name are updated. Those are
+/// the document's path, chat-history citation snapshots (path, and the label when it came
+/// from the file name), and `eval.jsonl` entries naming the old file.
+pub fn rename_document(ws: &Workspace, conn: &mut Connection, doc_id: i64, new_name: &str) -> anyhow::Result<RenameReport> {
+    let (old_path, status, kind, cite_label, csl): (String, String, String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT path, status, kind, cite_label, csl_json FROM documents WHERE id = ?1",
+            [doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+        .with_context(|| format!("no document with id {doc_id}"))?;
+    if Status::parse(&status) == Status::Removed {
+        bail!("{old_path} is no longer in corpus/, so there's no file to rename");
+    }
+    let new_kind = DocKind::from_path(std::path::Path::new(new_name));
+    if new_kind.map(DocKind::as_str) != Some(kind.as_str()) {
+        let ext = old_path.rsplit_once('.').map_or("", |(_, e)| e);
+        bail!("keep the .{ext} extension: changing a file's type would mean reindexing it");
+    }
+    let new_path = match old_path.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{new_name}"),
+        None => new_name.to_string(),
+    };
+    if new_path == old_path {
+        bail!("that's already its name");
+    }
+    let (from, to) = (ws.corpus_dir().join(&old_path), ws.corpus_dir().join(&new_path));
+    if to.exists() || conn.query_row("SELECT 1 FROM documents WHERE path = ?1", [&new_path], |_| Ok(())).optional()?.is_some() {
+        bail!("{new_path} already exists in corpus/");
+    }
+
+    let old_label = crate::cite::doc_label(cite_label.as_deref(), csl.as_deref(), &old_path);
+    std::fs::rename(&from, &to).with_context(|| format!("renaming {}", from.display()))?;
+    if let Err(e) = conn.execute("UPDATE documents SET path = ?2 WHERE id = ?1", params![doc_id, new_path]) {
+        let _ = std::fs::rename(&to, &from); // keep disk and index consistent
+        return Err(e.into());
+    }
+    // Labels can come from file names (and a/b suffixes depend on the others), so recompute.
+    crate::metadata::assign_labels(conn)?;
+    let new_label: String = conn.query_row("SELECT cite_label FROM documents WHERE id = ?1", [doc_id], |r| r.get(0))?;
+
+    let citations_updated = {
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, String)> = tx
+            .prepare("SELECT id, citations_json FROM messages WHERE citations_json IS NOT NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut updated = 0;
+        for (id, json) in rows {
+            let mut snaps: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+            let mut changed = false;
+            for snap in &mut snaps {
+                // By path, not hash: an identical copy elsewhere in corpus/ keeps its own name.
+                if snap["doc_path"] != old_path.as_str() {
+                    continue;
+                }
+                snap["doc_path"] = json!(new_path);
+                if let Some(label) = snap["label"].as_str()
+                    && let Some(rest) = label.strip_prefix(&old_label)
+                {
+                    snap["label"] = json!(format!("{new_label}{rest}"));
+                }
+                changed = true;
+                updated += 1;
+            }
+            if changed {
+                tx.execute("UPDATE messages SET citations_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&snaps)?])?;
+            }
+        }
+        tx.commit()?;
+        updated
+    };
+    let eval_items_updated = rename_in_eval(ws, &old_path, &new_path)?;
+    Ok(RenameReport { path: new_path, label: new_label, citations_updated, eval_items_updated })
+}
+
+/// eval.jsonl names documents by a substring of their path; retarget entries that matched
+/// the old file name and no longer match the new one.
+fn rename_in_eval(ws: &Workspace, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
+    let file = ws.state_dir().join("eval.jsonl");
+    let Ok(text) = std::fs::read_to_string(&file) else { return Ok(0) };
+    let (old_l, new_l) = (old_path.to_lowercase(), new_path.to_lowercase());
+    let new_name = new_path.rsplit('/').next().unwrap_or(new_path);
+    let mut updated = 0;
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut replaced = None;
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(want) = v["expected_doc"].as_str().map(str::to_lowercase)
+            && old_l.contains(&want)
+            && !new_l.contains(&want)
+        {
+            v["expected_doc"] = json!(new_name);
+            replaced = Some(v.to_string());
+            updated += 1;
+        }
+        out.push_str(replaced.as_deref().unwrap_or(line));
+        out.push('\n');
+    }
+    if updated > 0 {
+        crate::config::write_private(&file, out.as_bytes())?;
+    }
+    Ok(updated)
+}
+
+/// Resolves a `forget` argument: a document id or its path relative to corpus/.
+pub fn find_document(conn: &Connection, key: &str) -> anyhow::Result<Option<i64>> {
+    if let Ok(id) = key.parse::<i64>()
+        && conn.query_row("SELECT 1 FROM documents WHERE id = ?1", [id], |_| Ok(())).optional()?.is_some()
+    {
+        return Ok(Some(id));
+    }
+    let path = key.trim_start_matches("corpus/");
+    Ok(conn.query_row("SELECT id FROM documents WHERE path = ?1", [path], |r| r.get(0)).optional()?)
+}

@@ -1,0 +1,61 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+2 0 obj
+<< /Length 185 >>
+stream
+BT
+/F1 14 Tf
+72 720 Td
+18 TL
+(Sample Paper on Attention) Tj T*
+(Self-attention takes quadratic time in sequence length.) Tj T*
+(This sentence is used to check text extraction.) Tj T*
+ET
+endstream
+endobj
+3 0 obj
+<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 2 0 R >>
+endobj
+4 0 obj
+<< /Length 130 >>
+stream
+BT
+/F1 14 Tf
+72 720 Td
+18 TL
+(Second page of the sample paper.) Tj T*
+(Linear attention reduces the cost to linear time.) Tj T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>
+endobj
+7 0 obj
+<< /Type /Catalog /Pages 6 0 R /PageLabels << /Nums [0 << /S /D /St 345 >>] >> >>
+endobj
+8 0 obj
+<< /Title (Sample Paper on Attention) /Author (A. Tester) >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000015 00000 n 
+0000000085 00000 n 
+0000000321 00000 n 
+0000000447 00000 n 
+0000000628 00000 n 
+0000000754 00000 n 
+0000000817 00000 n 
+0000000914 00000 n 
+trailer
+<< /Size 9 /Root 7 0 R /Info 8 0 R >>
+startxref
+990
+%%EOF
