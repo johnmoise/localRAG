@@ -1,4 +1,5 @@
-//! OCR for scanned PDF pages with Apple Vision (ARCHITECTURE.md §6).
+//! OCR for scanned PDF pages (ARCHITECTURE.md §6): Apple Vision on macOS, Windows.Media.Ocr on
+//! Windows, unavailable elsewhere.
 //!
 //! Pages are rendered by the sandboxed PDF helper and recognized here. Results are cached in
 //! `.localrag/ocr/<sha256>.json`, keyed by file content, so rechunking, a model change or a
@@ -9,18 +10,38 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
-use objc2::AnyThread;
-use objc2::rc::Retained;
-use objc2_foundation::{NSArray, NSData, NSDictionary};
-use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use serde::{Deserialize, Serialize};
 
 use crate::parse::{ParsedDoc, line_blocks};
 use crate::pdfhelper::PdfHelper;
 use crate::workspace::Workspace;
 
-/// Bump to invalidate cached OCR (e.g. a different engine or settings).
-pub const ENGINE: &str = "apple-vision-accurate-1";
+#[cfg(target_os = "macos")]
+#[path = "vision.rs"]
+mod engine;
+#[cfg(windows)]
+#[path = "winrt.rs"]
+mod engine;
+#[cfg(not(any(target_os = "macos", windows)))]
+#[path = "none.rs"]
+mod engine;
+
+/// Bump to invalidate cached OCR (e.g. a different engine or settings). Caches written by
+/// another platform's engine are redone rather than reused.
+pub use engine::ENGINE;
+/// The engine's name for messages ("Apple Vision", "Windows OCR").
+pub use engine::NAME;
+
+/// Whether OCR can run on this machine; the error says why not and what to install.
+pub fn available() -> anyhow::Result<()> {
+    engine::available()
+}
+
+/// (text, confidence, [x, y, width, height] as fractions of the image, origin top-left)
+/// per recognized line.
+pub fn recognize(png: &[u8]) -> anyhow::Result<Vec<(String, f32, [f32; 4])>> {
+    engine::recognize(png)
+}
 /// ~300 DPI for a US-letter page.
 const RENDER_WIDTH: u32 = 2550;
 
@@ -72,6 +93,7 @@ pub fn ocr_document(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize, usize),
 ) -> anyhow::Result<OcrCache> {
+    available()?;
     let mut cache = load_cache(ws, sha256).unwrap_or(OcrCache { engine: ENGINE.into(), pages: BTreeMap::new() });
     let todo: Vec<u32> = pages.iter().copied().filter(|p| !cache.pages.contains_key(p)).collect();
     let total = todo.len();
@@ -109,29 +131,6 @@ pub fn apply_to(doc: &mut ParsedDoc, cache: &OcrCache) {
         }
     }
     doc.scanned_pages.retain(|p| !cache.pages.contains_key(p));
-}
-
-/// (text, confidence, bbox top-left fractions) per recognized line.
-fn recognize(png: &[u8]) -> anyhow::Result<Vec<(String, f32, [f32; 4])>> {
-    let data = NSData::with_bytes(png);
-    let handler = VNImageRequestHandler::initWithData_options(VNImageRequestHandler::alloc(), &data, &NSDictionary::new());
-    let request = VNRecognizeTextRequest::new();
-    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-    request.setUsesLanguageCorrection(true);
-    let as_request: Retained<VNRequest> = Retained::into_super(Retained::into_super(request.clone()));
-    handler
-        .performRequests_error(&NSArray::from_retained_slice(&[as_request]))
-        .map_err(|e| anyhow::anyhow!("Vision request failed: {e}"))?;
-    let Some(results) = request.results() else { return Ok(Vec::new()) };
-    let mut out = Vec::new();
-    for obs in results.iter() {
-        let Some(best) = obs.topCandidates(1).firstObject() else { continue };
-        // Vision's box is normalized with the origin at the bottom-left.
-        let r = unsafe { obs.boundingBox() };
-        let (x, y, w, h) = (r.origin.x as f32, r.origin.y as f32, r.size.width as f32, r.size.height as f32);
-        out.push((best.string().to_string(), best.confidence(), [x, 1.0 - y - h, w, h]));
-    }
-    Ok(out)
 }
 
 /// Orders lines top to bottom (then left to right) and starts a new paragraph where the gap

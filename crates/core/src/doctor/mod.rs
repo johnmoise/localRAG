@@ -80,7 +80,7 @@ pub async fn run(cfg: &DoctorConfig) -> Vec<Check> {
         Some(png) => ocr::check(&png),
         None => Ok(Outcome::Skip("needs PDFium to render a page".into())),
     };
-    checks.push(Check::from_result("Apple Vision OCR", t, ocr));
+    checks.push(Check::from_result(if cfg!(target_os = "macos") { "Apple Vision OCR" } else { crate::ocr::NAME }, t, ocr));
 
     let client = reqwest::Client::new();
     let t = Instant::now();

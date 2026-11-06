@@ -141,7 +141,7 @@ enum Command {
         chat_model: String,
         #[arg(long, default_value_t = 16384)]
         num_ctx: u32,
-        /// Path to libpdfium.dylib (default: discovered automatically)
+        /// Path to the PDFium library, libpdfium.dylib or pdfium.dll (default: discovered automatically)
         #[arg(long)]
         pdfium: Option<PathBuf>,
         /// Hugging Face tokenizer.json matching --chat-model
@@ -594,10 +594,18 @@ fn print_answer(a: &Answer, streamed: bool) {
     }
 }
 
+/// Opens `url` in the default browser.
+fn open_url(url: &str) {
+    // `explorer <url>` rather than `cmd /c start`, which would treat `&` in the URL as a
+    // command separator.
+    let opener = if cfg!(windows) { "explorer" } else { "open" };
+    let _ = std::process::Command::new(opener).arg(url).status();
+}
+
 fn serve(port: u16, no_open: bool, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let open_browser = |url: &str| {
         if !no_open {
-            let _ = std::process::Command::new("open").arg(url).status();
+            open_url(url);
         }
     };
     let guard = match instance::acquire()? {

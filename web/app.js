@@ -716,7 +716,7 @@ async function loadDocuments() {
       el("td", { class: "actions" }, d.status === "removed"
         ? el("button", { class: "small danger", title: "Permanently delete this document's record, passages and OCR cache", onclick: () => forget(d) }, "Forget")
         : el("span", {},
-            d.status === "needs_ocr" ? el("button", { class: "small primary", title: "Recognize the text of the scanned pages with Apple Vision", onclick: () => runOcr(d) }, "Run OCR") : null,
+            d.status === "needs_ocr" ? el("button", { class: "small primary", title: "Recognize the text of the scanned pages with the system OCR engine", onclick: () => runOcr(d) }, "Run OCR") : null,
             " ",
             el("button", { class: "small", title: "Rename the file (no reindexing)", onclick: () => startRename(d, nameCell) }, "Rename"))));
   }));
