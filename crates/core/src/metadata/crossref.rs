@@ -179,12 +179,9 @@ pub fn configured(g: &crate::config::GlobalConfig) -> &'static Crossref {
     c
 }
 
-/// `$LOCALRAG_CACHE_DIR/crossref`, else `~/.cache/localrag/crossref`.
+/// `crossref/` under the per-user cache folder (`config::cache_dir`).
 pub fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALRAG_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| {
-        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".cache").join("localrag")
-    });
-    base.join("crossref")
+    crate::config::cache_dir().join("crossref")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

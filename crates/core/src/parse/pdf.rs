@@ -22,8 +22,17 @@ pub fn pdfium(lib: &Path) -> anyhow::Result<&'static Pdfium> {
     Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
-/// Finds libpdfium.dylib: the configured path, `$LOCALRAG_PDFIUM`, or a bundled copy
-/// (see `resources::find`).
+/// The bundled PDFium library, relative to `third_party/` (the bblanchon/pdfium-binaries
+/// layout fetched by `scripts/fetch-pdfium.sh` / `fetch-pdfium.ps1`).
+#[cfg(target_os = "macos")]
+pub const BUNDLED_LIBRARY: &str = "pdfium/lib/libpdfium.dylib";
+#[cfg(windows)]
+pub const BUNDLED_LIBRARY: &str = "pdfium/bin/pdfium.dll";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub const BUNDLED_LIBRARY: &str = "pdfium/lib/libpdfium.so";
+
+/// Finds the PDFium library (libpdfium.dylib, pdfium.dll): the configured path,
+/// `$LOCALRAG_PDFIUM`, or a bundled copy (see `resources::find`).
 pub fn find_library(configured: Option<&Path>) -> anyhow::Result<PathBuf> {
     let explicit = configured.map(Path::to_path_buf).or_else(|| std::env::var_os("LOCALRAG_PDFIUM").map(PathBuf::from));
     if let Some(p) = explicit {
@@ -32,8 +41,10 @@ pub fn find_library(configured: Option<&Path>) -> anyhow::Result<PathBuf> {
         }
         bail!("libpdfium not found at {}", p.display());
     }
-    crate::resources::find("pdfium/lib/libpdfium.dylib")
-        .context("libpdfium.dylib not found; set pdfium_lib in the global config or run scripts/fetch-pdfium.sh")
+    crate::resources::find(BUNDLED_LIBRARY).with_context(|| {
+        let name = Path::new(BUNDLED_LIBRARY).file_name().unwrap_or_default().to_string_lossy();
+        format!("{name} not found; set pdfium_lib in the global config or run scripts/fetch-pdfium.sh")
+    })
 }
 
 /// Cheap checks that don't need PDFium: empty file, or no `%PDF-` header in the first KB.

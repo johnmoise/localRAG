@@ -1,6 +1,6 @@
 //! OCR inside the background job (ARCHITECTURE.md §6): scanned pages are rendered by the
-//! sandboxed PDF helper, recognized with Apple Vision, cached, and the document is marked for
-//! reprocessing so the following sync indexes the recognized text.
+//! PDF helper, recognized with the platform's OCR engine (`localrag_core::ocr`), cached, and
+//! the document is marked for reprocessing so the following sync indexes the recognized text.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;

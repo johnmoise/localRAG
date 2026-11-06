@@ -1,5 +1,6 @@
-//! Workspace picker API: list known workspaces, open, create, forget, and a native macOS
-//! folder chooser (ARCHITECTURE.md §4, §15).
+//! Workspace picker API: list known workspaces, open, create, forget, and the native folder
+//! chooser (macOS: `osascript`; Windows: the shell's folder dialog via `rfd`) (ARCHITECTURE.md
+//! §4, §15).
 
 use std::path::PathBuf;
 
@@ -22,7 +23,7 @@ pub async fn list(State(state): State<AppState>) -> ApiResult {
         Ok(Json(json!({
             "active": active.as_ref().map(|p| json!({ "path": p, "name": p.file_name().map(|n| n.to_string_lossy().to_string()) })),
             "known": known,
-            "home": std::env::var_os("HOME").map(PathBuf::from),
+            "home": localrag_core::config::home_dir(),
         })))
     })
     .await
@@ -93,6 +94,7 @@ pub async fn forget(State(state): State<AppState>, Json(body): Json<ForgetBody>)
 
 /// Shows the macOS folder chooser on the user's screen and returns the chosen path.
 /// The AppleScript is a fixed string: nothing from the request is interpolated into it.
+#[cfg(target_os = "macos")]
 pub async fn choose_folder() -> ApiResult {
     blocking(|| {
         let out = std::process::Command::new("osascript")
@@ -109,10 +111,31 @@ pub async fn choose_folder() -> ApiResult {
     .await
 }
 
+/// Shows the Windows folder dialog on the user's screen and returns the chosen path.
+#[cfg(windows)]
+pub async fn choose_folder() -> ApiResult {
+    blocking(|| {
+        let mut dialog = rfd::FileDialog::new().set_title("Choose a folder for localrag");
+        if let Some(home) = localrag_core::config::home_dir() {
+            dialog = dialog.set_directory(home);
+        }
+        Ok(Json(match dialog.pick_folder() {
+            Some(path) => json!({ "path": path }),
+            None => json!({ "cancelled": true }),
+        }))
+    })
+    .await
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub async fn choose_folder() -> ApiResult {
+    Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "unsupported", "The folder chooser isn't available on this platform."))
+}
+
 /// `~/x` → `$HOME/x`, so typed paths work.
 fn expand(p: &std::path::Path) -> PathBuf {
-    match (p.strip_prefix("~"), std::env::var_os("HOME")) {
-        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+    match (p.strip_prefix("~"), localrag_core::config::home_dir()) {
+        (Ok(rest), Some(home)) => home.join(rest),
         _ => p.to_path_buf(),
     }
 }

@@ -1,0 +1,69 @@
+# Builds and tests localrag for Windows (x86_64-pc-windows-msvc) and uploads a zip that
+# colleagues can unzip and run (docs/ARCHITECTURE.md, "Windows support").
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch PDFium and tokenizer
+        shell: bash
+        run: |
+          scripts/fetch-pdfium.sh
+          scripts/fetch-tokenizers.sh
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --target $env:TARGET -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --target $env:TARGET
+
+      - name: Build release
+        run: cargo build --release --workspace --target $env:TARGET
+
+      - name: Doctor (offline, no Ollama)
+        shell: pwsh
+        run: |
+          # Exercises the PDF helper, PDFium and Windows OCR on the fixture; Ollama checks skip.
+          # Informational: a runner without an OCR language pack only warns.
+          & "target\$env:TARGET\release\localrag.exe" doctor --offline
+          exit 0
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "dist\localrag-windows-x64"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "target\$env:TARGET\release\localrag.exe", "target\$env:TARGET\release\localrag-pdf.exe" $out
+          Copy-Item third_party\pdfium\bin\pdfium.dll $out
+          Copy-Item third_party\pdfium\LICENSE "$out\LICENSE-pdfium.txt"
+          Copy-Item third_party\tokenizers\qwen35.json $out
+
+      # GitHub serves the artifact as localrag-windows-x64.zip holding these files.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: localrag-windows-x64
+          path: dist/localrag-windows-x64/
+          if-no-files-found: error

@@ -33,7 +33,7 @@ pub(super) fn check(helper: &PdfHelper) -> anyhow::Result<PdfReport> {
                 "{} pages, {boxed} chars with boxes, labels {labels:?}, page 1 rendered ({} KB); helper {}",
                 doc.pages.len(),
                 png.len() / 1024,
-                if helper.is_sandboxed() { "sandboxed (no network, no writes)" } else { "NOT sandboxed" }
+                helper.isolation()
             )),
             page1_png: png,
         })

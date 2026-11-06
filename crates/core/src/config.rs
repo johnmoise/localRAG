@@ -149,13 +149,37 @@ pub fn validate_cache_days(s: &str) -> anyhow::Result<u32> {
     }
 }
 
-/// `$LOCALRAG_CONFIG_DIR`, else `~/.config/localrag`.
+/// The user's home folder (`$HOME`; `%USERPROFILE%` on Windows).
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|p| !p.as_os_str().is_empty())
+}
+
+/// `$LOCALRAG_CONFIG_DIR`, else `~/.config/localrag` (`%APPDATA%\localrag` on Windows, which
+/// only this user can read).
 pub fn global_config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOCALRAG_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("localrag")
+    if cfg!(windows)
+        && let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(appdata).join("localrag");
+    }
+    home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".config").join("localrag")
+}
+
+/// Per-user cache folder: `$LOCALRAG_CACHE_DIR`, else `~/.cache/localrag`
+/// (`%LOCALAPPDATA%\localrag` on Windows).
+pub fn cache_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LOCALRAG_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if cfg!(windows)
+        && let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(local).join("localrag");
+    }
+    home_dir().unwrap_or_default().join(".cache").join("localrag")
 }
 
 pub fn load_global() -> anyhow::Result<GlobalConfig> {
@@ -181,24 +205,41 @@ pub fn save_global(cfg: &GlobalConfig) -> anyhow::Result<()> {
     save(&dir.join("config.toml"), cfg, "# localrag machine-wide settings. Private to this user (mode 0600); never inside a workspace.\n\n")
 }
 
-/// Creates `dir` (and parents) and makes it accessible to this user only (0700).
+/// Creates `dir` (and parents) and makes it accessible to this user only (0700). On Windows
+/// the per-user folders it is used under (`%APPDATA%`, `%LOCALAPPDATA%`) are already private
+/// by their ACLs, which new files and folders inherit.
 pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
+}
+
+/// Options for creating a file only this user can read (0600 on Unix; the folder's ACL on
+/// Windows).
+pub fn private_file_options() -> std::fs::OpenOptions {
+    #[allow(unused_mut)]
+    let mut opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
 }
 
 /// Writes a file readable and writable by this user only (0600), replacing it atomically.
 pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     // A unique temp name: concurrent writers of the same file must not rename each other's.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let tmp = path.with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
-    let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)
+    let mut f = private_file_options().create(true).truncate(true).write(true).open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
     f.write_all(bytes)?;
     f.sync_all()?;

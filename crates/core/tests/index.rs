@@ -394,6 +394,10 @@ fn rename_updates_references_without_reindexing() {
 fn ocr_fills_scanned_pages_and_is_cached() {
     use_built_helper();
     let Ok(lib) = localrag_core::parse::pdf::find_library(None) else { return };
+    if let Err(e) = localrag_core::ocr::available() {
+        eprintln!("skipping: {e:#}");
+        return;
+    }
     let pdfium = localrag_core::parse::pdf::pdfium(&lib).unwrap();
     let mut f = Fixture::new();
     f.write("scan.pdf", scanned_pdf(pdfium));

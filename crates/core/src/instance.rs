@@ -1,20 +1,19 @@
-//! Only one localrag runs at a time (ARCHITECTURE.md §4): the server holds an exclusive
-//! `flock` on `~/.config/localrag/instance.lock` for its lifetime. The OS releases it when the
+//! Only one localrag runs at a time (ARCHITECTURE.md §4): the server holds an exclusive lock
+//! (`flock` on Unix, `LockFileEx` on Windows, via `File::try_lock`) on `instance.lock` in the
+//! global config folder for its lifetime. The OS releases it when the
 //! process exits, even on a crash, so a stale lock can't block the next start.
 //!
-//! `instance.json` (mode 0600, since it carries the launch token) tells a second invocation
+//! `instance.json` (private to this user, since it carries the launch token) tells a second invocation
 //! where the running one is.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, TryLockError};
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ensure_private_dir, global_config_dir};
+use crate::config::{ensure_private_dir, global_config_dir, private_file_options};
 
 /// Held for as long as this process is the running instance.
 pub struct InstanceGuard {
@@ -39,20 +38,22 @@ fn info_path() -> PathBuf {
 /// Becomes the running instance, or reports the one that already is.
 pub fn acquire() -> anyhow::Result<Result<InstanceGuard, RunningInstance>> {
     ensure_private_dir(&global_config_dir())?;
-    let file = OpenOptions::new()
+    let file = private_file_options()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o600)
         .open(lock_path())
         .with_context(|| format!("opening {}", lock_path().display()))?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock_path().display())),
+        Err(TryLockError::WouldBlock) => {
         let running = std::fs::read_to_string(info_path())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(RunningInstance { pid: 0, url: None });
-        return Ok(Err(running));
+            return Ok(Err(running));
+        }
     }
     write_info(&RunningInstance { pid: std::process::id(), url: None })?;
     Ok(Ok(InstanceGuard { _lock: file }))
@@ -72,7 +73,7 @@ impl Drop for InstanceGuard {
 }
 
 fn write_info(info: &RunningInstance) -> anyhow::Result<()> {
-    let mut f = OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(info_path())?;
+    let mut f = private_file_options().create(true).truncate(true).write(true).open(info_path())?;
     f.write_all(serde_json::to_string(info)?.as_bytes())?;
     Ok(())
 }

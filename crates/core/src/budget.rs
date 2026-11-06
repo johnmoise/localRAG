@@ -95,7 +95,10 @@ pub fn resolve_num_ctx(ws: &mut crate::workspace::Workspace, llm: &dyn crate::ll
     Ok((n, true))
 }
 
+const FALLBACK_RAM: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Physical memory in bytes (macOS `hw.memsize`).
+#[cfg(target_os = "macos")]
 pub fn system_ram() -> u64 {
     let mut value: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
@@ -103,7 +106,23 @@ pub fn system_ram() -> u64 {
     let rc = unsafe {
         libc::sysctlbyname(name.as_ptr(), (&mut value as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0)
     };
-    if rc == 0 { value } else { 16 * 1024 * 1024 * 1024 }
+    if rc == 0 { value } else { FALLBACK_RAM }
+}
+
+/// Physical memory in bytes (`GlobalMemoryStatusEx`).
+#[cfg(windows)]
+pub fn system_ram() -> u64 {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    match unsafe { GlobalMemoryStatusEx(&mut status) } {
+        Ok(()) => status.ullTotalPhys,
+        Err(_) => FALLBACK_RAM,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn system_ram() -> u64 {
+    FALLBACK_RAM
 }
 
 /// Submit blocked: the question plus required grounding can't fit (§11).
