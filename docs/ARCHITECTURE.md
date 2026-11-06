@@ -56,7 +56,7 @@ Guiding principles:
 
 ## 3. Platform & tech stack
 
-**Rust, Apple Silicon only.** Why Rust over C++ with Bazel:
+**Rust, Apple Silicon first; Windows x64 for colleagues (§19.1).** Why Rust over C++ with Bazel:
 - Every piece has a mature crate: server, SQLite + vectors, PDF, Vision bindings, tokenizers,
   chunking, file walking.
 - Cargo handles dependencies. With Bazel you'd write BUILD files for third-party C/C++
@@ -74,7 +74,7 @@ runs inference over HTTP.
 | Ollama | `reqwest` + `serde_json`: `/api/chat`, `/api/embed`, `/api/tags`, `/api/show`, `/api/pull` |
 | Storage | `rusqlite` with bundled SQLite (FTS5) + `sqlite-vec`, statically linked |
 | PDF | `pdfium-render` + prebuilt PDFium shipped in the app: text, per-character boxes, page labels, page rendering |
-| OCR | Apple Vision via `objc2-vision` |
+| OCR | Apple Vision via `objc2-vision` (macOS); `Windows.Media.Ocr` via `windows` (Windows) |
 | Markdown | `pulldown-cmark` |
 | Chunking | `text-splitter` |
 | Token counting | `tokenizers` (Hugging Face) |
@@ -222,7 +222,10 @@ confirm the exact template in Phase 0.
    - Jobs run in the background with progress and cancel.
 6. **Downstream:** citations get an *OCR* badge, quote matching is fuzzy, and highlighting
    works from Vision's boxes.
-7. **Later:** a vision-capable Ollama model (`qwen3.5` reports `vision`) for low-confidence
+7. **Windows:** `Windows.Media.Ocr` takes Vision's place (§19.1). It reports no confidence,
+   so lines get 1.0, and caches record the engine, so a workspace moved between platforms
+   is recognized again rather than mixing engines.
+8. **Later:** a vision-capable Ollama model (`qwen3.5` reports `vision`) for low-confidence
    pages with math, tables or handwriting.
 
 ## 7. Citation metadata (Crossref)
@@ -1380,7 +1383,7 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
 
 ## 19. Packaging & distribution
 
-- **Build:** `aarch64-apple-darwin` only. Tauri 2 bundles the UI, the in-process server, the
+- **Build:** `aarch64-apple-darwin` for the Mac app (Windows: §19.1). Tauri 2 bundles the UI, the in-process server, the
   `localrag-pdf` helper (next to the main executable) and `libpdfium.dylib` (in
   `Contents/Frameworks`) into a `.app` inside a `.dmg`.
 - **First-run checks:**
@@ -1402,6 +1405,57 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   approval. An in-app notice that a newer build exists is fine.
 - **Permissions:** keep them minimal. The app needs network access to localhost (Ollama) and
   Crossref, and file access to the workspace you pick.
+
+### 19.1 Windows support
+
+Colleagues use Windows, so localrag also builds for `x86_64-pc-windows-msvc` as a plain
+zip of `localrag.exe`, `localrag-pdf.exe` and `pdfium.dll` (plus PDFium's license and the
+Qwen tokenizer). `.github/workflows/windows.yml` runs clippy and the tests on
+`windows-latest`, builds the release, and uploads the zip as the `localrag-windows-x64`
+artifact on every pull request and push to `main`.
+
+**What differs from macOS:**
+
+| | macOS | Windows |
+|---|---|---|
+| OCR | Apple Vision | `Windows.Media.Ocr`, using the display languages. Without an OCR-capable language pack, OCR reports how to add one and scanned PDFs stay *needs OCR* |
+| PDF helper | separate process under `sandbox-exec`: no network, no file writes | separate process in a Job Object (killed with the app, can't start processes). **No sandbox:** a compromised parser could read files and use the network. `localrag doctor` says which applies |
+| Global config | `~/.config/localrag` (0700/0600) | `%APPDATA%\localrag`, private to the user by its ACL; no mode bits |
+| Crossref cache | `~/.cache/localrag` | `%LOCALAPPDATA%\localrag` |
+| Folder chooser | `osascript` | the shell's folder dialog (`rfd`) |
+| Single-instance lock | `flock` | `LockFileEx` (both via `File::try_lock`) |
+
+`LOCALRAG_CONFIG_DIR` and `LOCALRAG_CACHE_DIR` override the folders on both. Everything in
+§14 is unchanged: 127.0.0.1 only, Host/Origin checks, the per-launch token cookie, secrets
+only in the global config, and self-ignoring `.gitignore` files in `corpus/`, `.localrag/`
+and `brain/`.
+
+**Installing (colleagues):**
+1. Install [Ollama for Windows](https://ollama.com/download/windows) and pull the models
+   (`ollama pull qwen3-embedding:0.6b`, plus a chat model such as `qwen3.5:4b`).
+2. Download `localrag-windows-x64.zip` (the workflow's artifact, or a release) and unzip it
+   anywhere, e.g. `%LOCALAPPDATA%\Programs\localrag`. Keep the files together.
+3. In that folder, run `localrag serve` from PowerShell or Command Prompt. The browser opens
+   on the UI.
+4. The exe isn't signed, so the first run shows SmartScreen's "Windows protected your PC":
+   choose **More info → Run anyway**. If Windows Defender Firewall asks, no network access
+   needs allowing (the server only listens on 127.0.0.1).
+5. Optional: `localrag doctor` checks PDFium, OCR, Ollama and Crossref.
+
+**Cross-compiling from macOS** (with [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin),
+which downloads the MSVC CRT and Windows SDK and accepts Microsoft's license for them):
+
+```bash
+brew install llvm
+cargo install cargo-xwin
+rustup target add x86_64-pc-windows-msvc
+export PATH="$(brew --prefix llvm)/bin:$PATH"
+cargo xwin build --release --target x86_64-pc-windows-msvc
+PDFIUM_PLATFORM=win-x64 scripts/fetch-pdfium.sh   # third_party/pdfium/bin/pdfium.dll
+```
+
+The binaries land in `target/x86_64-pc-windows-msvc/release/`. Tests can't run on a Mac; CI
+runs them on Windows.
 
 ## 20. Development environment (this machine)
 
