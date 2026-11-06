@@ -244,6 +244,16 @@ async fn settled_runs(s: &AppState) -> u64 {
     panic!("sync never finished");
 }
 
+/// The sync tests embed with the real Ollama (the default host); without it they skip, as the
+/// PDFium tests do without libpdfium. CI runners have no Ollama.
+fn ollama_reachable() -> bool {
+    let up = std::net::TcpStream::connect_timeout(&"127.0.0.1:11434".parse().unwrap(), std::time::Duration::from_millis(500)).is_ok();
+    if !up {
+        eprintln!("skipping: Ollama not reachable at 127.0.0.1:11434");
+    }
+    up
+}
+
 fn document_count(dir: &std::path::Path) -> i64 {
     let ws = Workspace::open(dir).unwrap();
     db::open(&ws.db_path()).unwrap().query_row("SELECT count(*) FROM documents", [], |r| r.get(0)).unwrap()
@@ -251,6 +261,9 @@ fn document_count(dir: &std::path::Path) -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn indexing_is_manual_opening_or_changing_corpus_does_not_sync() {
+    if !ollama_reachable() {
+        return;
+    }
     isolate_config();
     let dir = tempfile::tempdir().unwrap();
     Workspace::init(dir.path()).unwrap();
@@ -271,6 +284,9 @@ async fn indexing_is_manual_opening_or_changing_corpus_does_not_sync() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_indexes_and_a_batch_can_defer_to_one_sync() {
+    if !ollama_reachable() {
+        return;
+    }
     isolate_config();
     let dir = tempfile::tempdir().unwrap();
     Workspace::init(dir.path()).unwrap();
