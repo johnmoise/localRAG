@@ -87,6 +87,8 @@ pub async fn run(cfg: &DoctorConfig) -> Vec<Check> {
     let reachable = ollama::check_reachable(&client, &cfg.ollama_host).await;
     let ollama_up = reachable.is_ok();
     checks.push(Check::from_result("Ollama reachable", t, reachable));
+    let t = Instant::now();
+    checks.push(Check::from_result("Ollama installation", t, ollama::check_installed(&cfg.ollama_host, ollama_up)));
 
     if ollama_up {
         let t = Instant::now();

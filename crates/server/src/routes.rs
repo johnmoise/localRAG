@@ -41,6 +41,9 @@ pub fn router(state: AppState) -> Router {
             "/api/documents/upload",
             post(crate::upload::upload).layer(axum::extract::DefaultBodyLimit::max(crate::upload::MAX_UPLOAD_BYTES)),
         )
+        .route("/api/ollama", get(crate::ollama::get))
+        .route("/api/ollama/check", post(crate::ollama::check))
+        .route("/api/ollama/pull", post(crate::ollama::pull))
         .route("/api/models", get(models))
         .route("/api/search", post(search))
         .route("/api/ask", post(ask))

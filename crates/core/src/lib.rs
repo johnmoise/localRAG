@@ -17,6 +17,7 @@ pub mod index;
 pub mod instance;
 pub mod llm;
 pub mod metadata;
+pub mod ollama;
 pub mod ocr;
 pub mod parse;
 pub mod pdfhelper;

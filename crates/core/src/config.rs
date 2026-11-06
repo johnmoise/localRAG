@@ -20,6 +20,9 @@ pub struct GlobalConfig {
     /// Cached Crossref responses younger than this many days are reused instead of asking
     /// Crossref again (§7). 0 always asks.
     pub cache_refresh_interval_days: u32,
+    /// Stop an `ollama serve` that localRAG started itself when localRAG exits. Never applies
+    /// to an Ollama that was already running or to the desktop app (§19.1).
+    pub stop_ollama_on_exit: bool,
 }
 
 impl Default for GlobalConfig {
@@ -30,6 +33,7 @@ impl Default for GlobalConfig {
             pdfium_lib: None,
             crossref_email_prompted: false,
             cache_refresh_interval_days: crate::metadata::crossref::DEFAULT_REFRESH_DAYS,
+            stop_ollama_on_exit: false,
         }
     }
 }

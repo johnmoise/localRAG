@@ -16,12 +16,36 @@ pub(super) async fn post(client: &reqwest::Client, host: &str, path: &str, body:
 pub(super) async fn check_reachable(client: &reqwest::Client, host: &str) -> anyhow::Result<Outcome> {
     let v: Value = client
         .get(format!("{host}/api/version"))
+        .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
-        .with_context(|| format!("no response from {host}; is Ollama running?"))?
+        .with_context(|| format!("no response from {host}; is Ollama running? (`localrag serve` starts an installed Ollama)"))?
         .json()
         .await?;
     Ok(Outcome::Pass(format!("Ollama {} at {host}", v["version"].as_str().unwrap_or("?"))))
+}
+
+/// Where Ollama is installed (what `localrag serve` would start when it's stopped, §19.1).
+/// Never starts anything itself.
+pub(super) fn check_installed(host: &str, reachable: bool) -> anyhow::Result<Outcome> {
+    use crate::ollama::{self, SearchEnv};
+    if !ollama::is_local_host(host) {
+        return Ok(Outcome::Skip(format!("{host} is another machine; localrag never starts Ollama there")));
+    }
+    let found = SearchEnv::current().discover();
+    let mut parts = Vec::new();
+    if let Some(a) = &found.app {
+        parts.push(format!("app {}", a.display()));
+    }
+    if let Some(c) = &found.cli {
+        parts.push(format!("cli {}", c.display()));
+    }
+    match (found.found(), reachable) {
+        (true, true) => Ok(Outcome::Pass(parts.join("; "))),
+        (true, false) => Ok(Outcome::Warn(format!("{}; stopped: `localrag serve` starts it", parts.join("; ")))),
+        (false, true) => Ok(Outcome::Pass("running, but not at a known install location".into())),
+        (false, false) => bail!("Ollama isn't installed: get it from {} (macOS: `brew install ollama`; Windows: `winget install Ollama.Ollama`)", ollama::DOWNLOAD_URL),
+    }
 }
 
 /// 1024 dimensions, and the query template ranks the relevant passage first.
