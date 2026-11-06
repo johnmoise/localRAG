@@ -8,6 +8,7 @@
 mod auth;
 mod brain;
 mod ocr_jobs;
+pub mod ollama;
 mod routes;
 mod settings;
 mod upload;
@@ -36,6 +37,10 @@ pub struct AppState {
     pub port: u16,
     active: Arc<RwLock<Option<PathBuf>>>,
     pub sync: Arc<Mutex<SyncState>>,
+    /// Whether Ollama is installed/running, and model downloads (§19.1).
+    pub ollama: Arc<Mutex<ollama::OllamaState>>,
+    /// Where to look for an installed Ollama.
+    pub ollama_env: Arc<localrag_core::ollama::SearchEnv>,
 }
 
 /// No workspace is open yet: the UI shows the workspace picker.
@@ -102,7 +107,21 @@ impl From<&SyncReport> for SyncSummary {
 
 impl AppState {
     pub fn new(root: Option<&Path>, port: u16, token: String) -> Self {
-        AppState { token, port, active: Arc::new(RwLock::new(root.map(Path::to_path_buf))), sync: Arc::default() }
+        AppState {
+            token,
+            port,
+            active: Arc::new(RwLock::new(root.map(Path::to_path_buf))),
+            sync: Arc::default(),
+            ollama: Arc::default(),
+            ollama_env: Arc::new(localrag_core::ollama::SearchEnv::current()),
+        }
+    }
+
+    /// Looks for Ollama with `env` instead of the real environment (tests: `SearchEnv::none()`
+    /// so nothing is ever started).
+    pub fn with_ollama_search(mut self, env: localrag_core::ollama::SearchEnv) -> Self {
+        self.ollama_env = Arc::new(env);
+        self
     }
 
     pub fn root(&self) -> Option<PathBuf> {
@@ -290,6 +309,25 @@ pub async fn bind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     }
 }
 
+/// Ctrl-C, or SIGTERM on Unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 /// Serves until the process exits, with `root` active (or none, so the UI starts on the
 /// workspace picker). Calls `on_ready` with the launch URL, which carries the access token.
 pub async fn serve(root: Option<&Path>, port: u16, on_ready: impl FnOnce(&str)) -> anyhow::Result<()> {
@@ -299,7 +337,14 @@ pub async fn serve(root: Option<&Path>, port: u16, on_ready: impl FnOnce(&str)) 
     if let Some(root) = root {
         state.activate(root)?;
     }
+    // Bring Ollama up (or find out it's missing) while the browser opens; the UI shows the
+    // setup dialog until it's running (§19.1).
+    ollama::start_check(&state);
     on_ready(&format!("http://127.0.0.1:{port}/?token={}", state.token));
-    axum::serve(listener, router(state)).await?;
-    Ok(())
+    let result = tokio::select! {
+        r = axum::serve(listener, router(state.clone())) => r.map_err(anyhow::Error::from),
+        _ = shutdown_signal() => Ok(()),
+    };
+    ollama::on_exit(&state);
+    result
 }

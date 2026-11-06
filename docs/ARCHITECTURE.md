@@ -30,6 +30,7 @@ Guiding principles:
 | Platform | Apple Silicon Macs only (`aarch64-apple-darwin`) | 3 |
 | Distribution | `.dmg` with an ad-hoc-signed `.app`. No Apple Developer account, so no notarization; colleagues approve it manually on first launch | 19 |
 | Inference | Ollama. The chat model is chosen per request from installed models | 10 |
+| Ollama setup | Not bundled. `localrag serve` starts an installed, stopped local Ollama; the UI guides installation and pulls missing models | 19.1 |
 | Embedding model | `qwen3-embedding:0.6b` (1024 dimensions) | 5 |
 | Inputs | `.pdf`, `.md`, `.txt`. Scanned PDFs are OCR'd with Apple Vision | 5, 6 |
 | Corpus | `<workspace>/corpus/`, tens to hundreds of documents | 4 |
@@ -895,6 +896,9 @@ The server picks a free port and opens the browser on start.
 | `GET /api/brain/{model}/last-change` | Previous and current file, for the diff |
 | `GET /api/brain/{model}/queue` | Proposed facts |
 | `POST /api/brain/{model}/queue/{id}/{approve\|reject\|merge}` | Queue actions (`approve` accepts an edited claim) |
+| `GET /api/ollama` | Setup status: `phase` (`checking`/`starting`/`done`), `status.state` (`running`/`not_installed`/`not_running`/`remote`), installation found, the workspace's models (installed?, approximate size), pull progress |
+| `POST /api/ollama/check` | Check again (starts Ollama if it was installed meanwhile) |
+| `POST /api/ollama/pull` | Pull the missing models one by one in the background via Ollama's `/api/pull`; progress in `GET /api/ollama` |
 | `POST /api/agent/run` | Run the reasoning agent (`mode`: `research` or `report`); SSE: `step`, `thinking`, `token`, `tool_call`, `tool_result`, `brain_update`, `warning`, `result` |
 
 ## 15. User interface
@@ -1384,8 +1388,10 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   `localrag-pdf` helper (next to the main executable) and `libpdfium.dylib` (in
   `Contents/Frameworks`) into a `.app` inside a `.dmg`.
 - **First-run checks:**
-  - Is Ollama installed and running? If not, link to the installer.
-  - Is `qwen3-embedding:0.6b` present? If not, pull it via `/api/pull` with progress.
+  - Is Ollama installed and running? Start it if it's stopped; if it's missing, link to the
+    installer (done: §19.1).
+  - Are the workspace's models present? If not, pull them via `/api/pull` with progress
+    (done: §19.1).
   - Pick the default `num_ctx` from RAM.
   - Ask for the Crossref email.
 - **Ad-hoc signing:** Apple Silicon won't run code with no signature at all, so the app and
@@ -1402,6 +1408,57 @@ Rule: `core` knows nothing about HTTP. The server, CLI, app and agent are thin s
   approval. An in-app notice that a newer build exists is fine.
 - **Permissions:** keep them minimal. The app needs network access to localhost (Ollama) and
   Crossref, and file access to the workspace you pick.
+
+### 19.1 Ollama: detect, start, guide (not bundled)
+
+`crates/core/src/ollama.rs`, `crates/server/src/ollama.rs`.
+
+- **At `localrag serve` startup**, before the browser opens, a background check probes
+  `GET {ollama_host}/api/version` (2 s timeout). `ollama_host` comes from the global config
+  (default `http://127.0.0.1:11434`).
+- **If it doesn't answer and the host is this machine** (`localhost`, a loopback or the
+  unspecified address), it looks for an installation:
+  - macOS: `/Applications/Ollama.app`, `~/Applications/Ollama.app`; `ollama` on `PATH`, then
+    `/opt/homebrew/bin` and `/usr/local/bin` (a GUI launch often lacks them on `PATH`), then
+    the CLI inside the app bundle.
+  - Windows: `%LOCALAPPDATA%\Programs\Ollama\ollama.exe` (the installer's per-user location),
+    else `ollama.exe` on `PATH`; the tray app `ollama app.exe` next to it.
+- **Starting:** the desktop app is preferred (`open -g -a …/Ollama.app`; on Windows the tray
+  app), because it keeps running after localRAG exits and updates itself. Otherwise
+  `ollama serve` is spawned with `OLLAMA_HOST` set to the configured host:port, stdin closed and
+  output appended to `.localrag/logs/ollama.log` (the workspace given with `-C`) or
+  `~/.config/localrag/logs/ollama.log`. It runs in its own process group, so Ctrl-C on
+  localRAG doesn't reach it; on Windows with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+  CREATE_NO_WINDOW`. Then `/api/version` is polled for up to 20 s.
+- **Stopping:** localRAG remembers only an `ollama serve` it spawned itself. It's left running
+  on exit unless `stop_ollama_on_exit = true` in the global config (then SIGTERM on Ctrl-C or
+  SIGTERM). An Ollama that was already running, or the desktop app, is never stopped.
+- **Remote hosts:** when `ollama_host` points at another machine, nothing is ever started;
+  the UI says it isn't answering and that it must be started there.
+- **First-run dialog** (web UI): shown over everything when Ollama isn't running or the
+  active workspace's models (`embed_model`, `chat_model`, `reasoning_model`) are missing.
+  - Not installed: link to https://ollama.com/download, plus `brew install ollama` (macOS) or
+    `winget install Ollama.Ollama` (Windows), and **Check again**.
+  - Installed but failed to start: the error and how to start it by hand.
+  - Running with models missing: the list with approximate sizes (`qwen3.5:9b` ≈ 6.6 GB) and
+    **Download models**, which pulls each missing one through `POST /api/pull`, showing the
+    streamed progress (bytes summed over layers). Models already present are skipped. Closing
+    the dialog doesn't stop a download. The status bar's "Ollama not reachable" reopens it.
+- **`localrag doctor`** reports the installation it found (and whether it's stopped), without
+  starting anything. `--ollama-host` defaults to the global config.
+- **Testing the dialog** on a machine that has Ollama: `LOCALRAG_OLLAMA_SEARCH=none` makes the
+  search find nothing, so a non-answering `ollama_host` shows "not installed".
+
+**Why Ollama isn't bundled inside the app:**
+- **Size:** Ollama ships GPU runners (Metal on macOS; CUDA and ROCm libraries on Windows) that
+  run to hundreds of MB, or over a GB on Windows, more than the rest of localRAG combined.
+- **Updates:** Ollama releases often (new model architectures need a new runtime). The desktop
+  app updates itself; a bundled copy would only update with a localRAG release.
+- **Clashes:** many colleagues already run Ollama on port 11434. A second, bundled server
+  would fight it for the port, or run on another port with a second copy of every model.
+
+Bundling stays possible later: as a Tauri sidecar in the Phase 6 package, or as an optional
+component of the Windows installer, with this same detection deciding whether to use it.
 
 ## 20. Development environment (this machine)
 

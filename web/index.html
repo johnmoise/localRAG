@@ -186,6 +186,21 @@
     </div>
   </div>
 
+  <div id="ollama-dialog" class="modal top" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ollama-title">
+      <div class="modal-head">
+        <h2 id="ollama-title">Set up Ollama</h2>
+        <button id="ollama-close" class="icon" aria-label="Close">×</button>
+      </div>
+      <div id="ollama-body" aria-live="polite"></div>
+      <div class="row end">
+        <span id="ollama-error" class="error" role="alert"></span>
+        <button id="ollama-check" class="small">Check again</button>
+        <button id="ollama-pull" class="primary" hidden>Download models</button>
+      </div>
+    </div>
+  </div>
+
   <div id="email-dialog" class="modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="email-title">
       <h2 id="email-title">Faster citation lookups</h2>

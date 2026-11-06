@@ -133,8 +133,9 @@ enum Command {
     },
     /// Check that PDFium, Vision, SQLite, Ollama and Crossref all work on this machine
     Doctor {
-        #[arg(long, default_value = "http://127.0.0.1:11434")]
-        ollama_host: String,
+        /// Default: ollama_host in the global config (http://127.0.0.1:11434)
+        #[arg(long)]
+        ollama_host: Option<String>,
         #[arg(long, default_value = "qwen3-embedding:0.6b")]
         embed_model: String,
         #[arg(long, default_value = "qwen3.5:4b")]
@@ -204,6 +205,10 @@ fn main() -> ExitCode {
         },
         Command::Eval { retrieval_only, model } => exclusive().and_then(|_g| eval_cmd(retrieval_only, model)),
         Command::Doctor { ollama_host, embed_model, chat_model, num_ctx, pdfium, tokenizer, crossref_email, offline } => {
+            let ollama_host = match ollama_host {
+                Some(h) => h,
+                None => localrag_core::config::load_global().map(|g| g.ollama_host).unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
+            };
             let cfg = DoctorConfig {
                 ollama_host,
                 embed_model,
@@ -620,7 +625,7 @@ fn serve(port: u16, no_open: bool, dir: Option<PathBuf>) -> anyhow::Result<()> {
         None => None,
     };
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(localrag_server::serve(root.as_deref(), port, |url| {
+    let result = runtime.block_on(localrag_server::serve(root.as_deref(), port, |url| {
         match &root {
             Some(r) => println!("localrag is serving {}", r.display()),
             None => println!("localrag is running; choose a workspace in the browser."),
@@ -629,7 +634,10 @@ fn serve(port: u16, no_open: bool, dir: Option<PathBuf>) -> anyhow::Result<()> {
         println!("  (press Ctrl-C to stop)");
         let _ = guard.publish_url(url);
         open_browser(url);
-    }))
+    }));
+    // Ctrl-C: don't wait for in-flight work (an answer, a sync) before exiting.
+    runtime.shutdown_background();
+    result
 }
 
 /// Commands that write to a workspace refuse while the app is running, so there's only ever

@@ -69,9 +69,10 @@ async function refreshStatus() {
     document.title = s.name ? `localRAG · ${s.name}` : "localRAG";
     const docs = Object.values(s.documents || {}).reduce((a, b) => a + b, 0);
     let dot = "", text;
+    $("#status").classList.toggle("clickable", !s.ollama.reachable);
     if (!s.ollama.reachable) {
       dot = "bad";
-      text = `Ollama not reachable at ${s.ollama.host}`;
+      text = `Ollama not reachable at ${s.ollama.host} · click to set up`;
     } else if (s.sync.running) {
       dot = "busy";
       const o = s.sync.ocr;
@@ -935,6 +936,7 @@ function onWorkspaceActivated(active) {
   newChat();
   loadModels();
   refreshStatus();
+  ollamaSetup(); // this workspace's models may be missing
   if ($("#tab-documents").classList.contains("active")) loadDocuments();
   brain.model = null;
   $("#agent-out").replaceChildren();
@@ -1155,9 +1157,124 @@ $("#meta-save").addEventListener("click", async () => {
   } catch (e) { $("#meta-error").textContent = e.message; }
 });
 
+// ---------------------------------------------------------------- Ollama setup (§19.1)
+
+const ollamaUi = { timer: null, dismissed: false };
+const gb = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`);
+
+function cmdLine(text) {
+  const copy = el("button", { class: "small", type: "button", onclick: async () => {
+    try { await navigator.clipboard.writeText(text); copy.textContent = "Copied"; } catch { copy.textContent = "Select and copy"; }
+  } }, "Copy");
+  return el("div", { class: "cmd" }, el("code", {}, text), copy);
+}
+const extLink = (href, text) => el("a", { href, target: "_blank", rel: "noopener noreferrer" }, text);
+
+// Shows the setup dialog when Ollama is missing, stopped or lacks this workspace's models;
+// polls while it's starting or downloading. Closes itself once everything is in place.
+async function ollamaSetup({ open = false } = {}) {
+  clearTimeout(ollamaUi.timer);
+  if (open) ollamaUi.dismissed = false;
+  let o;
+  try { o = await api("/api/ollama"); } catch { return; }
+  const st = o.status?.state;
+  const missing = (o.models || []).filter((m) => !m.installed);
+  const busy = o.phase !== "done" || o.pull.running;
+  const ready = st === "running" && !missing.length && !o.models_error;
+  if (ready && !o.pull.running) {
+    if (!$("#ollama-dialog").hidden) { $("#ollama-dialog").hidden = true; loadModels(); refreshStatus(); }
+    return;
+  }
+  if (busy) ollamaUi.timer = setTimeout(ollamaSetup, o.pull.running ? 700 : 500);
+  // Quietly wait out the first check; only show the dialog if something needs doing.
+  if (o.phase === "checking" && $("#ollama-dialog").hidden && !open) return;
+  if (ollamaUi.dismissed && !open && !o.pull.running) return;
+  renderOllama(o, missing);
+  $("#ollama-dialog").hidden = false;
+}
+
+function renderOllama(o, missing) {
+  const body = $("#ollama-body");
+  const st = o.status?.state;
+  const mac = o.os === "macos", win = o.os === "windows";
+  $("#ollama-error").textContent = o.pull.error || o.models_error || "";
+  $("#ollama-pull").hidden = !(st === "running" && missing.length);
+  $("#ollama-pull").disabled = o.pull.running;
+  $("#ollama-check").disabled = o.phase !== "done";
+  const parts = [];
+  if (o.phase === "starting") {
+    $("#ollama-title").textContent = "Starting Ollama…";
+    parts.push(el("p", { class: "muted" }, "Ollama is installed but wasn't running, so localRAG is starting it in the background. This takes a few seconds."));
+  } else if (o.phase === "checking") {
+    $("#ollama-title").textContent = "Checking Ollama…";
+    parts.push(el("p", { class: "muted" }, `Looking for Ollama at ${o.host}…`));
+  } else if (st === "not_installed") {
+    $("#ollama-title").textContent = "Install Ollama";
+    parts.push(
+      el("p", {}, "localRAG runs its language models on this computer with ", el("strong", {}, "Ollama"), ", a free app. It isn't installed yet."),
+      el("ol", { class: "setup-steps" },
+        el("li", {}, "Download it from ", extLink(o.download_url, "ollama.com/download"), " and run the installer", mac ? " (drag Ollama.app to Applications, then open it once)." : "."),
+        mac ? el("li", {}, "Or, with Homebrew, in Terminal:", cmdLine("brew install ollama")) : null,
+        win ? el("li", {}, "Or, in PowerShell:", cmdLine("winget install Ollama.Ollama")) : null,
+        el("li", {}, "Come back here and press ", el("strong", {}, "Check again"), ". localRAG starts Ollama for you from then on."),
+      ),
+    );
+  } else if (st === "not_running") {
+    $("#ollama-title").textContent = "Ollama isn't running";
+    parts.push(
+      el("p", {}, "Ollama is installed, but localRAG couldn't get it to answer at ", el("code", {}, o.host), "."),
+      el("p", { class: "muted small-text" }, o.status.error),
+      el("p", { class: "muted small-text" }, mac ? "Try opening Ollama from Applications, or run " : "Try starting Ollama from the Start menu, or run ", el("code", {}, "ollama serve"), " in a terminal, then press Check again."),
+    );
+  } else if (st === "remote") {
+    $("#ollama-title").textContent = "Ollama isn't answering";
+    parts.push(
+      el("p", {}, "Your settings point localRAG at Ollama on another machine, ", el("code", {}, o.host), ", and it isn't answering."),
+      el("p", { class: "muted small-text" }, "localRAG never starts programs on other machines. Start Ollama there, or set ollama_host in ~/.config/localrag/config.toml back to http://127.0.0.1:11434."),
+      el("p", { class: "muted small-text" }, o.status.error),
+    );
+  } else if (st === "running") {
+    $("#ollama-title").textContent = missing.length ? "Download models" : "Models ready";
+    const p = o.pull;
+    const total = missing.reduce((a, m) => a + (m.size || 0), 0);
+    parts.push(
+      el("p", {}, `Ollama ${o.status.version} is running. `, missing.length
+        ? `${missing.length === 1 ? "One model this workspace uses is" : `${missing.length} models this workspace uses are`} not downloaded yet${total ? ` (about ${gb(total)} in all)` : ""}.`
+        : "All models are downloaded."),
+      el("ul", { class: "model-list" }, ...o.models.map((m) => {
+        const active = p.running && p.model === m.name;
+        const pulled = m.installed || p.done.includes(m.name);
+        return el("li", {},
+          el("span", {}, el("code", {}, m.name), el("span", { class: "muted" }, ` · ${m.role}`)),
+          pulled ? el("span", { class: "ok" }, "✓ downloaded")
+            : active ? el("span", { class: "muted" }, p.progress.total ? `${p.progress.status.startsWith("pulling") ? "downloading" : p.progress.status} · ${gb(p.progress.completed)} of ${gb(p.progress.total)}` : p.progress.status || "starting…")
+            : el("span", { class: "muted" }, m.size ? `about ${gb(m.size)}` : "size shown when the download starts"),
+          active && p.progress.total ? el("progress", { class: "pull-bar", max: p.progress.total, value: p.progress.completed }) : null,
+        );
+      })),
+      missing.length ? el("p", { class: "muted small-text" }, "Downloads come from Ollama's model library through Ollama itself, and continue if you close this dialog. Models already on this computer are skipped.") : null,
+    );
+  }
+  body.replaceChildren(...parts.filter(Boolean));
+}
+
+$("#ollama-close").addEventListener("click", () => { ollamaUi.dismissed = true; $("#ollama-dialog").hidden = true; });
+$("#ollama-check").addEventListener("click", async () => {
+  $("#ollama-error").textContent = "";
+  try { await api("/api/ollama/check", { method: "POST" }); } catch (e) { $("#ollama-error").textContent = e.message; }
+  ollamaSetup({ open: true });
+});
+$("#ollama-pull").addEventListener("click", async () => {
+  $("#ollama-pull").disabled = true;
+  try { await api("/api/ollama/pull", { method: "POST" }); } catch (e) { $("#ollama-error").textContent = e.message; }
+  ollamaSetup({ open: true });
+});
+$("#status").addEventListener("click", () => { if ($("#status").classList.contains("clickable")) ollamaSetup({ open: true }); });
+
 // ---------------------------------------------------------------- start
 
 (async function start() {
+  ollamaSetup();
   const { active } = await api("/api/workspaces");
   if (!active) {
     $("#status").innerHTML = `<span class="dot bad"></span>No workspace open`;
